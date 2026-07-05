@@ -1,9 +1,9 @@
-// M0.5 (FW v0.7): USB-HS デバイス + 手放し書き込みループ + M1信号計測
+// GBAcapture APP ファームウェア (0x08004000 に配置、IAP からジャンプされる)
 //
 // バルクOUT(EP5) コマンド "GBAC"+1B → バルクIN(EP4) で応答:
-//   'P' ping → {G,B,A,C,'!', ver_major, ver_minor, rst_flags} (8B)
+//   'P' ping → {G,B,A,C,'!', 0x00(=APPモード), ver, rst_flags} (8B)
 //   'F' 計測 → {G,B,A,C,'F',0,0,0, dck/s u32, lp/s u32, sps/s u32} (20B)
-//   'B' 突入 → ISPブートローダへ直接ジャンプ（応答なし、USBは切断される）
+//   'U' 更新 → BKPマジックを書いてソフトリセット → IAP更新モードへ（手放し書き込み）
 //
 // 既知のスタックバグ回避: USBHS_SendEndpoint は data ポインタを UEP2_TX_DMA に
 // 書いてしまう([2-1]ハードコード)ため、EP4 の既定バッファ ENDPOINTS[4] に
@@ -13,8 +13,8 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION_MAJOR 0
-#define FW_VERSION_MINOR 7
+#define FW_VERSION 8      // v0.8
+#define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
 // DCK(PA0): 4.19MHz級バースト → TIM2 外部クロックモード(TI1FP1)でハードウェアカウント
@@ -131,38 +131,18 @@ static void ReplyFreq( void )
 	USBHS_SendEndpoint( 4, 20, t );
 }
 
-// WCH ISP ブートローダ (システムメモリ 0x1FFF8000) へ直接ジャンプする。
-//
-// 根拠: V30x BTVER2.9 ブートROMの逆アセンブル (COKPOWEHEU/ch32v307_bootloader) により、
-// ROM は入口チェックを一切行わず、自前で sp/gp/mtvec/RCC を再初期化することが判明。
-// 必要な前処理は「全IRQ無効化+ペンディングクリア / SysTick停止 / USB切断」のみ。
-// 注意: WWDG は絶対に有効化しないこと（ROMは食わせないため即リセットされる）。
-// 詳細: docs/flashing.md
-__attribute__((noreturn)) static void EnterIspBootloader( void )
+// IAP 更新モードへ移行する（手放し書き込みループ。docs/flashing.md）
+// BKP レジスタにマジックを書いてソフトリセット → IAP がマジックを見て更新モードに留まる
+__attribute__((noreturn)) static void EnterIapUpdater( void )
 {
-	USBHSD->CONTROL &= ~USBHS_UC_DEV_PU_EN; // まずUSBソフト切断（ホストに切断を見せる）
+	RCC->APB1PCENR |= RCC_APB1Periph_PWR | RCC_APB1Periph_BKP;
+	PWR->CTLR |= PWR_CTLR_DBP;
+	BKP->DATAR1 = IAP_MAGIC;
+
+	USBHSD->CONTROL &= ~USBHS_UC_DEV_PU_EN; // USBソフト切断で再列挙を確実に
 	Delay_Ms( 50 );
-
-	__disable_irq();
-	SysTick->CTLR = 0;
-	SysTick->SR = 0;
-
-	// 全PFIC割り込みを無効化しペンディングもクリア
-	// （ROMは mtvec をROM内に向けるため、残った割り込みが誤ベクタする）
-	NVIC->IRER[0] = 0xFFFFFFFF; NVIC->IRER[1] = 0xFFFFFFFF;
-	NVIC->IRER[2] = 0xFFFFFFFF; NVIC->IRER[3] = 0xFFFFFFFF;
-	NVIC->IPRR[0] = 0xFFFFFFFF; NVIC->IPRR[1] = 0xFFFFFFFF;
-	NVIC->IPRR[2] = 0xFFFFFFFF; NVIC->IPRR[3] = 0xFFFFFFFF;
-
-	// USB ペリフェラルを完全停止（ROMが再初期化し 4348:55E0 で再列挙する）
-	USBHSD->CONTROL = 0;
-	RCC->AHBPCENR &= ~RCC_AHBPeriph_USBHS;
-	RCC->AHBRSTR |= RCC_AHBPeriph_OTG_FS;
-	RCC->AHBRSTR &= ~RCC_AHBPeriph_OTG_FS;
-	RCC->AHBPCENR &= ~RCC_AHBPeriph_OTG_FS;
-
-	( (void (*)(void))0x1FFF8000 )();
-	__builtin_unreachable();
+	NVIC_SystemReset();
+	while(1);
 }
 
 int main()
@@ -190,13 +170,13 @@ int main()
 			switch( cmd )
 			{
 			case 'P':
-				Reply8( '!', FW_VERSION_MAJOR, FW_VERSION_MINOR, (uint8_t)( g_boot_rstsckr >> 24 ) );
+				Reply8( '!', 0x00 /* APPモード */, FW_VERSION, (uint8_t)( g_boot_rstsckr >> 24 ) );
 				break;
 			case 'F':
 				ReplyFreq();
 				break;
-			case 'B':
-				EnterIspBootloader(); // 戻らない
+			case 'U':
+				EnterIapUpdater(); // 戻らない
 				break;
 			}
 		}
