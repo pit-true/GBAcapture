@@ -31,27 +31,60 @@ switch (args[0])
 {
     case "ping":
     {
-        Send(writer, (byte)'P');
-        var reader = device.OpenEndpointReader(ReadEndpointID.Ep04);
-        var buf = new byte[512];
-        var ec = reader.Read(buf, 2000, out var got);
-        if (ec != Error.Success || got < 7 || buf[0] != 'G' || buf[4] != '!')
+        return Ping(device, writer) ? 0 : 1;
+    }
+    case "test-bootloader":
+    {
+        // 同一USBハンドルを保持したまま B 前後で ping し、リセットの有無を判定する。
+        // リセットが起きていればハンドルは死ぬ(2回目pingがパイプエラーになる)はず。
+        Console.WriteLine($"[1] 事前ping: {(Ping(device, writer) ? "OK" : "NG")}");
+        Send(writer, (byte)'B');
+        Console.WriteLine("[2] B 送信済み。3秒待機...");
+        Thread.Sleep(3000);
+        try
         {
-            Console.Error.WriteLine($"ping 失敗: {ec}, {got} bytes");
-            return 1;
+            Console.WriteLine($"[3] 事後ping(同一ハンドル): {(Ping(device, writer) ? "OK" : "NG")}");
+            Console.WriteLine("→ ハンドル生存 = デバイスはリセットしていない (Bが処理されていない)");
         }
-        Console.WriteLine($"PONG: FW v{buf[5]}.{buf[6]}");
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[3] 事後ping例外: {ex.Message}");
+            Console.WriteLine("→ ハンドル死亡 = リセットは発生した (ブートローダに弾かれてアプリ復帰)");
+        }
         return 0;
     }
     case "enter-bootloader":
+    case "enter-bootloader-c": // KEYRアンロック込みの変種
     {
-        Send(writer, (byte)'B');
+        Send(writer, (byte)(args[0].EndsWith("-c") ? 'C' : 'B'));
         Console.WriteLine("ブートローダ突入コマンド送信済み。数秒後に wchisp が使えます。");
+        return 0;
+    }
+    case "cmd": // 任意コマンド送信+応答ダンプ (診断用): cmd S / cmd T など
+    {
+        Send(writer, (byte)args[1][0]);
+        var reader = device.OpenEndpointReader(ReadEndpointID.Ep04);
+        var buf = new byte[512];
+        var ec = reader.Read(buf, 2000, out var got);
+        Console.WriteLine($"reply: {ec}, {got}B: {Convert.ToHexString(buf.AsSpan(0, Math.Min(got, 16)))}");
         return 0;
     }
     default:
         Console.Error.WriteLine($"unknown command: {args[0]}");
         return 2;
+}
+
+static bool Ping(IUsbDevice device, UsbEndpointWriter writer)
+{
+    Send(writer, (byte)'P');
+    var reader = device.OpenEndpointReader(ReadEndpointID.Ep04);
+    var buf = new byte[512];
+    var ec = reader.Read(buf, 2000, out var got);
+    Console.WriteLine($"  raw: {ec}, {got}B: {Convert.ToHexString(buf.AsSpan(0, Math.Min(got, 16)))}");
+    if (ec != Error.Success || got < 7 || buf[0] != 'G' || buf[4] != '!')
+        return false;
+    Console.WriteLine($"  PONG: FW v{buf[5]}.{buf[6]}");
+    return true;
 }
 
 static void Send(UsbEndpointWriter writer, byte cmd)
