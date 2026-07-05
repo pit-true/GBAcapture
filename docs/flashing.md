@@ -64,8 +64,22 @@ PFIC->CFGR = 0xBEEF0080;            // KEYCODE 0xBEEF + SYSRESET → ソフト�
 | Zadig / WinUSB ドライバ割当 | ✅ 2026-07-05 実施（4348:55E0 に WinUSB。一度きりの作業） |
 | 初回書き込み (M0 Lチカ) | ✅ 2026-07-05 成功。flash→verify→自動リセットまで確認 |
 | チップ情報 | CH32V305RBT6 / ブートローダ v2.90 / UID CD-AB-2F-89-3A-BC-36-F1 |
-| ソフトブートローダ突入コード | 未実装（M0.5 で USB ベンダーコマンドと共に実装） |
-| 手放しループ実証 | 未（M0.5 の目標。現状は BOOT+RST 手動突入が必要） |
+| ソフトブートローダ突入コード | ✅ 実装済み（`firmware/m05-usb`、実機検証待ち） |
+| ホスト側突入コマンド | ✅ `dotnet run --project host/GbaCap.Cli -- enter-bootloader` |
+| 手放しループ実証 | 未（M0.5 書き込み後に検証。現状は BOOT+RST 手動突入が必要） |
+
+## コマンドプロトコル（M0.5、バルクOUT EP5）
+
+制御コマンドはコントロール転送ではなく**バルクOUTパケット**で送る
+（ch32fun の USB スタックにベンダーリクエスト用フックが無いため。スタック改変を避けた）。
+
+| パケット | 動作 |
+|---|---|
+| `"GBAC" + 'B'` (5B) | ISPブートローダへソフト突入（USB切断→MODEフラグ→ソフトリセット） |
+| `"GBAC" + 'P'` (5B) | EP4(バルクIN) で `"GBAC!"+major+minor+0` の8Bを返す（疎通確認） |
+
+アプリFWのUSB ID: **VID 0x1209 / PID 0xC001**、Product "GBAcapture"。
+初回のみ Zadig でこの VID:PID に WinUSB を割当てる必要がある（ISPの 4348:55E0 とは別割当）。
 
 ## フォールバック
 

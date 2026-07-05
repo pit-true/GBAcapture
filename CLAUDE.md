@@ -48,8 +48,13 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
   雛形 = examples_v30x/turbo_adc_with_usb と usbdevice_hs）
 - 信号仕様は文献検証済み（DCKはバーストクロック・負エッジ有効。docs/gba-video-signal.md）
 - ブートローダ突入は MODEフラグ+ソフトリセット方式（docs/flashing.md にコード掲載、実機未実証）
-- 次の作業: **M0.5 = USBHS デバイス化 + CMD_ENTER_BOOTLOADER で手放しループ完成**。
-  それまでの ISP 突入はユーザーに「BOOT押したまま→RST押して離す→BOOT離す」を依頼
+- **M0.5 実装完了・実機検証待ち**: `firmware/m05-usb`（USB-HSバルクデバイス
+  1209:C001 + ブートローダ突入/pingコマンド）と `host/GbaCap.Cli`
+  （LibUsbDotNet。ping / enter-bootloader）。ビルド済み
+- M0.5 検証手順: BOOT+RST でISP → `wchisp flash firmware/m05-usb/m05_usb.bin` →
+  Zadig で 1209:C001 に WinUSB 割当（初回のみ）→ `dotnet run --project host/GbaCap.Cli -- ping` →
+  `enter-bootloader` → `wchisp info` が見えれば**手放しループ完成**
+- 次の作業: M0.5 実機検証 → M1（信号計測FW: DCK/LP/SPS の周波数・カウントをUSBで報告）
 
 ## スキル
 

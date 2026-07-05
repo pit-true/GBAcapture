@@ -20,11 +20,11 @@ description: nanoCH32V305 へ wchisp でファームウェアを書き込む。�
 2. **見えない場合（アプリFW実行中）**: ホストツールでブートローダ突入コマンドを送る
 
    ```bash
-   cd host && python -m gbacap.cli enter-bootloader
+   dotnet run --project host/GbaCap.Cli -- enter-bootloader
    ```
 
-   （このコマンドが未実装/失敗の場合のみ、ユーザーに依頼:
-   「nanoCH32V305 の BOOT を押しながら USB を挿す、または BOOT 押しながら RST を押して離してください」）
+   （これが失敗する場合のみ、ユーザーに依頼:
+   「BOOTを押したまま → RSTを押して離す → BOOTを離してください」※抜き差し不要）
 3. 書き込み: `$WCHISP flash firmware/<target-dir>/<name>.bin`
 4. `wchisp flash` はデフォルトで書き込み後にチップをリセットしアプリが起動する
    （USB抜き差し不要。抑止したい場合のみ `--no-reset`）
