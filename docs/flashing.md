@@ -5,51 +5,67 @@
 **人手ゼロで「ビルド → 書き込み → 実行 → テスト」を回し続ける。**
 通常は「BOOT押しながらUSB接続 → 書き込み → USB抜き差し」が必要だが、これをすべてソフトウェアで代替する。
 
-## 手放しループの仕組み
+## 手放しループの仕組み（2026-07-05 文献調査済み）
 
 ```
 [アプリFW実行中]
    │  ① PCから USB ベンダーコマンド CMD_ENTER_BOOTLOADER 送信
    ▼
-[FWが自らブートローダへジャンプ]  ← BOOT ボタン不要
+[FWが MODEフラグ+ソフトリセットでブートローダへ]   ← BOOT ボタン不要
    │  ② wchisp flash firmware.bin
    ▼
 [書き込み完了]
-   │  ③ wchisp がチップをリセット → アプリ起動（USB再列挙はソフトで発生）
+   │  ③ wchisp flash はデフォルトで書き込み後チップをリセット → アプリ起動 ✅検証済み
    ▼
 [新アプリFW実行中]  → テスト → ①に戻る
 ```
 
-- **①のソフトブートローダ突入**: CH32V30x のシステムメモリ上の WCH ISP ブートローダ
-  （アドレス 0x1FFF8000 想定 — **要検証**）へ、ペリフェラル停止後にジャンプする。
-  USB切断(ソフトディスコネクト)してからジャンプすることで再列挙を確実にする。
-- **③の再列挙**: 物理的な抜き差しは不要。リセット後に USB D+ の再接続で PC 側が再列挙する。
-- **初回のみ**（またはFWが暴走してコマンドを受けられない時のみ）BOOT ボタンで手動突入。
+### ① ソフトブートローダ突入の実装方法
 
-> この仕組みが動くまでの M0 段階では、BOOT 押下→接続の手動操作をユーザーに依頼する。
-> Claude から依頼する時は「BOOTを押しながらUSBを挿し直してください」と明示する。
+CH32V30x のブートローダはシステムメモリ **0x1FFF8000 (28KB)**。
+STM32 流の「アドレスへジャンプ」ではなく、**FLASH_STATR の MODE ビット + ソフトリセット**が正規ルート:
 
-## ツール
+```c
+FLASH->BOOT_MODEKEYR = 0x45670123;  // KEY1
+FLASH->BOOT_MODEKEYR = 0xCDEF89AB;  // KEY2 (MODEフラグ書き込みアンロック)
+FLASH->STATR = 0x4000;              // STATR.MODE(bit14)=1 → 次リセットでBOOT領域実行
+RCC->RSTSCKR |= 0x1000000;          // RMVF: リセットフラグ全クリア(必須!)
+PFIC->CFGR = 0xBEEF0080;            // KEYCODE 0xBEEF + SYSRESET → ソフトリセット
+```
 
-### wchisp (ch32-rs 製, Rust)
+- ブートローダは「SFTRSTF のみ 1、他のリセットフラグ全て 0」を確認して留まる。
+  **RMVF クリアを忘れると即アプリへ戻ってしまう**
+- リセット前に USB ソフト切断（D+プルアップ解除）をしておくと再列挙が確実
+- 出典: https://github.com/basilhussain/ch32v003-bootloader-docs （CH32V003 での解析）
+- ⚠️ **V305 実機での動作は未実証**（V003 で解析された手順。V30x のリファレンスマニュアル
+  にも MODE ビットの記載あり）。M0 で最初に実証する。失敗してもリスクなし
+  （BOOT ボタン手動突入でやり直せる）
 
-- インストール: `cargo install wchisp` またはプレビルドバイナリ（GitHub releases）
-- 主なコマンド（要バージョン確認）:
-  - `wchisp info` — 接続チップ情報
-  - `wchisp flash <firmware.bin|elf|hex>` — 書き込み（完了後リセットするか要確認）
-  - `wchisp config ...` — オプションバイト
-- Windows ではドライバとして WinUSB が必要な場合あり（Zadig で割当 — 要確認）
+## ツール: wchisp（✅ 調査済み）
+
+- CH32V305RBT6 はデバイスDB登録済み（chip_id 0x50, flash 128K）
+- コマンド: `probe` / `info` / `reset` / `erase` / `flash` / `verify` / `config`
+- **`wchisp flash` はデフォルトで書き込み後リセット**（`--no-reset` で抑止可）
+- Windows ドライバ: **Zadig で WinUSB を割当**（README 記載の公式手順）
+- 入手: プレビルドバイナリ（GitHub releases v0.3.0 / nightly）。
+  cargo install はMSVCリンカが必要（本環境では未導入のためプレビルドを使用）
+
+## 手順（現在の運用）
+
+1. **初回のみ / FW暴走時**: ユーザーに依頼 →「BOOT を押しながら USB を挿す（または BOOT 押しながら RST 押して離す）」
+2. `wchisp info` でチップ確認 → `wchisp flash <bin>` → 自動リセットでアプリ起動
+3. 手放しループ確立後: ホストツールで `enter-bootloader` → `wchisp flash <bin>` のみ
 
 ## 状態記録
 
 | 項目 | 状態 |
 |---|---|
-| wchisp インストール | 未 |
-| Rust ツールチェーン | 未 |
-| ソフトブートローダ突入コード | 未実装（調査中） |
-| 手放しループ実証 | 未 |
+| wchisp インストール | 進行中（プレビルド取得） |
+| Zadig / WinUSB ドライバ割当 | 未（初回接続時に実施） |
+| ソフトブートローダ突入コード | 未実装（上記手順で実装予定） |
+| 手放しループ実証 | 未（M0 の目標） |
 
-## フォールバック（ソフト突入が使えない場合）
+## フォールバック
 
 - FW 暴走時: BOOT 手動突入（ユーザー依頼）
-- 将来案: USB制御リレー/別MCUで nano の NRST・BOOT を外部制御し、完全ハード的にも無人化
+- 将来案: USB制御リレー/別MCUで NRST・BOOT を外部制御し完全ハード無人化（docs/roadmap.md）

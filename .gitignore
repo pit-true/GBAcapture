@@ -3,3 +3,10 @@ __pycache__/
 .pytest_cache/
 build/
 tools/
+firmware/ch32fun/
+*.elf
+*.bin
+*.hex
+*.lst
+*.map
+nul

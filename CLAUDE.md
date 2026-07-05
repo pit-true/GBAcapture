@@ -30,10 +30,18 @@ cd host && python -m pytest -q
 ## 現在の状態 (2026-07-05 更新)
 
 - 配線完了（ユーザー実施済み、docs/wiring.md に記録）
-- ドキュメント・プロジェクト骨格作成済み
-- 環境: Python 3.12 (winget導入済)。Rust/wchisp/RISC-Vツールチェーン **未導入**
-- FW実装方式（EVT C / ch32fun / Rust ch32-hal）は調査中 → 決定したらここに記載
+- ドキュメント・プロジェクト骨格・ホスト側デコード/パケット解析（テスト11件 green）作成済み
+- 環境構築完了（docs/setup.md）: Python 3.12 + pytest / wchisp v0.3.0
+  (`tools/wchisp-win-x64/wchisp.exe`) / xPack RISC-V GCC 15.2.0 (`tools/`) /
+  native make (ezwinports) / ch32fun クローン済み
+- **M0 ファームウェア `firmware/m0-blink` ビルド成功済み**（`cd firmware && ./build.sh m0-blink`）。
+  実機書き込みは未（初回はユーザーの BOOT 操作待ち）
+- **FW実装方式: ch32fun に決定**（docs/architecture.md 参照。
+  雛形 = examples_v30x/turbo_adc_with_usb と usbdevice_hs）
+- 信号仕様は文献検証済み（DCKはバーストクロック・負エッジ有効。docs/gba-video-signal.md）
+- ブートローダ突入は MODEフラグ+ソフトリセット方式（docs/flashing.md にコード掲載、実機未実証）
 - 次の作業: M0 = Lチカ + wchisp 手放し書き込みループの確立（docs/architecture.md）
+  ※初回書き込みのみユーザーに BOOT ボタン操作を依頼する必要あり
 
 ## スキル
 
