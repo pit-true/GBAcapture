@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 21     // v0.21: ラインストライド241対応 (240px + H-blank中の1ジャンクパルス)
+#define FW_VERSION 22     // v0.22: ジャンクパルスはライン先頭側 → 読み出し+1オフセット
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -659,7 +659,7 @@ int main()
 				{
 					uint32_t line = ( g_st_sent - g_st_anchor ) / STR_LINE_STRIDE;
 					if( line < 160 )
-						TrySendLine( g_st_frame, (uint16_t)line, g_st_sent % STR_RING_SAMPLES );
+						TrySendLine( g_st_frame, (uint16_t)line, ( g_st_sent + 1 ) % STR_RING_SAMPLES );
 				}
 				// → 次に来るサンプルがライン0の先頭。ここがフレーム境界
 				g_st_anchor = g_st_total;
@@ -684,7 +684,7 @@ int main()
 					g_st_anchored = 0; // 次のVBLANKで再アンカー
 					break;
 				}
-				if( TrySendLine( g_st_frame, (uint16_t)line, g_st_sent % STR_RING_SAMPLES ) )
+				if( TrySendLine( g_st_frame, (uint16_t)line, ( g_st_sent + 1 ) % STR_RING_SAMPLES ) )
 					break; // 全EP使用中 → 次周で再試行
 				g_st_sent += STR_LINE_STRIDE;
 			}

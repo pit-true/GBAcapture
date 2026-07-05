@@ -32,32 +32,77 @@ public sealed class ViewerForm : Form
     private int _framesThisSec;
     private string _status = "接続中...";
 
+    private bool _fullscreen;
+
+    // Windows 11 の角丸を無効化（映像領域の四隅が欠けるのを防ぐ）
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
     public ViewerForm()
     {
         Text = "GBAcapture";
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
+        BackColor = Color.Black;
+        KeyPreview = true;
 
         var menu = new MenuStrip();
         var view = new ToolStripMenuItem("表示(&V)");
-        foreach (var s in new[] { 1, 2, 3, 4, 8 })
+        foreach (var s in new[] { 1, 2, 3, 4 })
         {
             var item = new ToolStripMenuItem($"{s}x") { Checked = s == _scale, Tag = s };
             item.Click += (_, _) => SetScale((int)item.Tag!, view);
             view.DropDownItems.Add(item);
         }
+        view.DropDownItems.Add(new ToolStripSeparator());
+        var fsItem = new ToolStripMenuItem("フルスクリーン (Escで戻る)");
+        fsItem.Click += (_, _) => EnterFullscreen();
+        view.DropDownItems.Add(fsItem);
         menu.Items.Add(view);
         MainMenuStrip = menu;
         Controls.Add(menu);
 
+        KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Escape && _fullscreen) ExitFullscreen();
+        };
+
         ApplyClientSize();
         _fpsTimer.Tick += (_, _) =>
         {
-            Text = $"GBAcapture - {_framesThisSec} fps ({_scale}x) {_status}";
+            if (!_fullscreen)
+                Text = $"GBAcapture - {_framesThisSec} fps ({_scale}x) {_status}";
             _framesThisSec = 0;
         };
         _fpsTimer.Start();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        var pref = 1; // DWMWCP_DONOTROUND
+        try { DwmSetWindowAttribute(Handle, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, ref pref, 4); }
+        catch { }
+    }
+
+    private void EnterFullscreen()
+    {
+        _fullscreen = true;
+        MainMenuStrip!.Visible = false;
+        FormBorderStyle = FormBorderStyle.None;
+        WindowState = FormWindowState.Maximized;
+        Invalidate();
+    }
+
+    private void ExitFullscreen()
+    {
+        _fullscreen = false;
+        WindowState = FormWindowState.Normal;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MainMenuStrip!.Visible = true;
+        ApplyClientSize();
+        Invalidate();
     }
 
     private void SetScale(int s, ToolStripMenuItem parent)
@@ -219,10 +264,24 @@ public sealed class ViewerForm : Form
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        var menuH = MainMenuStrip?.Height ?? 24;
         e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
         e.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
-        lock (_bmpLock)
-            e.Graphics.DrawImage(_bmp, 0, menuH, W * _scale, H * _scale);
+        if (_fullscreen)
+        {
+            // アスペクト比(3:2)維持で最大化。左右(または上下)は黒帯
+            var cw = ClientSize.Width;
+            var ch = ClientSize.Height;
+            var fit = Math.Min((float)cw / W, (float)ch / H);
+            var dw = (int)(W * fit);
+            var dh = (int)(H * fit);
+            lock (_bmpLock)
+                e.Graphics.DrawImage(_bmp, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+        }
+        else
+        {
+            var menuH = MainMenuStrip?.Height ?? 24;
+            lock (_bmpLock)
+                e.Graphics.DrawImage(_bmp, 0, menuH, W * _scale, H * _scale);
+        }
     }
 }
