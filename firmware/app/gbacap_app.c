@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 20     // v0.20: サーキュラDMAストリーミング + EP1/3/4分散送信
+#define FW_VERSION 21     // v0.21: ラインストライド241対応 (240px + H-blank中の1ジャンクパルス)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -52,7 +52,10 @@ static void CapArmDma( int slot );
 // - VBLANK(約5ms)のDMA停止をメインループで検出 → その位置=ライン0先頭(算術で確定)
 // - 割り込みタイミングがデータ経路に入らないため水平ジッタが原理的に出ない
 static volatile uint8_t g_stream;       // 1=ストリーミング中
-#define STR_RING_SAMPLES ( CAP_MAX_LINES * 240 ) // 7680
+// 実測: DCKは1ライン周期あたり241パルス (可視240 + H-blank中に1ジャンク)。
+// リングはストライド241の倍数にする
+#define STR_LINE_STRIDE 241
+#define STR_RING_SAMPLES ( CAP_MAX_LINES * STR_LINE_STRIDE ) // 7712
 static uint32_t g_st_total;      // 取り込んだサンプル総数
 static uint32_t g_st_lastcur;    // 前回のDMA位置
 static uint32_t g_st_sent;       // 送信済みサンプル数
@@ -155,15 +158,17 @@ static void SignalCountersInit( void )
 //   CC1イベント → DMA1_CH5 が GPIOB->INDR(16bit) をラインバッファへ
 //   CC2イベント(同じTI1をIC2に写像) → DMA1_CH7 が GPIOC->INDR下位バイトへ
 //   (PC4/PC5 = 赤の下位2bit)
-static uint16_t g_capbuf[CAP_MAX_LINES][240];
-static uint8_t  g_capbuf_c[CAP_MAX_LINES][240];
+// フラット配列: ストリーミングはストライド241のリングとして、
+// 一発キャプチャ('L')は 240サンプル×32スロットとして共用する
+static uint16_t g_capbuf[STR_RING_SAMPLES];
+static uint8_t  g_capbuf_c[STR_RING_SAMPLES];
 static uint16_t g_dbg_last_cntr; // 診断: 直近キャプチャの最終スロットDMA残量
 
 static void CapArmDma( int slot )
 {
 	DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
 	DMA1_Channel5->PADDR = (uintptr_t)&GPIOB->INDR;
-	DMA1_Channel5->MADDR = (uintptr_t)g_capbuf[slot];
+	DMA1_Channel5->MADDR = (uintptr_t)( g_capbuf + slot * 240 );
 	DMA1_Channel5->CNTR = 240;
 	DMA1_Channel5->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_HalfWord
 	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
@@ -171,7 +176,7 @@ static void CapArmDma( int slot )
 
 	DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
 	DMA1_Channel7->PADDR = (uintptr_t)&GPIOC->INDR;
-	DMA1_Channel7->MADDR = (uintptr_t)g_capbuf_c[slot];
+	DMA1_Channel7->MADDR = (uintptr_t)( g_capbuf_c + slot * 240 );
 	DMA1_Channel7->CNTR = 240;
 	DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
 	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
@@ -445,8 +450,6 @@ static const uint8_t k_stream_eps[3] = { 4, 1, 3 };
 static uint8_t g_eptx[3][484];
 static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 {
-	const uint16_t * bsrc = (const uint16_t *)g_capbuf + cbase;
-	const uint8_t * csrc = (const uint8_t *)g_capbuf_c + cbase;
 	for( int k = 0; k < 3; k++ )
 	{
 		int ep = k_stream_eps[k];
@@ -456,8 +459,15 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 		pkt[1] = frame;
 		memcpy( pkt + 2, &line_no, 2 );
 		uint16_t * dst = (uint16_t *)( pkt + 4 );
+		// リング終端をまたぐ可能性があるため2セグメントで処理
 		for( int j = 0; j < 240; j++ )
-			dst[j] = bsrc[j] | ( ( csrc[j] & 0x10 ) >> 2 ) | ( ( csrc[j] & 0x20 ) << 1 );
+		{
+			uint32_t idx = cbase + j;
+			if( idx >= STR_RING_SAMPLES ) idx -= STR_RING_SAMPLES;
+			dst[j] = g_capbuf[idx]
+			       | ( ( g_capbuf_c[idx] & 0x10 ) >> 2 )
+			       | ( ( g_capbuf_c[idx] & 0x20 ) << 1 );
+		}
 		// UEPn_TX_DMA は UEP1 から連続配置
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
 		USBHS_SendEndpoint( ep, 484, 0 );
@@ -474,8 +484,8 @@ static void BuildLinePacket( uint8_t * pkt, uint8_t frame, uint16_t line_no, int
 	pkt[0] = 0xA5;
 	pkt[1] = frame;
 	memcpy( pkt + 2, &line_no, 2 );
-	const uint16_t * b = g_capbuf[slot];
-	const uint8_t * c = g_capbuf_c[slot];
+	const uint16_t * b = g_capbuf + slot * 240;
+	const uint8_t * c = g_capbuf_c + slot * 240;
 	uint16_t * dst = (uint16_t *)( pkt + 4 );
 	for( int j = 0; j < 240; j++ )
 		dst[j] = b[j] | ( ( c[j] & 0x10 ) >> 2 ) | ( ( c[j] & 0x20 ) << 1 );
@@ -643,23 +653,32 @@ int main()
 				&& (uint32_t)( tnow - g_st_lastchange ) > ( Ticks_from_Ms( 1 ) / 4 ) )
 			{
 				// 250µs以上DMAが停止 = VBLANK (H-Blankは~16µsなので誤検出しない)
+				// まず最終ライン(159)を回収: 末尾ラインはジャンクパルスを待たずに
+				// 240サンプル揃った時点で送れる
+				if( g_st_anchored && g_st_total - g_st_sent >= 240 )
+				{
+					uint32_t line = ( g_st_sent - g_st_anchor ) / STR_LINE_STRIDE;
+					if( line < 160 )
+						TrySendLine( g_st_frame, (uint16_t)line, g_st_sent % STR_RING_SAMPLES );
+				}
 				// → 次に来るサンプルがライン0の先頭。ここがフレーム境界
 				g_st_anchor = g_st_total;
-				g_st_sent = g_st_total; // フレーム途中の未送信分は破棄
+				g_st_sent = g_st_total;
 				g_st_anchored = 1;
 				g_st_install = 1;
 				g_st_frame++;
 			}
 
-			while( g_st_anchored && g_st_total - g_st_sent >= 240 )
+			// 1ライン周期 = 241サンプル (可視240 + ジャンク1)。241揃うごとに240を送る
+			while( g_st_anchored && g_st_total - g_st_sent >= STR_LINE_STRIDE )
 			{
 				// リング一周分以上遅れたら(上書きされたら)このフレームは諦める
-				if( g_st_total - g_st_sent > STR_RING_SAMPLES - 240 )
+				if( g_st_total - g_st_sent > STR_RING_SAMPLES - STR_LINE_STRIDE )
 				{
 					g_st_anchored = 0;
 					break;
 				}
-				uint32_t line = ( g_st_sent - g_st_anchor ) / 240;
+				uint32_t line = ( g_st_sent - g_st_anchor ) / STR_LINE_STRIDE;
 				if( line >= 160 )
 				{
 					g_st_anchored = 0; // 次のVBLANKで再アンカー
@@ -667,7 +686,7 @@ int main()
 				}
 				if( TrySendLine( g_st_frame, (uint16_t)line, g_st_sent % STR_RING_SAMPLES ) )
 					break; // 全EP使用中 → 次周で再試行
-				g_st_sent += 240;
+				g_st_sent += STR_LINE_STRIDE;
 			}
 		}
 
