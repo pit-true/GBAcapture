@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 13     // v0.13: 'R' にGPIOC(PC4/PC5)とGPIOBビット別エッジ数を追加
+#define FW_VERSION 14     // v0.14: 'A' ADC電圧計測を追加（GND浮き判定用）
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -307,6 +307,76 @@ static void ReplyRawDiag( void )
 	SendEp4( rep, 88 );
 }
 
+// 'A': PA0(DCK)/PA1(LP)/PA2(SPS)/PC4(LDR1)/PC5(LDR2) のアナログ電圧を測る。
+// 各ch 16回サンプルの min/max (ADC生値 0-4095, Vref=3.3V) を返す。
+// GND浮きなら全ピンがVDD付近に張り付き、本物のGBAロジックHなら~2.9V/3.3*4095≈3600
+// V30x(F1型)のADC: SWSTART をトリガ源に選ばないと変換が始まらない
+// (ch32fun の funAnalogInit/Read はこれを設定せず無限ループする → 自前実装)
+static void AdcInit( void )
+{
+	RCC->APB2PCENR |= RCC_APB2Periph_ADC1;
+	RCC->CFGR0 |= RCC_ADCPRE_DIV8; // 144/8=18MHz (診断用途なので許容)
+	ADC1->CTLR1 = 0;
+	ADC1->CTLR2 = ADC_ADON | ADC_EXTSEL | ADC_EXTTRIG; // EXTSEL=111: SWSTART
+	Delay_Ms( 1 );
+	ADC1->CTLR2 |= ADC_RSTCAL; while( ADC1->CTLR2 & ADC_RSTCAL );
+	ADC1->CTLR2 |= ADC_CAL;    while( ADC1->CTLR2 & ADC_CAL );
+	ADC1->SAMPTR2 = 0x2DB6DB6D; // 全ch サンプル時間 0b101
+	ADC1->SAMPTR1 = 0x00B6DB6D;
+	ADC1->RSQR1 = 0; // 変換1回
+}
+
+static uint16_t AdcRead( uint8_t ch )
+{
+	ADC1->RSQR3 = ch;
+	ADC1->CTLR2 |= ADC_SWSTART;
+	uint32_t t0 = SysTick->CNT;
+	while( !( ADC1->STATR & ADC_EOC ) )
+		if( (uint32_t)( SysTick->CNT - t0 ) > Ticks_from_Ms( 10 ) ) return 0xFFFF;
+	return (uint16_t)ADC1->RDATAR;
+}
+
+static void ReplyAdc( void )
+{
+	static const uint8_t chans[5] = { 0, 1, 2, 14, 15 }; // ADC-IN番号
+	uint16_t vmin[5], vmax[5];
+
+	AdcInit();
+	// 対象ピンをアナログ入力に
+	funPinMode( PA0, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PA1, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PA2, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PC4, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PC5, GPIO_CFGLR_IN_ANALOG );
+
+	for( int c = 0; c < 5; c++ )
+	{
+		vmin[c] = 0xFFFF; vmax[c] = 0;
+		for( int i = 0; i < 16; i++ )
+		{
+			uint16_t v = AdcRead( chans[c] );
+			if( v < vmin[c] ) vmin[c] = v;
+			if( v > vmax[c] ) vmax[c] = v;
+		}
+	}
+
+	// デジタル入力へ戻す
+	funPinMode( PA0, GPIO_CFGLR_IN_FLOAT );
+	funPinMode( PA1, GPIO_CFGLR_IN_FLOAT );
+	funPinMode( PA2, GPIO_CFGLR_IN_FLOAT );
+	funPinMode( PC4, GPIO_CFGLR_IN_FLOAT );
+	funPinMode( PC5, GPIO_CFGLR_IN_FLOAT );
+
+	uint8_t rep[28];
+	rep[0]='G'; rep[1]='B'; rep[2]='A'; rep[3]='C'; rep[4]='A'; rep[5]=0; rep[6]=0; rep[7]=0;
+	for( int c = 0; c < 5; c++ )
+	{
+		memcpy( rep + 8 + c * 4, &vmin[c], 2 );
+		memcpy( rep + 10 + c * 4, &vmax[c], 2 );
+	}
+	SendEp4( rep, 28 );
+}
+
 static void ReplyFreq( void )
 {
 	uint8_t rep[20];
@@ -390,6 +460,12 @@ int main()
 	SignalCountersInit();
 	HSUSBSetup();
 
+	// ハング自動復旧: IWDG 約6.5秒。メインループが固まるとリセット→IAP→APPで復帰
+	// (純正ISP ROMもIWDGを自前で管理するので救済経路とは干渉しない)
+	IWDG->CTLR = 0x5555; IWDG->PSCR = 4;     // 40kHz/64
+	IWDG->CTLR = 0x5555; IWDG->RLDR = 0xFFF; // ~6.5s
+	IWDG->CTLR = 0xCCCC;                     // 開始
+
 	uint32_t last_toggle = 0;
 	uint32_t last_meas = 0;
 	uint32_t prev_dck = 0, prev_lp = 0, prev_sps = 0;
@@ -397,6 +473,8 @@ int main()
 
 	while(1)
 	{
+		IWDG->CTLR = 0xAAAA; // 餌やり
+
 		int cmd = g_pending_cmd;
 		if( cmd )
 		{
@@ -411,6 +489,9 @@ int main()
 				break;
 			case 'R':
 				ReplyRawDiag();
+				break;
+			case 'A':
+				ReplyAdc();
 				break;
 			case 'L':
 				HandleCaptureCmd( (const uint8_t *)HSUSBCTX.ENDPOINTS[5] );

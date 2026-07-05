@@ -198,6 +198,22 @@ switch (args[0])
         Console.WriteLine("(表示なし=全ビット変化ゼロ)");
         return 0;
     }
+    case "volt": // 'A': DCK/LP/SPS/LDR1/LDR2 の実電圧 (min-max)
+    {
+        using var dev = Open(context);
+        if (dev is null) return 1;
+        var b = Transact(dev, MakeCmd('A'), 28, timeoutMs: 5000);
+        if (b[4] != 'A') { Console.Error.WriteLine("volt 失敗"); return 1; }
+        string[] names = ["PA0 DCK ", "PA1 LP  ", "PA2 SPS ", "PC4 LDR1", "PC5 LDR2"];
+        for (var c = 0; c < 5; c++)
+        {
+            var lo = BitConverter.ToUInt16(b, 8 + c * 4) * 3.3 / 4095;
+            var hi = BitConverter.ToUInt16(b, 10 + c * 4) * 3.3 / 4095;
+            Console.WriteLine($"{names[c]}: {lo:F2} 〜 {hi:F2} V");
+        }
+        Console.WriteLine("(GBAロジックHなら~2.4-2.9V / nanoの3.3V電源張り付きならGND浮き疑い / 変動大なら信号あり)");
+        return 0;
+    }
     case "cmd":
     {
         using var dev = Open(context);
