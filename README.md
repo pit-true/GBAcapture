@@ -3,6 +3,14 @@
 Game Boy Advance の映像信号を nanoCH32V305 (WCH CH32V305, RISC-V) で取り込み、
 USB-HS 経由で Windows PC にストリーミングする自作キャプチャシステム。
 
+**2026-07-05: 初キャプチャ成功！**
+
+![first light](docs/captures/2026-07-05_first-light.png)
+
+```bash
+cd host && dotnet run --project GbaCap.Cli -- capture out.bmp
+```
+
 ## 構成
 
 ```

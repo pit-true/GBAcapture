@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 14     // v0.14: 'A' ADC電圧計測を追加（GND浮き判定用）
+#define FW_VERSION 15     // v0.15: キャプチャをSPL方式に変更（PA2の実信号はSPSでなくSPLと判明）
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -50,39 +50,54 @@ void EXTI1_IRQHandler( void ) __attribute__((interrupt));
 void EXTI1_IRQHandler( void )
 {
 	EXTI->INTFR = 1 << 1;
-	g_lp_count++;
-
-	if( g_cap_state == 2 )
-	{
-		// LP = ライン確定。範囲内ならこのラインのDMA転送が完了しているはず
-		if( g_cap_line >= g_cap_start && g_cap_line < (uint16_t)( g_cap_start + g_cap_count ) )
-			g_cap_filled++;
-		g_cap_line++;
-		if( g_cap_filled >= g_cap_count )
-		{
-			DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
-			g_cap_state = 3;
-		}
-		else if( g_cap_line >= g_cap_start && g_cap_line < (uint16_t)( g_cap_start + g_cap_count ) )
-		{
-			CapArmDma( g_cap_line - g_cap_start );
-		}
-	}
+	g_lp_count++; // LP は計測のみ（キャプチャは SPL 駆動）
 }
+
+// PA2 の実信号は SPL（可視ライン開始パルス、160回/フレーム。VBLANK中は約5ms休止）。
+// 「前回パルスからのギャップが長い → 次はライン0」でフレーム同期する。
+static uint32_t g_spl_last;
+static volatile uint16_t g_spl_line; // 現在の可視ライン番号 (0-159)
 
 void EXTI2_IRQHandler( void ) __attribute__((interrupt));
 void EXTI2_IRQHandler( void )
 {
 	EXTI->INTFR = 1 << 2;
-	g_sps_count++;
+	g_sps_count++; // 名前は歴史的経緯。実体は SPL のパルス数
 
-	if( g_cap_state == 1 )
+	uint32_t now = SysTick->CNT;
+	uint32_t gap = now - g_spl_last;
+	g_spl_last = now;
+	// ライン周期 ≈73µs。150µs 超のギャップは VBLANK 明け = ライン0
+	int frame_start = ( gap > ( Ticks_from_Ms( 1 ) * 150 ) / 1000 );
+
+	if( frame_start )
+		g_spl_line = 0;
+	else if( g_spl_line < 227 )
+		g_spl_line++;
+
+	if( g_cap_state == 1 && frame_start )
 	{
-		g_cap_line = 0;
 		g_cap_filled = 0;
 		g_cap_state = 2;
-		if( g_cap_start == 0 )
-			CapArmDma( 0 );
+	}
+	if( g_cap_state == 2 )
+	{
+		uint16_t line = g_spl_line;
+		// 直前のラインが範囲内なら、そのDMA転送(240サンプル)は完了している
+		// (frame_start の場合の直前ライン = 前フレームの159)
+		uint16_t prev = frame_start ? 159 : ( line == 0 ? 0xFFFF : (uint16_t)( line - 1 ) );
+		if( prev != 0xFFFF
+			&& prev >= g_cap_start && prev < (uint16_t)( g_cap_start + g_cap_count ) )
+			g_cap_filled++;
+		if( g_cap_filled >= g_cap_count )
+		{
+			DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+			g_cap_state = 3;
+		}
+		else if( line >= g_cap_start && line < (uint16_t)( g_cap_start + g_cap_count ) )
+		{
+			CapArmDma( line - g_cap_start ); // このラインの 240 DCK を取り込む
+		}
 	}
 }
 
@@ -396,7 +411,7 @@ static void HandleCaptureCmd( const uint8_t * cmd )
 	uint16_t start, count;
 	memcpy( &start, cmd + 6, 2 );
 	memcpy( &count, cmd + 8, 2 );
-	if( count == 0 || count > CAP_MAX_LINES || start + count > 228 )
+	if( count == 0 || count > CAP_MAX_LINES || start + count > 160 )
 	{
 		Reply8( 'l', 1, 0, 0 );
 		return;
