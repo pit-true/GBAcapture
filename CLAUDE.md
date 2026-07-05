@@ -40,16 +40,16 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
   (`tools/wchisp-win-x64/wchisp.exe`) / xPack RISC-V GCC 15.2.0 (`tools/`) /
   native make (ezwinports) / ch32fun クローン済み
 - ホスト側を C# (.NET 8 + xUnit) へ移行完了、テスト14件 green（`cd host && dotnet test`）
-- **M0 ファームウェア `firmware/m0-blink` ビルド成功済み**、実機書き込みは未
-  （ユーザーの ISP 突入操作待ち: BOOT押したまま→RST押して離す→BOOT離す）
-- ⚠️ 未解決の謎: チップに既存FW「GBA Capture Device」(VID 1209/PID C001) が
-  書かれている。由来をユーザーに確認中。書き込めば上書きされる
+- **M0 実機書き込み成功（2026-07-05）**: Zadig で WinUSB 割当（一度きりの作業）→
+  `wchisp flash` → verify → 自動リセットまで確認。書き込みパイプライン確立
+- チップにあった旧FW「GBA Capture Device」(1209:C001) はユーザーの過去のテストの名残
+  と判明、上書き済み
 - **FW実装方式: ch32fun に決定**（docs/architecture.md 参照。
   雛形 = examples_v30x/turbo_adc_with_usb と usbdevice_hs）
 - 信号仕様は文献検証済み（DCKはバーストクロック・負エッジ有効。docs/gba-video-signal.md）
 - ブートローダ突入は MODEフラグ+ソフトリセット方式（docs/flashing.md にコード掲載、実機未実証）
-- 次の作業: M0 = Lチカ + wchisp 手放し書き込みループの確立（docs/architecture.md）
-  ※初回書き込みのみユーザーに BOOT ボタン操作を依頼する必要あり
+- 次の作業: **M0.5 = USBHS デバイス化 + CMD_ENTER_BOOTLOADER で手放しループ完成**。
+  それまでの ISP 突入はユーザーに「BOOT押したまま→RST押して離す→BOOT離す」を依頼
 
 ## スキル
 
