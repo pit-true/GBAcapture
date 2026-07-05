@@ -55,13 +55,16 @@ GBA LCD信号 ──> [nanoCH32V305]                          ──USB-HS──
 - WCH 公式 EVT (https://github.com/openwch/ch32v307) はレジスタ参照実装として併用
 - Rust (ch32-hal) は USBHS ドライバの成熟度が低く見送り
 
-## ホスト側 (Windows 専用ソフト)
+## ホスト側 (Windows 専用ソフト) — **C# / .NET 8**（2026-07-05 ユーザー指定）
 
-- 段階1 (現在): **Python + pyusb (WinUSB)** — 受信 → デコード → PNG保存/簡易表示
-  - デコードロジック (GPIOビット→RGB888) は pytest で TDD（docs/tdd.md）
-- 段階2: リアルタイム表示（pygame/SDL）、フレーム落ち統計
+- `host/GBAcapture.sln`: `GbaCap`（コアライブラリ）+ `GbaCap.Tests`（xUnit、TDD）
+- デコード/パケット解析/フレーム復元は純粋ロジックとして `GbaCap` に実装済み（テスト14件）
+- USB アクセス: WinUSB を直接 P/Invoke するか `LibUsbDotNet` / `WinUSBNet` を利用（M3で選定）
+- 段階1: 受信 → デコード → PNG保存/簡易表示（WinForms/WPF の簡易ビューア）
+- 段階2: リアルタイム表示、フレーム落ち統計
 - 段階3: 録画（将来は UVC 化で標準ソフト対応。docs/roadmap.md）
-- ドライバ: WCH デバイスに WinUSB を Zadig で割当（要確認）
+- ドライバ: デバイスに WinUSB を割当（FW の MSOS ディスクリプタで自動割当できると理想。
+  当面は Zadig で手動割当）
 
 ## 開発マイルストーン
 

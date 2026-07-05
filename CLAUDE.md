@@ -10,32 +10,40 @@ GBA の LCD 信号を nanoCH32V305 で取り込み USB-HS で Windows PC に送�
 ## 絶対ルール
 
 1. **t-wada 流 TDD で開発する**（docs/tdd.md）。テストリスト → Red → Green → Refactor
-2. **配線を変更・仮定したら docs/wiring.md を必ず更新**（記載順は GBA側-nano側）
-3. 未検証の数値・仕様は「要検証」と明記し、実測で確認したら文書を更新する
-4. ユーザーとのやり取りは日本語
-5. 書き込みは wchisp を使い、Claude 上で完結させる（docs/flashing.md の手放しループ）。
-   手放しループ確立前に物理操作（BOOT押下・抜き差し）が必要な場合は、
-   具体的な手順を明示してユーザーに依頼する
+2. **配線は最終確定済み・変更提案禁止**（パターン剥がれ懸念。docs/wiring.md が正）
+3. **ホスト側（受信・表示）は C# / .NET 8、FW は C (ch32fun)**（ユーザー指定）
+4. 未検証の数値・仕様は「要検証」と明記し、実測で確認したら文書を更新する
+5. ユーザーとのやり取りは日本語
+6. 書き込みは wchisp を使い、Claude 上で完結させる（docs/flashing.md の手放しループ）。
+   物理操作が必要な場合の依頼文言:
+   「BOOTを押したまま → RSTを押して離す → BOOTを離す」（ISP突入。抜き差し不要）
+7. GitHub リモート: https://github.com/pit-true/GBAcapture（main に push）
 
 ## よく使うコマンド
 
 ```bash
 # ホスト側テスト (TDD)
-cd host && python -m pytest -q
+cd host && dotnet test
 
-# FWビルド (ツールチェーン確定後に追記)
-# 書き込み: wchisp flash <bin>  (詳細は docs/flashing.md)
+# FWビルド
+cd firmware && ./build.sh m0-blink
+
+# 書き込み (詳細は docs/flashing.md と .claude/skills/flash)
+tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
 ```
 
 ## 現在の状態 (2026-07-05 更新)
 
 - 配線完了（ユーザー実施済み、docs/wiring.md に記録）
 - ドキュメント・プロジェクト骨格・ホスト側デコード/パケット解析（テスト11件 green）作成済み
-- 環境構築完了（docs/setup.md）: Python 3.12 + pytest / wchisp v0.3.0
+- 環境構築完了（docs/setup.md）: .NET 8 SDK / wchisp v0.3.0
   (`tools/wchisp-win-x64/wchisp.exe`) / xPack RISC-V GCC 15.2.0 (`tools/`) /
   native make (ezwinports) / ch32fun クローン済み
-- **M0 ファームウェア `firmware/m0-blink` ビルド成功済み**（`cd firmware && ./build.sh m0-blink`）。
-  実機書き込みは未（初回はユーザーの BOOT 操作待ち）
+- ホスト側を C# (.NET 8 + xUnit) へ移行完了、テスト14件 green（`cd host && dotnet test`）
+- **M0 ファームウェア `firmware/m0-blink` ビルド成功済み**、実機書き込みは未
+  （ユーザーの ISP 突入操作待ち: BOOT押したまま→RST押して離す→BOOT離す）
+- ⚠️ 未解決の謎: チップに既存FW「GBA Capture Device」(VID 1209/PID C001) が
+  書かれている。由来をユーザーに確認中。書き込めば上書きされる
 - **FW実装方式: ch32fun に決定**（docs/architecture.md 参照。
   雛形 = examples_v30x/turbo_adc_with_usb と usbdevice_hs）
 - 信号仕様は文献検証済み（DCKはバーストクロック・負エッジ有効。docs/gba-video-signal.md）

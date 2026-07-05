@@ -25,10 +25,10 @@ Windows PC (専用キャプチャソフト)
 | パス | 内容 |
 |---|---|
 | `docs/` | 設計・配線・信号仕様・書き込み手順などのドキュメント |
-| `firmware/` | CH32V305 ファームウェア |
-| `host/` | Windows 側キャプチャソフト |
-| `tests/` | ホストで走るユニットテスト (pytest) |
+| `firmware/` | CH32V305 ファームウェア (C, ch32fun ベース) |
+| `host/` | Windows 側キャプチャソフト (C# / .NET 8, xUnit で TDD) |
 | `.claude/skills/` | Claude Code 用スキル |
+| `tools/` | wchisp・RISC-V GCC・ボード資料など（.gitignore 対象、docs/setup.md で再取得） |
 
 ## ドキュメント索引
 

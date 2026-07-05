@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GbaCap", "GbaCap\GbaCap.csproj", "{2EA5DC16-F2B7-44A2-A2D3-0CC148D4D7B0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GbaCap.Tests", "GbaCap.Tests\GbaCap.Tests.csproj", "{8FA73F2B-C710-49DF-8FB5-4F3B0370B8F0}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2EA5DC16-F2B7-44A2-A2D3-0CC148D4D7B0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2EA5DC16-F2B7-44A2-A2D3-0CC148D4D7B0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2EA5DC16-F2B7-44A2-A2D3-0CC148D4D7B0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2EA5DC16-F2B7-44A2-A2D3-0CC148D4D7B0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8FA73F2B-C710-49DF-8FB5-4F3B0370B8F0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8FA73F2B-C710-49DF-8FB5-4F3B0370B8F0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8FA73F2B-C710-49DF-8FB5-4F3B0370B8F0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8FA73F2B-C710-49DF-8FB5-4F3B0370B8F0}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

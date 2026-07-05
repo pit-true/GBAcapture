@@ -6,7 +6,7 @@
 
 | ツール | 入手方法 | 場所 |
 |---|---|---|
-| Python 3.12 + pytest | `winget install Python.Python.3.12` → `py -3.12 -m pip install pytest` | `py -3.12` で起動 |
+| .NET 8 SDK (8.0.412) | 導入済みだった（無ければ `winget install Microsoft.DotNet.SDK.8`） | `dotnet` |
 | wchisp v0.3.0 | GitHub releases プレビルド (`gh release download v0.3.0 -R ch32-rs/wchisp -p '*win-x64*'`) | `tools/wchisp-win-x64/wchisp.exe` |
 | xPack RISC-V GCC | `gh release download -R xpack-dev-tools/riscv-none-elf-gcc-xpack -p '*win32-x64.zip'` | `tools/xpack-riscv-none-elf-gcc-*/` |
 | GNU Make 4.4.1 (native) | `winget install ezwinports.make` | `%LOCALAPPDATA%\Microsoft\WinGet\Links\make.exe` |
@@ -31,17 +31,17 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin   # 書き�
 
 書き込みフロー全体は docs/flashing.md と `.claude/skills/flash/` を参照。
 
-## ホスト側テスト
+## ホスト側テスト (C#)
 
 ```bash
-cd host && py -3.12 -m pytest -q
+cd host && dotnet test
 ```
 
 ## hooks 提案（未導入・ユーザー承認待ち）
 
 `.claude/settings.json` に設定すれば Claude Code が自動実行する。承認されたら update-config スキルで導入する。
 
-1. **pytest 自動実行**: PostToolUse (Edit|Write, `host/**/*.py`) → `cd host && py -3.12 -m pytest -q`
+1. **テスト自動実行**: PostToolUse (Edit|Write, `host/**/*.cs`) → `cd host && dotnet test`
    TDD のリズム維持。編集のたびに Red/Green が即座に見える
 2. **FWビルド検証**: PostToolUse (Edit|Write, `firmware/**/*.{c,h}`) → `cd firmware && ./build.sh m0-blink`
    コンパイルエラーの早期検出（対象ディレクトリはマイルストーンごとに更新）
