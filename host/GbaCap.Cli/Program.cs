@@ -150,19 +150,20 @@ static IUsbDevice? Reopen(UsbContext ctx, bool expectIapMode, int timeoutMs)
     Thread.Sleep(1500);
     while (Environment.TickCount64 < deadline)
     {
+        IUsbDevice? dev = null;
         try
         {
-            var dev = ctx.Find(d => d.VendorId == Vid && d.ProductId == Pid);
+            dev = ctx.Find(d => d.VendorId == Vid && d.ProductId == Pid);
             if (dev is not null)
             {
                 dev.Open();
                 dev.ClaimInterface(0);
                 var (mode, _) = Ping(dev);
                 if ((mode == 0xAA) == expectIapMode) return dev;
-                dev.Dispose();
             }
         }
         catch { /* 列挙途中は失敗し得る。リトライ */ }
+        dev?.Dispose(); // 解放しないと以降の open が失敗し続ける
         Thread.Sleep(500);
     }
     return null;

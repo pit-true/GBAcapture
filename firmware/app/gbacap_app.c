@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 8      // v0.8
+#define FW_VERSION 9      // v0.9 (手放し更新ループの実証で更新)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
