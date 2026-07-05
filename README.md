@@ -35,7 +35,8 @@ Windows PC (専用キャプチャソフト)
 - [docs/wiring.md](docs/wiring.md) — **配線表（正）**。GBA ↔ nanoCH32V305
 - [docs/gba-video-signal.md](docs/gba-video-signal.md) — GBA LCD 信号仕様
 - [docs/architecture.md](docs/architecture.md) — キャプチャ方式・DMA設計・USBプロトコル
-- [docs/flashing.md](docs/flashing.md) — wchisp による書き込みと**手放し開発ループ**
+- [docs/hands-free-loop.md](docs/hands-free-loop.md) — **ボタンフリー開発ループ（IAP方式）の方法と手順**
+- [docs/flashing.md](docs/flashing.md) — 書き込み方式の検討経緯・純正ISP調査記録・救済手順
 - [docs/tdd.md](docs/tdd.md) — t-wada 流 TDD の運用ルール
 - [docs/roadmap.md](docs/roadmap.md) — 将来計画（音声デジタル取得 / UVC / 録画デバイス）
 

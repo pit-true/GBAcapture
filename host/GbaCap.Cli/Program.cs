@@ -110,6 +110,21 @@ switch (args[0])
         Console.WriteLine($"更新完了! APP v0.{ver2} が起動しました");
         return 0;
     }
+    case "rawdiag": // 生ピン診断 ('R'): エッジ数/デューティ/GPIOB活動
+    {
+        using var dev = Open(context);
+        if (dev is null) return 1;
+        var b = Transact(dev, MakeCmd('R'), 44, timeoutMs: 5000);
+        if (b[4] != 'R') { Console.Error.WriteLine("rawdiag 失敗"); return 1; }
+        var loops = BitConverter.ToUInt32(b, 40);
+        string Pct(int off) => $"{100.0 * BitConverter.ToUInt32(b, off) / loops:F1}%";
+        Console.WriteLine($"サンプル数: {loops}");
+        Console.WriteLine($"PA0 (DCK): エッジ {BitConverter.ToUInt32(b, 8),8}, H率 {Pct(20)}");
+        Console.WriteLine($"PA1 (LP) : エッジ {BitConverter.ToUInt32(b, 12),8}, H率 {Pct(24)}");
+        Console.WriteLine($"PA2 (SPS): エッジ {BitConverter.ToUInt32(b, 16),8}, H率 {Pct(28)}");
+        Console.WriteLine($"GPIOB    : 変化 {BitConverter.ToUInt32(b, 32),8}, OR=0x{BitConverter.ToUInt16(b, 36):X4}, AND=0x{BitConverter.ToUInt16(b, 38):X4}");
+        return 0;
+    }
     case "cmd":
     {
         using var dev = Open(context);

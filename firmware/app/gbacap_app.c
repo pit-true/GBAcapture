@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 9      // v0.9 (手放し更新ループの実証で更新)
+#define FW_VERSION 10     // v0.10: 'R' 生ピン診断を追加
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -120,6 +120,53 @@ static void Reply8( uint8_t tag, uint8_t b5, uint8_t b6, uint8_t b7 )
 	USBHS_SendEndpoint( 4, 8, txbuf ); // data は UEP2_TX_DMA に書かれるが無害。EP4 は既定 DMA(=txbuf) から送信
 }
 
+// 'R': 生ピン診断。PA0/PA1/PA2 と GPIOB をタイトループで大量サンプリングし、
+// エッジ数・Hデューティ・GPIOBの活動ビットを返す。
+// 「信号が本当に来ているか」「浮いてノイズを拾っているだけか」を切り分ける。
+static void ReplyRawDiag( void )
+{
+	if( HSUSBCTX.USBHS_Endp_Busy[4] & 1 ) return;
+
+	const uint32_t LOOPS = 1000000;
+	uint32_t trans[3] = {0,0,0}, high[3] = {0,0,0};
+	uint32_t b_trans = 0;
+	uint16_t b_or = 0, b_and = 0xFFFF;
+	uint32_t prev_a = GPIOA->INDR & 7;
+	uint16_t prev_b = (uint16_t)GPIOB->INDR;
+
+	for( uint32_t i = 0; i < LOOPS; i++ )
+	{
+		uint32_t a = GPIOA->INDR & 7;
+		uint16_t b = (uint16_t)GPIOB->INDR;
+		uint32_t chg = a ^ prev_a;
+		if( chg & 1 ) trans[0]++;
+		if( chg & 2 ) trans[1]++;
+		if( chg & 4 ) trans[2]++;
+		if( a & 1 ) high[0]++;
+		if( a & 2 ) high[1]++;
+		if( a & 4 ) high[2]++;
+		if( b != prev_b ) b_trans++;
+		b_or |= b;
+		b_and &= b;
+		prev_a = a;
+		prev_b = b;
+	}
+
+	uint8_t * t = HSUSBCTX.ENDPOINTS[4];
+	t[0]='G'; t[1]='B'; t[2]='A'; t[3]='C'; t[4]='R'; t[5]=0; t[6]=0; t[7]=0;
+	memcpy( t + 8,  &trans[0], 4 );  // A0(DCK) エッジ数
+	memcpy( t + 12, &trans[1], 4 );  // A1(LP)
+	memcpy( t + 16, &trans[2], 4 );  // A2(SPS)
+	memcpy( t + 20, &high[0], 4 );   // A0 Hだったサンプル数
+	memcpy( t + 24, &high[1], 4 );
+	memcpy( t + 28, &high[2], 4 );
+	memcpy( t + 32, &b_trans, 4 );   // GPIOB が変化した回数
+	memcpy( t + 36, &b_or, 2 );      // 一度でもHになったビット
+	memcpy( t + 38, &b_and, 2 );     // 常にHだったビット
+	memcpy( t + 40, &LOOPS, 4 );
+	USBHS_SendEndpoint( 4, 44, t );
+}
+
 static void ReplyFreq( void )
 {
 	if( HSUSBCTX.USBHS_Endp_Busy[4] & 1 ) return;
@@ -174,6 +221,9 @@ int main()
 				break;
 			case 'F':
 				ReplyFreq();
+				break;
+			case 'R':
+				ReplyRawDiag();
 				break;
 			case 'U':
 				EnterIapUpdater(); // 戻らない
