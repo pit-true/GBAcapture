@@ -190,7 +190,7 @@ switch (args[0])
                 for (var x = 0; x < 240; x++)
                 {
                     var cell = Math.Max(0, x - PixelDecoder.SampleOffset);
-                    px[y, x] = PixelDecoder.DecodeSample(pkt.Samples[cell], pkt.RedLow[cell]);
+                    px[y, x] = PixelDecoder.DecodeSample(pkt.Samples[cell]);
                 }
             else
                 missing++;
@@ -243,6 +243,46 @@ switch (args[0])
         Console.WriteLine("(GBAロジックHなら~2.4-2.9V / nanoの3.3V電源張り付きならGND浮き疑い / 変動大なら信号あり)");
         return 0;
     }
+    case "streamtest": // 'S'を送り2秒間EP4/1/3を読んで統計を出す
+    {
+        using var dev = Open(context);
+        if (dev is null) return 1;
+        Write(dev, MakeCmd('S'));
+        long[] bytes = new long[3];
+        var lineSeen = new HashSet<int>();
+        var epids = new[] { ReadEndpointID.Ep04, ReadEndpointID.Ep01, ReadEndpointID.Ep03 };
+        var threads = new List<Thread>();
+        var stopAt = Environment.TickCount64 + 2000;
+        for (var k = 0; k < 3; k++)
+        {
+            var kk = k;
+            var t = new Thread(() =>
+            {
+                try
+                {
+                    var rd = dev.OpenEndpointReader(epids[kk]);
+                    var b = new byte[65536];
+                    while (Environment.TickCount64 < stopAt)
+                    {
+                        if (rd.Read(b, 300, out var n) != Error.Success) continue;
+                        bytes[kk] += n;
+                        for (var i = 0; i + 4 <= n; i += LinePacket.PacketSize)
+                            if (b[i] == 0xA5)
+                                lock (lineSeen) lineSeen.Add(b[i + 2]);
+                    }
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"EP{epids[kk]}: {ex.Message}"); }
+            });
+            t.Start();
+            threads.Add(t);
+        }
+        foreach (var t in threads) t.Join();
+        Write(dev, MakeCmd('X'));
+        Console.WriteLine($"EP4: {bytes[0]}B, EP1: {bytes[1]}B, EP3: {bytes[2]}B (2秒)");
+        Console.WriteLine($"合計 {(bytes[0] + bytes[1] + bytes[2]) / 2.0 / 1e6:F2} MB/s");
+        Console.WriteLine($"観測ライン番号: {lineSeen.Count}種 min={(lineSeen.Count > 0 ? lineSeen.Min() : -1)} max={(lineSeen.Count > 0 ? lineSeen.Max() : -1)}");
+        return 0;
+    }
     case "cmd":
     {
         using var dev = Open(context);
@@ -275,6 +315,17 @@ static IUsbDevice? Open(UsbContext ctx)
     }
     dev.Open();
     dev.ClaimInterface(0);
+    // ストリーミング停止 + 前セッションの残骸排水（開いた直後に必ず行う）
+    try
+    {
+        var w = dev.OpenEndpointWriter(WriteEndpointID.Ep05);
+        byte[] stop = [(byte)'G', (byte)'B', (byte)'A', (byte)'C', (byte)'X'];
+        w.Write(stop, 500, out _);
+        var rd = dev.OpenEndpointReader(ReadEndpointID.Ep04);
+        var drain = new byte[16384];
+        while (rd.Read(drain, 100, out var dn) == Error.Success && dn > 0) { }
+    }
+    catch { }
     return dev;
 }
 

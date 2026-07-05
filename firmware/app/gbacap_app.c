@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 17     // v0.17: 'S'/'X' 連続ストリーミングモード (M3)
+#define FW_VERSION 20     // v0.20: サーキュラDMAストリーミング + EP1/3/4分散送信
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -46,14 +46,21 @@ static volatile uint16_t g_cap_line;    // 現在のGBAライン番号（SPSで0
 static volatile uint16_t g_cap_filled;
 static void CapArmDma( int slot );
 
-// M3 ストリーミング: 全160ライン/フレームをリングバッファ経由で連続送出
-static volatile uint8_t  g_stream;      // 1=ストリーミング中
-static volatile uint32_t g_str_wr;      // 確定済みライン通し番号 (書き込み側)
-static volatile uint32_t g_str_rd;      // 送信済みライン通し番号 (読み出し側)
-static volatile uint32_t g_str_drop;    // リング満杯で落としたライン数
-static volatile uint8_t  g_str_frame;   // フレーム番号 (SPLギャップごとに+1)
-static struct { uint8_t frame; uint8_t line; } g_str_meta[CAP_MAX_LINES];
-static volatile int g_str_armed_slot = -1; // 直前にアームしたスロット
+// M3 ストリーミング (v0.20 サーキュラDMA方式):
+// - 'S' で DMA をサーキュラモード(7680サンプル=32ライン)で1回だけアーム
+// - DCK が可視区間しか動かないので、サンプル総数はそのままピクセル位置
+// - VBLANK(約5ms)のDMA停止をメインループで検出 → その位置=ライン0先頭(算術で確定)
+// - 割り込みタイミングがデータ経路に入らないため水平ジッタが原理的に出ない
+static volatile uint8_t g_stream;       // 1=ストリーミング中
+#define STR_RING_SAMPLES ( CAP_MAX_LINES * 240 ) // 7680
+static uint32_t g_st_total;      // 取り込んだサンプル総数
+static uint32_t g_st_lastcur;    // 前回のDMA位置
+static uint32_t g_st_sent;       // 送信済みサンプル数
+static uint32_t g_st_anchor;     // ライン0先頭のサンプル総数(フレームアンカー)
+static uint32_t g_st_lastchange; // 最後にDMAが進んだ時刻
+static uint8_t  g_st_anchored;   // アンカー有効
+static uint8_t  g_st_install;    // 今の停止期間でアンカー済み
+static uint8_t  g_st_frame;      // フレーム番号
 
 void EXTI1_IRQHandler( void ) __attribute__((interrupt));
 void EXTI1_IRQHandler( void )
@@ -84,32 +91,10 @@ void EXTI2_IRQHandler( void )
 	else if( g_spl_line < 227 )
 		g_spl_line++;
 
-	// --- ストリーミング (M3) ---
+	// ストリーミング中はSPL割り込みをデータ経路に使わない
+	// （サーキュラDMA + VBLANK休止検出で全て賄う。ジッタ源を排除）
 	if( g_stream )
-	{
-		// 直前ラインのDMAが完了したので確定
-		if( g_str_armed_slot >= 0 )
-		{
-			g_str_wr++;
-			g_str_armed_slot = -1;
-		}
-		if( frame_start )
-			g_str_frame++;
-		// 今ラインをアーム（リングに空きがある場合のみ。満杯なら落として計上）
-		if( g_str_wr - g_str_rd < CAP_MAX_LINES - 1 && g_spl_line < 160 )
-		{
-			int slot = g_str_wr % CAP_MAX_LINES;
-			g_str_meta[slot].frame = g_str_frame;
-			g_str_meta[slot].line = (uint8_t)g_spl_line;
-			CapArmDma( slot );
-			g_str_armed_slot = slot;
-		}
-		else if( g_spl_line < 160 )
-		{
-			g_str_drop++;
-		}
 		return;
-	}
 
 	if( g_cap_state == 1 && frame_start )
 	{
@@ -452,9 +437,52 @@ static void ReplyFreq( void )
 	SendEp4( rep, 20 );
 }
 
+// ストリーミング送出: EP4/EP1/EP3 のうち空いているエンドポイントで1ライン送る。
+// 1EPあたり実効~3.3MB/s(NAK後のホスト再ポーリングがマイクロフレーム単位のため)
+// なので3本に分散して 60fps に必要な ~6.9MB/s を確保する。
+// cbase はサーキュラバッファ内のサンプル開始位置 (240の倍数なのでライン跨ぎなし)
+static const uint8_t k_stream_eps[3] = { 4, 1, 3 };
+static uint8_t g_eptx[3][484];
+static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
+{
+	const uint16_t * bsrc = (const uint16_t *)g_capbuf + cbase;
+	const uint8_t * csrc = (const uint8_t *)g_capbuf_c + cbase;
+	for( int k = 0; k < 3; k++ )
+	{
+		int ep = k_stream_eps[k];
+		if( HSUSBCTX.USBHS_Endp_Busy[ep] & 1 ) continue;
+		uint8_t * pkt = g_eptx[k];
+		pkt[0] = 0xA5;
+		pkt[1] = frame;
+		memcpy( pkt + 2, &line_no, 2 );
+		uint16_t * dst = (uint16_t *)( pkt + 4 );
+		for( int j = 0; j < 240; j++ )
+			dst[j] = bsrc[j] | ( ( csrc[j] & 0x10 ) >> 2 ) | ( ( csrc[j] & 0x20 ) << 1 );
+		// UEPn_TX_DMA は UEP1 から連続配置
+		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
+		USBHS_SendEndpoint( ep, 484, 0 );
+		return 0;
+	}
+	return -1;
+}
+
+// ラインパケット v3 (484B): [0xA5][frame][line u16][240×u16]
+// u16 の空きビットに赤下位2bitを合成する: bit2=LDR1(赤bit0), bit6=LDR2(赤bit1)
+// (GPIOB実配線で bit2/6/7 は未使用。これで1ライン=バルク1パケットに収まり帯域半減)
+static void BuildLinePacket( uint8_t * pkt, uint8_t frame, uint16_t line_no, int slot )
+{
+	pkt[0] = 0xA5;
+	pkt[1] = frame;
+	memcpy( pkt + 2, &line_no, 2 );
+	const uint16_t * b = g_capbuf[slot];
+	const uint8_t * c = g_capbuf_c[slot];
+	uint16_t * dst = (uint16_t *)( pkt + 4 );
+	for( int j = 0; j < 240; j++ )
+		dst[j] = b[j] | ( ( c[j] & 0x10 ) >> 2 ) | ( ( c[j] & 0x20 ) << 1 );
+}
+
 // 'L': ラインキャプチャ。"GBAC"+'L'+pad1+u16開始ライン+u16ライン数(≤32)
-// 成功: 484B のラインパケット(0xA5,フレーム,ライン番号u16,サンプル480B) × ライン数
-// 失敗: 8B応答 {..'l', status, filled, line}
+// 成功: ラインパケットv3 (484B) × ライン数 / 失敗: 8B応答 {..'l', status, filled, line}
 static void HandleCaptureCmd( const uint8_t * cmd )
 {
 	uint16_t start, count;
@@ -489,22 +517,14 @@ static void HandleCaptureCmd( const uint8_t * cmd )
 		return;
 	}
 
-	// ラインパケット v2 (724B): [0xA5][frame][line u16][GPIOB 240×u16][GPIOC 240×u8]
-	// 注意: g_txpkt に直接組み立ててはならない（前パケット送信中に上書きされ
-	// 全パケットが1本ズレるバグの原因だった）。ステージング経由で送る
-	static uint8_t pkt[724];
+	static uint8_t pkt[484];
 	uint8_t frame = (uint8_t)g_sps_count;
 	for( int i = 0; i < count; i++ )
 	{
-		uint16_t line_no = start + i;
-		pkt[0] = 0xA5;
-		pkt[1] = frame;
-		memcpy( pkt + 2, &line_no, 2 );
-		memcpy( pkt + 4, g_capbuf[i], 480 );
-		memcpy( pkt + 484, g_capbuf_c[i], 240 );
-		// 724B は 512B + 212B の2パケットで送る（ホスト側は1回のReadで受く）
-		if( SendEp4( pkt, 512 ) ) return;
-		if( SendEp4( pkt + 512, 212 ) ) return;
+		BuildLinePacket( pkt, frame, start + i, i );
+		// 注意: g_txpkt に直接組み立ててはならない（前パケット送信中に上書きされ
+		// 全パケットが1本ズレるバグの原因だった）。ステージング経由で送る
+		if( SendEp4( pkt, 484 ) ) return;
 	}
 }
 
@@ -573,11 +593,23 @@ int main()
 			case 'L':
 				HandleCaptureCmd( (const uint8_t *)HSUSBCTX.ENDPOINTS[5] );
 				break;
-			case 'S': // ストリーミング開始
+			case 'S': // ストリーミング開始 (サーキュラDMAを1回だけアーム)
 				RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
 				Tim2ConfigCapture();
-				g_str_wr = g_str_rd = g_str_drop = 0;
-				g_str_armed_slot = -1;
+				DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+				DMA1_Channel5->PADDR = (uintptr_t)&GPIOB->INDR;
+				DMA1_Channel5->MADDR = (uintptr_t)g_capbuf;
+				DMA1_Channel5->CNTR = STR_RING_SAMPLES;
+				DMA1_Channel5->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_HalfWord
+				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
+				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
+				DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
+				DMA1_Channel7->PADDR = (uintptr_t)&GPIOC->INDR;
+				DMA1_Channel7->MADDR = (uintptr_t)g_capbuf_c;
+				DMA1_Channel7->CNTR = STR_RING_SAMPLES;
+				DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
+				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
+				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
 				g_stream = 1;
 				break;
 			case 'X': // ストリーミング停止
@@ -593,29 +625,49 @@ int main()
 			}
 		}
 
-		// ストリーミング送出: 確定済みスロットをラインパケットにして送る
+		// ストリーミング消費側: DMA位置を監視し、VBLANK休止でフレーム同期、
+		// 完成ラインを EP1/3/4 の空いているエンドポイントへ送出する
 		if( g_stream )
 		{
-			static uint8_t spkt[724];
-			while( g_str_rd < g_str_wr )
+			uint32_t tnow = SysTick->CNT;
+			uint32_t cur = STR_RING_SAMPLES - DMA1_Channel5->CNTR;
+			uint32_t delta = ( cur + STR_RING_SAMPLES - g_st_lastcur ) % STR_RING_SAMPLES;
+			if( delta )
 			{
-				int slot = g_str_rd % CAP_MAX_LINES;
-				uint16_t line_no = g_str_meta[slot].line;
-				spkt[0] = 0xA5;
-				spkt[1] = g_str_meta[slot].frame;
-				memcpy( spkt + 2, &line_no, 2 );
-				memcpy( spkt + 4, g_capbuf[slot], 480 );
-				memcpy( spkt + 484, g_capbuf_c[slot], 240 );
-				g_str_rd++;
-				if( SendEp4( spkt, 512 ) || SendEp4( spkt + 512, 212 ) )
+				g_st_total += delta;
+				g_st_lastcur = cur;
+				g_st_lastchange = tnow;
+				g_st_install = 0;
+			}
+			else if( !g_st_install
+				&& (uint32_t)( tnow - g_st_lastchange ) > ( Ticks_from_Ms( 1 ) / 4 ) )
+			{
+				// 250µs以上DMAが停止 = VBLANK (H-Blankは~16µsなので誤検出しない)
+				// → 次に来るサンプルがライン0の先頭。ここがフレーム境界
+				g_st_anchor = g_st_total;
+				g_st_sent = g_st_total; // フレーム途中の未送信分は破棄
+				g_st_anchored = 1;
+				g_st_install = 1;
+				g_st_frame++;
+			}
+
+			while( g_st_anchored && g_st_total - g_st_sent >= 240 )
+			{
+				// リング一周分以上遅れたら(上書きされたら)このフレームは諦める
+				if( g_st_total - g_st_sent > STR_RING_SAMPLES - 240 )
 				{
-					g_stream = 0; // ホストが読んでいない → 自動停止
-					DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
-					DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
-					Tim2ConfigCount();
+					g_st_anchored = 0;
 					break;
 				}
-				IWDG->CTLR = 0xAAAA;
+				uint32_t line = ( g_st_sent - g_st_anchor ) / 240;
+				if( line >= 160 )
+				{
+					g_st_anchored = 0; // 次のVBLANKで再アンカー
+					break;
+				}
+				if( TrySendLine( g_st_frame, (uint16_t)line, g_st_sent % STR_RING_SAMPLES ) )
+					break; // 全EP使用中 → 次周で再試行
+				g_st_sent += 240;
 			}
 		}
 

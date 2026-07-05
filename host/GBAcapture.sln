@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GbaCap.Tests", "GbaCap.Test
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GbaCap.Cli", "GbaCap.Cli\GbaCap.Cli.csproj", "{A2A02580-670E-40B6-9999-0C8CE0035928}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GbaCap.Viewer", "GbaCap.Viewer\GbaCap.Viewer.csproj", "{C033843F-F7E5-4197-9B83-CBCF2436A839}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -30,5 +32,9 @@ Global
 		{A2A02580-670E-40B6-9999-0C8CE0035928}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A2A02580-670E-40B6-9999-0C8CE0035928}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A2A02580-670E-40B6-9999-0C8CE0035928}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C033843F-F7E5-4197-9B83-CBCF2436A839}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C033843F-F7E5-4197-9B83-CBCF2436A839}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C033843F-F7E5-4197-9B83-CBCF2436A839}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C033843F-F7E5-4197-9B83-CBCF2436A839}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

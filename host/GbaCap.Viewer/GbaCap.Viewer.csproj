@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\GbaCap\GbaCap.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LibUsbDotNet" Version="3.0.224" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\GbaCap.Cli\native\libusb-1.0.dll" Link="libusb-1.0.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

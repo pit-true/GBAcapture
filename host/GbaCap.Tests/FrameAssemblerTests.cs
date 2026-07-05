@@ -13,7 +13,7 @@ public class FrameAssemblerTests
     {
         var samples = new ushort[Width];
         Array.Fill(samples, fill);
-        return new LinePacket(frameNo, lineNo, samples, new byte[Width]);
+        return new LinePacket(frameNo, lineNo, samples);
     }
 
     [Fact]

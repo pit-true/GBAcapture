@@ -37,7 +37,7 @@ static const uint8_t config_descriptor[] = {
 	/* Configuration Descriptor */
 	0x09,       // bLength
 	0x02,       // bDescriptorType (Configuration)
-	0x20, 0x00, // wTotalLength (9+9+7+7 = 32)
+	0x2e, 0x00, // wTotalLength (9+9+7×4 = 46)
 	0x01,       // bNumInterfaces
 	0x01,       // bConfigurationValue
 	0x00,       // iConfiguration
@@ -49,27 +49,23 @@ static const uint8_t config_descriptor[] = {
 	0x04,       // bDescriptorType (Interface)
 	0x00,       // bInterfaceNumber
 	0x00,       // bAlternateSetting
-	0x02,       // bNumEndpoints
+	0x04,       // bNumEndpoints
 	0xff,       // bInterfaceClass (Vendor)
 	0xff,       // bInterfaceSubClass
 	0xff,       // bInterfaceProtocol
 	0x00,       // iInterface
 
-	/* Endpoint Descriptor: EP4 IN (Bulk, 512B) */
-	0x07,       // bLength
-	0x05,       // bDescriptorType (Endpoint)
-	0x84,       // bEndpointAddress: IN 4
-	0x02,       // bmAttributes: Bulk
-	0x00, 0x02, // wMaxPacketSize: 512
-	0x00,       // bInterval
+	/* Endpoint Descriptor: EP4 IN (Bulk, 512B) — コマンド応答 + ストリーム */
+	0x07, 0x05, 0x84, 0x02, 0x00, 0x02, 0x00,
 
-	/* Endpoint Descriptor: EP5 OUT (Bulk, 512B) */
-	0x07,       // bLength
-	0x05,       // bDescriptorType (Endpoint)
-	0x05,       // bEndpointAddress: OUT 5
-	0x02,       // bmAttributes: Bulk
-	0x00, 0x02, // wMaxPacketSize: 512
-	0x00,       // bInterval
+	/* Endpoint Descriptor: EP1 IN (Bulk, 512B) — ストリーム分散用 */
+	0x07, 0x05, 0x81, 0x02, 0x00, 0x02, 0x00,
+
+	/* Endpoint Descriptor: EP3 IN (Bulk, 512B) — ストリーム分散用 */
+	0x07, 0x05, 0x83, 0x02, 0x00, 0x02, 0x00,
+
+	/* Endpoint Descriptor: EP5 OUT (Bulk, 512B) — コマンド受信 */
+	0x07, 0x05, 0x05, 0x02, 0x00, 0x02, 0x00,
 };
 
 #define STR_MANUFACTURER u"pit-true"

@@ -3,17 +3,17 @@ using System.Buffers.Binary;
 namespace GbaCap;
 
 /// <summary>
-/// USB ラインパケット v2 (724B):
-/// [0xA5][フレーム番号][ライン番号u16LE][GPIOBサンプル240×u16LE][GPIOC下位バイト240×u8]
-/// GPIOC バイトは bit4=LDR1(赤bit0), bit5=LDR2(赤bit1)。フォーマットの正は docs/architecture.md。
+/// USB ラインパケット v3 (484B):
+/// [0xA5][フレーム番号][ライン番号u16LE][サンプル240×u16LE]
+/// サンプルは FW が赤下位2bitを bit2/bit6 に合成済みの15bit値。
 /// </summary>
-public sealed record LinePacket(byte FrameNo, ushort LineNo, ushort[] Samples, byte[] RedLow)
+public sealed record LinePacket(byte FrameNo, ushort LineNo, ushort[] Samples)
 {
     public const byte Magic = 0xA5;
     public const int SamplesPerLine = 240;
-    public const int PacketSize = 4 + SamplesPerLine * 2 + SamplesPerLine; // 724
+    public const int PacketSize = 4 + SamplesPerLine * 2; // 484
 
-    /// <summary>724Bのラインパケットを解析する。マジック不一致は null。サイズ不正は例外。</summary>
+    /// <summary>484Bのラインパケットを解析する。マジック不一致は null。サイズ不正は例外。</summary>
     public static LinePacket? Parse(ReadOnlySpan<byte> data)
     {
         if (data.Length != PacketSize)
@@ -25,7 +25,6 @@ public sealed record LinePacket(byte FrameNo, ushort LineNo, ushort[] Samples, b
         var samples = new ushort[SamplesPerLine];
         for (var i = 0; i < SamplesPerLine; i++)
             samples[i] = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(4 + i * 2, 2));
-        var redLow = data.Slice(4 + SamplesPerLine * 2, SamplesPerLine).ToArray();
-        return new LinePacket(data[1], lineNo, samples, redLow);
+        return new LinePacket(data[1], lineNo, samples);
     }
 }
