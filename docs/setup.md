@@ -36,3 +36,14 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin   # 書き�
 ```bash
 cd host && py -3.12 -m pytest -q
 ```
+
+## hooks 提案（未導入・ユーザー承認待ち）
+
+`.claude/settings.json` に設定すれば Claude Code が自動実行する。承認されたら update-config スキルで導入する。
+
+1. **pytest 自動実行**: PostToolUse (Edit|Write, `host/**/*.py`) → `cd host && py -3.12 -m pytest -q`
+   TDD のリズム維持。編集のたびに Red/Green が即座に見える
+2. **FWビルド検証**: PostToolUse (Edit|Write, `firmware/**/*.{c,h}`) → `cd firmware && ./build.sh m0-blink`
+   コンパイルエラーの早期検出（対象ディレクトリはマイルストーンごとに更新）
+3. **配線表更新リマインド**: PostToolUse で `PA\d|PB\d|PC\d` を含む FW 編集時に
+   「docs/wiring.md と整合しているか確認」と注意喚起（additionalContext 出力）
