@@ -60,6 +60,27 @@ switch (args[0])
         Console.WriteLine("ブートローダ突入コマンド送信済み。数秒後に wchisp が使えます。");
         return 0;
     }
+    case "freq": // GBA信号の実測周波数を表示 (M1)
+    {
+        Send(writer, (byte)'F');
+        var reader = device.OpenEndpointReader(ReadEndpointID.Ep04);
+        var buf = new byte[512];
+        var ec = reader.Read(buf, 2000, out var got);
+        if (ec != Error.Success || got < 20 || buf[4] != 'F')
+        {
+            Console.Error.WriteLine($"freq 失敗: {ec}, {got}B");
+            return 1;
+        }
+        var dck = BitConverter.ToUInt32(buf, 8);
+        var lp = BitConverter.ToUInt32(buf, 12);
+        var sps = BitConverter.ToUInt32(buf, 16);
+        Console.WriteLine($"DCK: {dck,10} Hz (基準: バースト合計。38400×59.73≒2293632 か 54720×59.73≒3268426)");
+        Console.WriteLine($"LP : {lp,10} Hz (期待: 13618 ≒ 4194304/308)");
+        Console.WriteLine($"SPS: {sps,10} Hz (期待: 59.73 → 59 or 60)");
+        if (sps > 0)
+            Console.WriteLine($"DCK/フレーム: {(double)dck / sps:F0}, LP/フレーム: {(double)lp / sps:F1}");
+        return 0;
+    }
     case "cmd": // 任意コマンド送信+応答ダンプ (診断用): cmd S / cmd T など
     {
         Send(writer, (byte)args[1][0]);
