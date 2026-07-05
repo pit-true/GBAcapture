@@ -28,7 +28,7 @@ public sealed class FrameAssembler
 
         var line = new (byte R, byte G, byte B)[LinePacket.SamplesPerLine];
         for (var x = 0; x < LinePacket.SamplesPerLine; x++)
-            line[x] = PixelDecoder.DecodeGpiobSample(pkt.Samples[x]);
+            line[x] = PixelDecoder.DecodeSample(pkt.Samples[x], pkt.RedLow[x]);
         _lines[pkt.LineNo] = line;
 
         if (_lines.Count != LinesPerFrame)

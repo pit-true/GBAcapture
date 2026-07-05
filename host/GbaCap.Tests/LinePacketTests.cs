@@ -2,16 +2,18 @@ using GbaCap;
 
 namespace GbaCap.Tests;
 
-// USB ラインパケット解析のテスト。
+// USB ラインパケット v2 解析のテスト。
 // フォーマット (docs/architecture.md):
 //   ヘッダ4B: マジック 0xA5, フレーム番号 uint8, ライン番号 uint16(LE)
-//   ペイロード: 240 サンプル × uint16(LE) = 480B、計 484B
+//   ペイロード: GPIOB 240×uint16(LE)=480B + GPIOC下位バイト 240×uint8=240B、計 724B
 public class LinePacketTests
 {
-    private static byte[] MakePacket(byte frameNo = 0, ushort lineNo = 0, ushort[]? samples = null)
+    private static byte[] MakePacket(byte frameNo = 0, ushort lineNo = 0,
+        ushort[]? samples = null, byte[]? redLow = null)
     {
         samples ??= new ushort[240];
-        var data = new byte[4 + samples.Length * 2];
+        redLow ??= new byte[240];
+        var data = new byte[4 + 480 + 240];
         data[0] = 0xA5;
         data[1] = frameNo;
         data[2] = (byte)(lineNo & 0xFF);
@@ -21,13 +23,14 @@ public class LinePacketTests
             data[4 + i * 2] = (byte)(samples[i] & 0xFF);
             data[5 + i * 2] = (byte)(samples[i] >> 8);
         }
+        redLow.CopyTo(data, 484);
         return data;
     }
 
     [Fact]
-    public void パケットサイズは484バイト()
+    public void パケットサイズは724バイト()
     {
-        Assert.Equal(484, LinePacket.PacketSize);
+        Assert.Equal(724, LinePacket.PacketSize);
     }
 
     [Fact]
@@ -39,12 +42,14 @@ public class LinePacketTests
     }
 
     [Fact]
-    public void サンプル240個が取り出せる()
+    public void サンプル240個と赤下位バイト240個が取り出せる()
     {
         var samples = Enumerable.Range(0, 240).Select(i => (ushort)i).ToArray();
-        var pkt = LinePacket.Parse(MakePacket(samples: samples));
+        var redLow = Enumerable.Range(0, 240).Select(i => (byte)(i & 0x30)).ToArray();
+        var pkt = LinePacket.Parse(MakePacket(samples: samples, redLow: redLow));
         Assert.NotNull(pkt);
         Assert.Equal(samples, pkt.Samples);
+        Assert.Equal(redLow, pkt.RedLow);
     }
 
     [Fact]

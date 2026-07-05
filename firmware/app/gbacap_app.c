@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 15     // v0.15: キャプチャをSPL方式に変更（PA2の実信号はSPSでなくSPLと判明）
+#define FW_VERSION 16     // v0.16: 送信上書きバグ修正 + 赤下位2bit(GPIOC)第2DMA取得
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -92,6 +92,7 @@ void EXTI2_IRQHandler( void )
 		if( g_cap_filled >= g_cap_count )
 		{
 			DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+			DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
 			g_cap_state = 3;
 		}
 		else if( line >= g_cap_start && line < (uint16_t)( g_cap_start + g_cap_count ) )
@@ -129,9 +130,12 @@ static void SignalCountersInit( void )
 }
 
 // --- M2: DMAラインキャプチャ ---
-// TIM2_CH1(PA0=DCK) の入力キャプチャ(負エッジ)ごとに DMA1_CH5 が GPIOB->INDR を
-// ラインバッファへ転送する。LP(EXTI1)でライン確定、SPS(EXTI2)でライン番号リセット。
+// DCK(PA0=TI1) の負エッジごとに:
+//   CC1イベント → DMA1_CH5 が GPIOB->INDR(16bit) をラインバッファへ
+//   CC2イベント(同じTI1をIC2に写像) → DMA1_CH7 が GPIOC->INDR下位バイトへ
+//   (PC4/PC5 = 赤の下位2bit)
 static uint16_t g_capbuf[CAP_MAX_LINES][240];
+static uint8_t  g_capbuf_c[CAP_MAX_LINES][240];
 
 static void CapArmDma( int slot )
 {
@@ -142,16 +146,24 @@ static void CapArmDma( int slot )
 	DMA1_Channel5->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_HalfWord
 	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 	                    | DMA_CFGR1_EN;
+
+	DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
+	DMA1_Channel7->PADDR = (uintptr_t)&GPIOC->INDR;
+	DMA1_Channel7->MADDR = (uintptr_t)g_capbuf_c[slot];
+	DMA1_Channel7->CNTR = 240;
+	DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
+	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
+	                    | DMA_CFGR1_EN;
 }
 
 // TIM2 を「DCK負エッジで入力キャプチャ→DMA要求」モードにする（キャプチャ用）
 static void Tim2ConfigCapture( void )
 {
 	TIM2->CTLR1 = 0;
-	TIM2->SMCFGR = 0;                       // 内部クロック
-	TIM2->CHCTLR1 = 0x01;                   // CC1S=01: TI1
-	TIM2->CCER = TIM_CC1E | TIM_CC1P;       // 負エッジでキャプチャ
-	TIM2->DMAINTENR = TIM_CC1DE;            // CC1 で DMA 要求
+	TIM2->SMCFGR = 0;                        // 内部クロック
+	TIM2->CHCTLR1 = 0x01 | (0x02 << 8);      // CC1S=01(TI1), CC2S=10(TI1をIC2へ)
+	TIM2->CCER = TIM_CC1E | TIM_CC1P | TIM_CC2E | TIM_CC2P; // 両ch負エッジ
+	TIM2->DMAINTENR = TIM_CC1DE | TIM_CC2DE; // CC1→DMA1_CH5, CC2→DMA1_CH7
 	TIM2->ATRLR = 0xFFFF;
 	TIM2->CTLR1 = TIM_CEN;
 }
@@ -430,6 +442,7 @@ static void HandleCaptureCmd( const uint8_t * cmd )
 	uint16_t filled = g_cap_filled, lastline = g_cap_line;
 	g_cap_state = 0;
 	DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+	DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
 	Tim2ConfigCount();
 
 	if( !done )
@@ -438,15 +451,22 @@ static void HandleCaptureCmd( const uint8_t * cmd )
 		return;
 	}
 
+	// ラインパケット v2 (724B): [0xA5][frame][line u16][GPIOB 240×u16][GPIOC 240×u8]
+	// 注意: g_txpkt に直接組み立ててはならない（前パケット送信中に上書きされ
+	// 全パケットが1本ズレるバグの原因だった）。ステージング経由で送る
+	static uint8_t pkt[724];
 	uint8_t frame = (uint8_t)g_sps_count;
 	for( int i = 0; i < count; i++ )
 	{
 		uint16_t line_no = start + i;
-		g_txpkt[0] = 0xA5;
-		g_txpkt[1] = frame;
-		memcpy( g_txpkt + 2, &line_no, 2 );
-		memcpy( g_txpkt + 4, g_capbuf[i], 480 );
-		if( SendEp4( g_txpkt, 484 ) ) return; // ホストが読まない場合は中断
+		pkt[0] = 0xA5;
+		pkt[1] = frame;
+		memcpy( pkt + 2, &line_no, 2 );
+		memcpy( pkt + 4, g_capbuf[i], 480 );
+		memcpy( pkt + 484, g_capbuf_c[i], 240 );
+		// 724B は 512B + 212B の2パケットで送る（ホスト側は1回のReadで受く）
+		if( SendEp4( pkt, 512 ) ) return;
+		if( SendEp4( pkt + 512, 212 ) ) return;
 	}
 }
 

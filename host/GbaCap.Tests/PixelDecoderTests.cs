@@ -38,6 +38,22 @@ public class PixelDecoderTests
     }
 
     [Fact]
+    public void GPIOC込みなら赤5bitフルで255になる()
+    {
+        // GPIOB: R3(bit0),R4(bit1),R5(bit10) + GPIOC下位バイト: R1(bit4),R2(bit5)
+        ushort b = (1 << 0) | (1 << 1) | (1 << 10);
+        byte c = (1 << 4) | (1 << 5);
+        Assert.Equal((255, 0, 0), PixelDecoder.DecodeSample(b, c));
+    }
+
+    [Fact]
+    public void GPIOCの赤下位2bitのみで8bit値24になる()
+    {
+        // R1,R2のみ → 5bit値 0b00011 = 3 → (3<<3)|(3>>2) = 24
+        Assert.Equal((24, 0, 0), PixelDecoder.DecodeSample(0, (1 << 4) | (1 << 5)));
+    }
+
+    [Fact]
     public void 五bit中間値の8bit拡張()
     {
         // G=0b00001 (G1=bit11のみ) → (1<<3)|(1>>2) = 8

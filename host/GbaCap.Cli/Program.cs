@@ -117,7 +117,13 @@ switch (args[0])
         using var dev = Open(context);
         if (dev is null) return 1;
         var reader = dev.OpenEndpointReader(ReadEndpointID.Ep04);
-        var lines = new Dictionary<int, ushort[]>();
+        var lines = new Dictionary<int, LinePacket>();
+
+        // 前回実行の残骸がパイプに残っていることがあるため排水する
+        {
+            var drain = new byte[4096];
+            while (reader.Read(drain, 100, out var dn) == Error.Success && dn > 0) { }
+        }
 
         for (var start = 0; start < 160; start += 32)
         {
@@ -128,29 +134,49 @@ switch (args[0])
             BitConverter.GetBytes((ushort)32).CopyTo(cmd, 8);
             Write(dev, cmd);
 
+            // バルクはバイトストリーム。グループ全体 (32×724B) を読み切ってから分割する
+            var total = 32 * LinePacket.PacketSize;
+            var buf = new byte[total];
+            var got = 0;
+            while (got < total)
+            {
+                var ec = reader.Read(buf, got, total - got, 3000, out var n);
+                if (ec != Error.Success || n == 0)
+                {
+                    if (got == 8 && buf[4] == 'l')
+                    {
+                        Console.Error.WriteLine(
+                            $"キャプチャ失敗 status={buf[5]} filled={buf[6]} line={buf[7]}" +
+                            (buf[5] == 2 ? " → SPL信号が検出できていません（配線/GBA電源要確認）" : ""));
+                        return 1;
+                    }
+                    Console.Error.WriteLine($"受信エラー: {ec} (グループ{start}, {got}/{total}B)");
+                    return 1;
+                }
+                got += n;
+            }
+            // 再同期: 先頭に残骸があれば正規ヘッダ位置まで読み捨て、不足分を読み足す
+            var p0 = 0;
+            while (p0 < LinePacket.PacketSize &&
+                   !(buf[p0] == 0xA5 && buf[p0 + 3] == 0 && buf[p0 + 2] < 160))
+                p0++;
+            if (p0 > 0 && p0 < LinePacket.PacketSize)
+            {
+                Console.Error.WriteLine($"(再同期: 残骸 {p0}B を破棄)");
+                Array.Resize(ref buf, total + p0);
+                var got2 = total;
+                while (got2 < total + p0)
+                {
+                    if (reader.Read(buf, got2, total + p0 - got2, 3000, out var n2) != Error.Success || n2 == 0)
+                        break;
+                    got2 += n2;
+                }
+            }
             for (var i = 0; i < 32; i++)
             {
-                var buf = new byte[512];
-                var ec = reader.Read(buf, 3000, out var got);
-                if (ec != Error.Success)
-                {
-                    Console.Error.WriteLine($"受信エラー: {ec} (ライン {start + i})");
-                    return 1;
-                }
-                if (got == 8 && buf[4] == 'l')
-                {
-                    Console.Error.WriteLine(
-                        $"キャプチャ失敗 status={buf[5]} filled={buf[6]} line={buf[7]}" +
-                        (buf[5] == 2 ? " → SPS/LP信号が検出できていません（配線要確認）" : ""));
-                    return 1;
-                }
-                if (got != LinePacket.PacketSize)
-                {
-                    Console.Error.WriteLine($"不正なパケット長 {got}B (ライン {start + i})");
-                    return 1;
-                }
-                var pkt = LinePacket.Parse(buf.AsSpan(0, LinePacket.PacketSize));
-                if (pkt is not null) lines[pkt.LineNo] = pkt.Samples;
+                var pkt = LinePacket.Parse(buf.AsSpan(p0 + i * LinePacket.PacketSize, LinePacket.PacketSize));
+                if (pkt is not null) lines[pkt.LineNo] = pkt;
+                else Console.Error.WriteLine($"\nパケット不正 (グループ{start} #{i})");
             }
             Console.Write($"\r取得中... {Math.Min(start + 32, 160)}/160 ライン");
         }
@@ -160,9 +186,12 @@ switch (args[0])
         var missing = 0;
         for (var y = 0; y < 160; y++)
         {
-            if (lines.TryGetValue(y, out var samples))
+            if (lines.TryGetValue(y, out var pkt))
                 for (var x = 0; x < 240; x++)
-                    px[y, x] = PixelDecoder.DecodeGpiobSample(samples[x]);
+                {
+                    var cell = Math.Max(0, x - PixelDecoder.SampleOffset);
+                    px[y, x] = PixelDecoder.DecodeSample(pkt.Samples[cell], pkt.RedLow[cell]);
+                }
             else
                 missing++;
         }
