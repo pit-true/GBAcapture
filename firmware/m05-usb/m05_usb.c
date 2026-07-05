@@ -1,15 +1,9 @@
-// M0.5 (FW v0.6): USB-HS デバイス + ブートローダ突入診断
+// M0.5 (FW v0.7): USB-HS デバイス + 手放し書き込みループ + M1信号計測
 //
-// バルクOUT(EP5) コマンド "GBAC"+1B → バルクIN(EP4) で 8B 応答:
-//   'P' ping     → {G,B,A,C,'!', ver_major, ver_minor, rst_flags}
-//                  rst_flags = RCC->RSTSCKR >> 24（前回リセット要因。SFT=bit4相当）
-//   'S' diag     → MODEKEYR のみで FLASH_STATR.MODE セットを試行（リセットせず）
-//                  {G,B,A,C,'$', statr_hi(セット後), statr_hi(クリア後), 0}
-//                  bit6 (=STATRのbit14) が立てばフラグ書き込み成功
-//   'T' diag     → KEYR で FLASH 全体をアンロックしてから同上
-//                  {G,B,A,C,'%', statr_hi(セット後), statr_hi(クリア後), 0}
-//   'B' 突入     → MODEKEYRのみ方式でブートローダへ（リセットする）
-//   'C' 突入     → KEYRアンロック込み方式でブートローダへ（リセットする）
+// バルクOUT(EP5) コマンド "GBAC"+1B → バルクIN(EP4) で応答:
+//   'P' ping → {G,B,A,C,'!', ver_major, ver_minor, rst_flags} (8B)
+//   'F' 計測 → {G,B,A,C,'F',0,0,0, dck/s u32, lp/s u32, sps/s u32} (20B)
+//   'B' 突入 → ISPブートローダへ直接ジャンプ（応答なし、USBは切断される）
 //
 // 既知のスタックバグ回避: USBHS_SendEndpoint は data ポインタを UEP2_TX_DMA に
 // 書いてしまう([2-1]ハードコード)ため、EP4 の既定バッファ ENDPOINTS[4] に
@@ -96,9 +90,6 @@ static inline uint32_t Dck32( void )
 	return ( ovf1 << 16 ) | cnt;
 }
 
-// FLASH_KEY1/KEY2/FLASH_CTLR_LOCK は ch32v30xhw.h で定義済み
-#define FLASH_STATR_MODE (1 << 14)
-
 static volatile int g_pending_cmd = 0;
 static uint32_t g_boot_rstsckr; // 起動直後の RSTSCKR（リセット要因の記録）
 
@@ -140,47 +131,38 @@ static void ReplyFreq( void )
 	USBHS_SendEndpoint( 4, 20, t );
 }
 
-// MODE フラグセットを試行し (STATRセット後, クリア後) の上位バイトを返す
-static void TryModeFlag( int unlock_flash, uint8_t * hi_after_set, uint8_t * hi_after_clear )
+// WCH ISP ブートローダ (システムメモリ 0x1FFF8000) へ直接ジャンプする。
+//
+// 根拠: V30x BTVER2.9 ブートROMの逆アセンブル (COKPOWEHEU/ch32v307_bootloader) により、
+// ROM は入口チェックを一切行わず、自前で sp/gp/mtvec/RCC を再初期化することが判明。
+// 必要な前処理は「全IRQ無効化+ペンディングクリア / SysTick停止 / USB切断」のみ。
+// 注意: WWDG は絶対に有効化しないこと（ROMは食わせないため即リセットされる）。
+// 詳細: docs/flashing.md
+__attribute__((noreturn)) static void EnterIspBootloader( void )
 {
-	if( unlock_flash )
-	{
-		FLASH->KEYR = FLASH_KEY1;
-		FLASH->KEYR = FLASH_KEY2;
-	}
-	FLASH->MODEKEYR = FLASH_KEY1;
-	FLASH->MODEKEYR = FLASH_KEY2;
-	FLASH->STATR = FLASH_STATR_MODE;
-	*hi_after_set = (uint8_t)( FLASH->STATR >> 8 );
-
-	// 元に戻す（診断でフラグを立てっぱなしにしない）
-	FLASH->MODEKEYR = FLASH_KEY1;
-	FLASH->MODEKEYR = FLASH_KEY2;
-	FLASH->STATR = 0;
-	*hi_after_clear = (uint8_t)( FLASH->STATR >> 8 );
-
-	if( unlock_flash )
-		FLASH->CTLR |= FLASH_CTLR_LOCK;
-}
-
-static void EnterIspBootloader( int unlock_flash )
-{
-	USBHSD->CONTROL &= ~USBHS_UC_DEV_PU_EN; // USBソフト切断
+	USBHSD->CONTROL &= ~USBHS_UC_DEV_PU_EN; // まずUSBソフト切断（ホストに切断を見せる）
 	Delay_Ms( 50 );
+
 	__disable_irq();
+	SysTick->CTLR = 0;
+	SysTick->SR = 0;
 
-	if( unlock_flash )
-	{
-		FLASH->KEYR = FLASH_KEY1;
-		FLASH->KEYR = FLASH_KEY2;
-	}
-	FLASH->MODEKEYR = FLASH_KEY1;
-	FLASH->MODEKEYR = FLASH_KEY2;
-	FLASH->STATR = FLASH_STATR_MODE;
+	// 全PFIC割り込みを無効化しペンディングもクリア
+	// （ROMは mtvec をROM内に向けるため、残った割り込みが誤ベクタする）
+	NVIC->IRER[0] = 0xFFFFFFFF; NVIC->IRER[1] = 0xFFFFFFFF;
+	NVIC->IRER[2] = 0xFFFFFFFF; NVIC->IRER[3] = 0xFFFFFFFF;
+	NVIC->IPRR[0] = 0xFFFFFFFF; NVIC->IPRR[1] = 0xFFFFFFFF;
+	NVIC->IPRR[2] = 0xFFFFFFFF; NVIC->IPRR[3] = 0xFFFFFFFF;
 
-	RCC->RSTSCKR |= RCC_RMVF; // 全リセットフラグをクリア（ブートローダはSFTRSTFのみを要求）
-	NVIC_SystemReset();
-	while(1);
+	// USB ペリフェラルを完全停止（ROMが再初期化し 4348:55E0 で再列挙する）
+	USBHSD->CONTROL = 0;
+	RCC->AHBPCENR &= ~RCC_AHBPeriph_USBHS;
+	RCC->AHBRSTR |= RCC_AHBPeriph_OTG_FS;
+	RCC->AHBRSTR &= ~RCC_AHBPeriph_OTG_FS;
+	RCC->AHBPCENR &= ~RCC_AHBPeriph_OTG_FS;
+
+	( (void (*)(void))0x1FFF8000 )();
+	__builtin_unreachable();
 }
 
 int main()
@@ -205,7 +187,6 @@ int main()
 		if( cmd )
 		{
 			g_pending_cmd = 0;
-			uint8_t a, b;
 			switch( cmd )
 			{
 			case 'P':
@@ -214,19 +195,8 @@ int main()
 			case 'F':
 				ReplyFreq();
 				break;
-			case 'S':
-				TryModeFlag( 0, &a, &b );
-				Reply8( '$', a, b, 0 );
-				break;
-			case 'T':
-				TryModeFlag( 1, &a, &b );
-				Reply8( '%', a, b, 0 );
-				break;
 			case 'B':
-				EnterIspBootloader( 0 ); // 戻らない
-				break;
-			case 'C':
-				EnterIspBootloader( 1 ); // 戻らない
+				EnterIspBootloader(); // 戻らない
 				break;
 			}
 		}

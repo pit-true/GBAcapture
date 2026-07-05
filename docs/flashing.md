@@ -20,25 +20,35 @@
 [新アプリFW実行中]  → テスト → ①に戻る
 ```
 
-### ① ソフトブートローダ突入 — 調査状況（2026-07-05 実機検証で仕切り直し）
+### ① ソフトブートローダ突入 — **直接ジャンプ方式**（2026-07-05 確定）
 
 CH32V30x のブートローダはシステムメモリ **0x1FFF8000 (28KB)**、実機の BTVER は 2.90。
 
-**V003 方式（MODEフラグ+ソフトリセット）は V305 実機で不成立と判明:**
+**V003 方式（FLASH_STATR.MODE + ソフトリセット）は V20x/V30x には存在しない**
+（RM V2.2 で確認、実機の 'S'/'T' 診断でも STATR 読み戻し 0）。
 
-- `FLASH->MODEKEYR (0x40022024)` へのキー書き込み後に `FLASH->STATR` bit14 を
-  セットしても**読み戻しは 0x0000**（FW v0.6 の 'S'/'T' 診断コマンドで実測）
-- 手元の CH32FV2x_V3x RM **V1.5 では FLASH_STATR の bit[31:8] は Reserved で
-  MODE ビット自体が存在しない**。0x40022024 は高速書き込み(FLOCK)用の拡張キーのみ
-- ソフトリセット（PFIC 0xBEEF0080）と USB 切断は**動作確認済み**
-  （リセット→アプリ再起動までは実証できている。ブートローダに留まらないだけ）
+**確定した方式: 0x1FFF8000 への直接関数ジャンプ。**
+根拠は V30x BTVER2.9 ブートROMの逆アセンブル
+（https://github.com/COKPOWEHEU/ch32v307_bootloader ）:
+- ROM は入口チェックを一切しない（BOOTピンはリセット時のメモリマッピング選択のみ）
+- ROM 自身が sp/gp/mtvec/RCC を任意状態から再初期化する（HSI→PLL 96MHz）
+- V305(chipID 0x50) では USBHS と OTG_FS の両方で ISP をサービスする
 
-実測で分かった副次情報:
-- リセット要因フラグは RMVF まで累積する。SYSRESET 後は PINRSTF も同時に立つ模様
-  （ping 応答の rst_flags=0x14 = PINRSTF|SFTRSTF）
-- 代替手段の候補: (a) 最新RM(v2.2+)にのみ記載の別レジスタ/ビット、
-  (b) 0x1FFF8000 への直接ジャンプ、(c) IAP方式（FWが自分でflash書き換え、ISP不要）
-- 調査継続中。確定したらここを更新すること
+必要な前処理（`firmware/m05-usb/m05_usb.c` の `EnterIspBootloader()` に実装）:
+1. USB ソフト切断（UC_DEV_PU_EN クリア）+ 50ms 待ち
+2. `__disable_irq()` / SysTick 停止
+3. **全 PFIC 割り込みの無効化とペンディングクリア**（ROM は mtvec を ROM 内へ向けるため、
+   残った割り込みが誤ベクタする — 素朴なジャンプが失敗する最大の理由）
+4. USBHS/OTG_FS のクロック停止・リセット
+5. `((void(*)(void))0x1FFF8000)();`
+
+⚠️ **WWDG は絶対に有効化しないこと**（ROM は WWDG を食わせないので即リセットされる。
+IWDG は ROM が ~26 秒に再設定して食わせるので可）。
+
+副次情報（実測）:
+- リセット要因フラグ(RSTSCKR)は RMVF まで累積。SYSRESET 後は PINRSTF|SFTRSTF が立つ
+- ch32fun の `USBHS_SendEndpoint` は data ポインタを常に UEP2_TX_DMA へ書くバグがある
+  （`[2-1]` ハードコード）。EP4 送信は既定バッファ ENDPOINTS[4] への memcpy で回避
 
 ## ツール: wchisp（✅ 調査済み）
 
