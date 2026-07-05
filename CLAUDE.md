@@ -59,9 +59,13 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
   初回のみ BOOT+RST + `wchisp flash firmware/gbacap_full.bin`（./make_full.sh で生成）。
   以降のAPP更新は `dotnet run --project GbaCap.Cli -- update firmware/app/gbacap_app.bin`
   だけで完結（ボタン不要）。詳細 .claude/skills/flash と docs/flashing.md
-- 次の作業: M1信号計測の異常調査（SPS=60Hz✓、LP=60Hz✗(期待13.6k)、
-  DCK=58✗(期待2.3M)。DCKはPLL未使用でTIM2サンプリング上限の疑い→funconfigでPLL 144MHz化、
-  LPは配線 or 信号解釈の要再検証）
+- **M1調査で配線問題を特定（2026-07-05、docs/wiring.md の実機診断参照）**:
+  全信号線が「導通しているが定常HIGH（映像活動なし）」+ PB12(LDG2)のみ浮き。
+  当初の60Hz計測値はGBA電源断時のノイズだった。タップ先がLCD映像線でない疑い
+  （GBAのLCDコネクタ32ピン/40ピン違いを含め**ユーザーのハードウェア確認待ち**）
+- 診断ツール整備済み: `rawdiag`(エッジ/デューティ/プルテスト) と `freq`(周波数)。
+  ハード修正後はこの2つで即再検証できる
+- 次の作業: 配線確認後に M1 完了 → M2 DMAラインキャプチャ（'L'コマンド）→ 静止画取得
 
 ## スキル
 

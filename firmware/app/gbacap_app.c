@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 10     // v0.10: 'R' 生ピン診断を追加
+#define FW_VERSION 11     // v0.11: 'R' にプルアップ/ダウン切り分けテストを追加
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -152,8 +152,42 @@ static void ReplyRawDiag( void )
 		prev_b = b;
 	}
 
+	// --- プル切り分けテスト ---
+	// 内部プル(約30-50kΩ)で引っ張って読み値が変わる = 外部が駆動していない(浮き)
+	// 変わらない = 外部が強く駆動している(または強い外部プル)
+	uint8_t a_pd, a_pu;   // PA0-2: プルダウン時/プルアップ時の読み値(bit0-2)
+	uint16_t b_pd, b_pu;  // GPIOB 全体
+
+	// 入力プルモードへ (CNF=10, ODR=0でPD/1でPU)
+	funPinMode( PA0, GPIO_CFGLR_IN_PUPD );
+	funPinMode( PA1, GPIO_CFGLR_IN_PUPD );
+	funPinMode( PA2, GPIO_CFGLR_IN_PUPD );
+	for( int p = 0; p < 16; p++ )
+		if( 0xFF3B & (1 << p) )
+			funPinMode( PB0 + p, GPIO_CFGLR_IN_PUPD );
+
+	GPIOA->OUTDR &= ~7;      // プルダウン
+	GPIOB->OUTDR &= ~0xFF3B;
+	Delay_Ms( 2 );
+	a_pd = GPIOA->INDR & 7;
+	b_pd = (uint16_t)GPIOB->INDR;
+
+	GPIOA->OUTDR |= 7;       // プルアップ
+	GPIOB->OUTDR |= 0xFF3B;
+	Delay_Ms( 2 );
+	a_pu = GPIOA->INDR & 7;
+	b_pu = (uint16_t)GPIOB->INDR;
+
+	// フローティングに戻す
+	funPinMode( PA0, GPIO_CFGLR_IN_FLOAT );
+	funPinMode( PA1, GPIO_CFGLR_IN_FLOAT );
+	funPinMode( PA2, GPIO_CFGLR_IN_FLOAT );
+	for( int p = 0; p < 16; p++ )
+		if( 0xFF3B & (1 << p) )
+			funPinMode( PB0 + p, GPIO_CFGLR_IN_FLOAT );
+
 	uint8_t * t = HSUSBCTX.ENDPOINTS[4];
-	t[0]='G'; t[1]='B'; t[2]='A'; t[3]='C'; t[4]='R'; t[5]=0; t[6]=0; t[7]=0;
+	t[0]='G'; t[1]='B'; t[2]='A'; t[3]='C'; t[4]='R'; t[5]=a_pd; t[6]=a_pu; t[7]=0;
 	memcpy( t + 8,  &trans[0], 4 );  // A0(DCK) エッジ数
 	memcpy( t + 12, &trans[1], 4 );  // A1(LP)
 	memcpy( t + 16, &trans[2], 4 );  // A2(SPS)
@@ -164,7 +198,9 @@ static void ReplyRawDiag( void )
 	memcpy( t + 36, &b_or, 2 );      // 一度でもHになったビット
 	memcpy( t + 38, &b_and, 2 );     // 常にHだったビット
 	memcpy( t + 40, &LOOPS, 4 );
-	USBHS_SendEndpoint( 4, 44, t );
+	memcpy( t + 44, &b_pd, 2 );      // GPIOB プルダウン時
+	memcpy( t + 46, &b_pu, 2 );      // GPIOB プルアップ時
+	USBHS_SendEndpoint( 4, 48, t );
 }
 
 static void ReplyFreq( void )
