@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 16     // v0.16: 送信上書きバグ修正 + 赤下位2bit(GPIOC)第2DMA取得
+#define FW_VERSION 17     // v0.17: 'S'/'X' 連続ストリーミングモード (M3)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -46,6 +46,15 @@ static volatile uint16_t g_cap_line;    // 現在のGBAライン番号（SPSで0
 static volatile uint16_t g_cap_filled;
 static void CapArmDma( int slot );
 
+// M3 ストリーミング: 全160ライン/フレームをリングバッファ経由で連続送出
+static volatile uint8_t  g_stream;      // 1=ストリーミング中
+static volatile uint32_t g_str_wr;      // 確定済みライン通し番号 (書き込み側)
+static volatile uint32_t g_str_rd;      // 送信済みライン通し番号 (読み出し側)
+static volatile uint32_t g_str_drop;    // リング満杯で落としたライン数
+static volatile uint8_t  g_str_frame;   // フレーム番号 (SPLギャップごとに+1)
+static struct { uint8_t frame; uint8_t line; } g_str_meta[CAP_MAX_LINES];
+static volatile int g_str_armed_slot = -1; // 直前にアームしたスロット
+
 void EXTI1_IRQHandler( void ) __attribute__((interrupt));
 void EXTI1_IRQHandler( void )
 {
@@ -74,6 +83,33 @@ void EXTI2_IRQHandler( void )
 		g_spl_line = 0;
 	else if( g_spl_line < 227 )
 		g_spl_line++;
+
+	// --- ストリーミング (M3) ---
+	if( g_stream )
+	{
+		// 直前ラインのDMAが完了したので確定
+		if( g_str_armed_slot >= 0 )
+		{
+			g_str_wr++;
+			g_str_armed_slot = -1;
+		}
+		if( frame_start )
+			g_str_frame++;
+		// 今ラインをアーム（リングに空きがある場合のみ。満杯なら落として計上）
+		if( g_str_wr - g_str_rd < CAP_MAX_LINES - 1 && g_spl_line < 160 )
+		{
+			int slot = g_str_wr % CAP_MAX_LINES;
+			g_str_meta[slot].frame = g_str_frame;
+			g_str_meta[slot].line = (uint8_t)g_spl_line;
+			CapArmDma( slot );
+			g_str_armed_slot = slot;
+		}
+		else if( g_spl_line < 160 )
+		{
+			g_str_drop++;
+		}
+		return;
+	}
 
 	if( g_cap_state == 1 && frame_start )
 	{
@@ -136,6 +172,7 @@ static void SignalCountersInit( void )
 //   (PC4/PC5 = 赤の下位2bit)
 static uint16_t g_capbuf[CAP_MAX_LINES][240];
 static uint8_t  g_capbuf_c[CAP_MAX_LINES][240];
+static uint16_t g_dbg_last_cntr; // 診断: 直近キャプチャの最終スロットDMA残量
 
 static void CapArmDma( int slot )
 {
@@ -440,6 +477,7 @@ static void HandleCaptureCmd( const uint8_t * cmd )
 
 	uint8_t done = ( g_cap_state == 3 );
 	uint16_t filled = g_cap_filled, lastline = g_cap_line;
+	g_dbg_last_cntr = (uint16_t)DMA1_Channel5->CNTR; // 最後にアームしたスロットの残転送数
 	g_cap_state = 0;
 	DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
 	DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
@@ -528,12 +566,56 @@ int main()
 			case 'A':
 				ReplyAdc();
 				break;
+			case 'D': // 診断: 直近 'L' の最終スロットDMA残量
+				Reply8( 'd', (uint8_t)( g_dbg_last_cntr & 0xFF ),
+				        (uint8_t)( g_dbg_last_cntr >> 8 ), 0 );
+				break;
 			case 'L':
 				HandleCaptureCmd( (const uint8_t *)HSUSBCTX.ENDPOINTS[5] );
+				break;
+			case 'S': // ストリーミング開始
+				RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
+				Tim2ConfigCapture();
+				g_str_wr = g_str_rd = g_str_drop = 0;
+				g_str_armed_slot = -1;
+				g_stream = 1;
+				break;
+			case 'X': // ストリーミング停止
+				g_stream = 0;
+				Delay_Ms( 2 );
+				DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+				DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
+				Tim2ConfigCount();
 				break;
 			case 'U':
 				EnterIapUpdater(); // 戻らない
 				break;
+			}
+		}
+
+		// ストリーミング送出: 確定済みスロットをラインパケットにして送る
+		if( g_stream )
+		{
+			static uint8_t spkt[724];
+			while( g_str_rd < g_str_wr )
+			{
+				int slot = g_str_rd % CAP_MAX_LINES;
+				uint16_t line_no = g_str_meta[slot].line;
+				spkt[0] = 0xA5;
+				spkt[1] = g_str_meta[slot].frame;
+				memcpy( spkt + 2, &line_no, 2 );
+				memcpy( spkt + 4, g_capbuf[slot], 480 );
+				memcpy( spkt + 484, g_capbuf_c[slot], 240 );
+				g_str_rd++;
+				if( SendEp4( spkt, 512 ) || SendEp4( spkt + 512, 212 ) )
+				{
+					g_stream = 0; // ホストが読んでいない → 自動停止
+					DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+					DMA1_Channel7->CFGR &= ~DMA_CFGR1_EN;
+					Tim2ConfigCount();
+					break;
+				}
+				IWDG->CTLR = 0xAAAA;
 			}
 		}
 

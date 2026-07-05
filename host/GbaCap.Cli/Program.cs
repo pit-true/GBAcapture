@@ -247,7 +247,8 @@ switch (args[0])
     {
         using var dev = Open(context);
         if (dev is null) return 1;
-        var buf = Transact(dev, MakeCmd((char)args[1][0]), 512);
+        var buf = Transact(dev, MakeCmd(args[1][0]), 8);
+        Console.WriteLine($"reply: {Convert.ToHexString(buf.AsSpan(0, 8))}");
         return 0;
     }
     default:
