@@ -1,3 +1,4 @@
+using GbaCap;
 using LibUsbDotNet;
 using LibUsbDotNet.LibUsb;
 using LibUsbDotNet.Main;
@@ -109,6 +110,65 @@ switch (args[0])
         var (m2, ver2) = Ping(app);
         Console.WriteLine($"更新完了! APP v0.{ver2} が起動しました");
         return 0;
+    }
+    case "capture": // 1フレーム(240x160)を32ラインずつ取得してBMP保存
+    {
+        var outPath = args.Length >= 2 ? args[1] : "capture.bmp";
+        using var dev = Open(context);
+        if (dev is null) return 1;
+        var reader = dev.OpenEndpointReader(ReadEndpointID.Ep04);
+        var lines = new Dictionary<int, ushort[]>();
+
+        for (var start = 0; start < 160; start += 32)
+        {
+            var cmd = new byte[12];
+            "GBAC"u8.CopyTo(cmd);
+            cmd[4] = (byte)'L';
+            BitConverter.GetBytes((ushort)start).CopyTo(cmd, 6);
+            BitConverter.GetBytes((ushort)32).CopyTo(cmd, 8);
+            Write(dev, cmd);
+
+            for (var i = 0; i < 32; i++)
+            {
+                var buf = new byte[512];
+                var ec = reader.Read(buf, 3000, out var got);
+                if (ec != Error.Success)
+                {
+                    Console.Error.WriteLine($"受信エラー: {ec} (ライン {start + i})");
+                    return 1;
+                }
+                if (got == 8 && buf[4] == 'l')
+                {
+                    Console.Error.WriteLine(
+                        $"キャプチャ失敗 status={buf[5]} filled={buf[6]} line={buf[7]}" +
+                        (buf[5] == 2 ? " → SPS/LP信号が検出できていません（配線要確認）" : ""));
+                    return 1;
+                }
+                if (got != LinePacket.PacketSize)
+                {
+                    Console.Error.WriteLine($"不正なパケット長 {got}B (ライン {start + i})");
+                    return 1;
+                }
+                var pkt = LinePacket.Parse(buf.AsSpan(0, LinePacket.PacketSize));
+                if (pkt is not null) lines[pkt.LineNo] = pkt.Samples;
+            }
+            Console.Write($"\r取得中... {Math.Min(start + 32, 160)}/160 ライン");
+        }
+        Console.WriteLine();
+
+        var px = new (byte R, byte G, byte B)[160, 240];
+        var missing = 0;
+        for (var y = 0; y < 160; y++)
+        {
+            if (lines.TryGetValue(y, out var samples))
+                for (var x = 0; x < 240; x++)
+                    px[y, x] = PixelDecoder.DecodeGpiobSample(samples[x]);
+            else
+                missing++;
+        }
+        File.WriteAllBytes(outPath, BmpWriter.Encode(px));
+        Console.WriteLine($"保存しました: {outPath} (欠落ライン: {missing})");
+        return missing == 0 ? 0 : 1;
     }
     case "rawdiag": // 生ピン診断 ('R'): エッジ数/デューティ/GPIOB活動
     {

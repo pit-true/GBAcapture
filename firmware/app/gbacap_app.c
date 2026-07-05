@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 11     // v0.11: 'R' にプルアップ/ダウン切り分けテストを追加
+#define FW_VERSION 12     // v0.12: 'L' DMAラインキャプチャを追加 (M2)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -38,11 +38,36 @@ void TIM2_IRQHandler( void )
 	}
 }
 
+// M2 ラインキャプチャの状態（実体・詳細は下方の M2 セクション）
+#define CAP_MAX_LINES 32
+static volatile uint8_t  g_cap_state;   // 0=idle 1=SPS待ち 2=キャプチャ中 3=完了
+static volatile uint16_t g_cap_start, g_cap_count;
+static volatile uint16_t g_cap_line;    // 現在のGBAライン番号（SPSで0）
+static volatile uint16_t g_cap_filled;
+static void CapArmDma( int slot );
+
 void EXTI1_IRQHandler( void ) __attribute__((interrupt));
 void EXTI1_IRQHandler( void )
 {
 	EXTI->INTFR = 1 << 1;
 	g_lp_count++;
+
+	if( g_cap_state == 2 )
+	{
+		// LP = ライン確定。範囲内ならこのラインのDMA転送が完了しているはず
+		if( g_cap_line >= g_cap_start && g_cap_line < (uint16_t)( g_cap_start + g_cap_count ) )
+			g_cap_filled++;
+		g_cap_line++;
+		if( g_cap_filled >= g_cap_count )
+		{
+			DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+			g_cap_state = 3;
+		}
+		else if( g_cap_line >= g_cap_start && g_cap_line < (uint16_t)( g_cap_start + g_cap_count ) )
+		{
+			CapArmDma( g_cap_line - g_cap_start );
+		}
+	}
 }
 
 void EXTI2_IRQHandler( void ) __attribute__((interrupt));
@@ -50,6 +75,15 @@ void EXTI2_IRQHandler( void )
 {
 	EXTI->INTFR = 1 << 2;
 	g_sps_count++;
+
+	if( g_cap_state == 1 )
+	{
+		g_cap_line = 0;
+		g_cap_filled = 0;
+		g_cap_state = 2;
+		if( g_cap_start == 0 )
+			CapArmDma( 0 );
+	}
 }
 
 static void SignalCountersInit( void )
@@ -77,6 +111,46 @@ static void SignalCountersInit( void )
 	EXTI->INTENR |= (1 << 1) | (1 << 2);
 	NVIC_EnableIRQ( EXTI1_IRQn );
 	NVIC_EnableIRQ( EXTI2_IRQn );
+}
+
+// --- M2: DMAラインキャプチャ ---
+// TIM2_CH1(PA0=DCK) の入力キャプチャ(負エッジ)ごとに DMA1_CH5 が GPIOB->INDR を
+// ラインバッファへ転送する。LP(EXTI1)でライン確定、SPS(EXTI2)でライン番号リセット。
+static uint16_t g_capbuf[CAP_MAX_LINES][240];
+
+static void CapArmDma( int slot )
+{
+	DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+	DMA1_Channel5->PADDR = (uintptr_t)&GPIOB->INDR;
+	DMA1_Channel5->MADDR = (uintptr_t)g_capbuf[slot];
+	DMA1_Channel5->CNTR = 240;
+	DMA1_Channel5->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_HalfWord
+	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
+	                    | DMA_CFGR1_EN;
+}
+
+// TIM2 を「DCK負エッジで入力キャプチャ→DMA要求」モードにする（キャプチャ用）
+static void Tim2ConfigCapture( void )
+{
+	TIM2->CTLR1 = 0;
+	TIM2->SMCFGR = 0;                       // 内部クロック
+	TIM2->CHCTLR1 = 0x01;                   // CC1S=01: TI1
+	TIM2->CCER = TIM_CC1E | TIM_CC1P;       // 負エッジでキャプチャ
+	TIM2->DMAINTENR = TIM_CC1DE;            // CC1 で DMA 要求
+	TIM2->ATRLR = 0xFFFF;
+	TIM2->CTLR1 = TIM_CEN;
+}
+
+// TIM2 を周波数計測用（DCK外部クロックカウント）に戻す
+static void Tim2ConfigCount( void )
+{
+	TIM2->CTLR1 = 0;
+	TIM2->CCER = 0;
+	TIM2->CHCTLR1 = 0x01;
+	TIM2->SMCFGR = TIM_TS_2 | TIM_TS_0 | TIM_SMS;
+	TIM2->ATRLR = 0xFFFF;
+	TIM2->DMAINTENR = TIM_UIE;
+	TIM2->CTLR1 = TIM_CEN;
 }
 
 static inline uint32_t Dck32( void )
@@ -111,13 +185,26 @@ void HandleGotEPComplete( struct _USBState * ctx, int ep )
 	}
 }
 
+// EP4(バルクIN)送信。専用512Bバッファ経由（内蔵ENDPOINTS[4]は64Bしかないため）。
+// USBHS_SendEndpoint の dataポインタは常にUEP2_TX_DMAへ書かれるスタックバグがあるので
+// UEP4_TX_DMA を毎回自分で設定する。
+static uint8_t g_txpkt[512];
+static int SendEp4( const uint8_t * data, int len )
+{
+	uint32_t t0 = SysTick->CNT;
+	while( HSUSBCTX.USBHS_Endp_Busy[4] & 1 )
+		if( (uint32_t)( SysTick->CNT - t0 ) > Ticks_from_Ms( 500 ) ) return -1;
+	if( data != g_txpkt )
+		memcpy( g_txpkt, data, len );
+	USBHSD->UEP4_TX_DMA = (uintptr_t)g_txpkt;
+	USBHS_SendEndpoint( 4, len, 0 );
+	return 0;
+}
+
 static void Reply8( uint8_t tag, uint8_t b5, uint8_t b6, uint8_t b7 )
 {
-	if( HSUSBCTX.USBHS_Endp_Busy[4] & 1 ) return;
-	uint8_t * txbuf = HSUSBCTX.ENDPOINTS[4];
-	txbuf[0]='G'; txbuf[1]='B'; txbuf[2]='A'; txbuf[3]='C';
-	txbuf[4]=tag; txbuf[5]=b5; txbuf[6]=b6; txbuf[7]=b7;
-	USBHS_SendEndpoint( 4, 8, txbuf ); // data は UEP2_TX_DMA に書かれるが無害。EP4 は既定 DMA(=txbuf) から送信
+	uint8_t p[8] = { 'G','B','A','C', tag, b5, b6, b7 };
+	SendEp4( p, 8 );
 }
 
 // 'R': 生ピン診断。PA0/PA1/PA2 と GPIOB をタイトループで大量サンプリングし、
@@ -164,7 +251,7 @@ static void ReplyRawDiag( void )
 	funPinMode( PA2, GPIO_CFGLR_IN_PUPD );
 	for( int p = 0; p < 16; p++ )
 		if( 0xFF3B & (1 << p) )
-			funPinMode( PB0 + p, GPIO_CFGLR_IN_PUPD );
+			funPinMode( (PB0 + p), GPIO_CFGLR_IN_PUPD );
 
 	GPIOA->OUTDR &= ~7;      // プルダウン
 	GPIOB->OUTDR &= ~0xFF3B;
@@ -184,9 +271,10 @@ static void ReplyRawDiag( void )
 	funPinMode( PA2, GPIO_CFGLR_IN_FLOAT );
 	for( int p = 0; p < 16; p++ )
 		if( 0xFF3B & (1 << p) )
-			funPinMode( PB0 + p, GPIO_CFGLR_IN_FLOAT );
+			funPinMode( (PB0 + p), GPIO_CFGLR_IN_FLOAT );
 
-	uint8_t * t = HSUSBCTX.ENDPOINTS[4];
+	uint8_t rep[48];
+	uint8_t * t = rep;
 	t[0]='G'; t[1]='B'; t[2]='A'; t[3]='C'; t[4]='R'; t[5]=a_pd; t[6]=a_pu; t[7]=0;
 	memcpy( t + 8,  &trans[0], 4 );  // A0(DCK) エッジ数
 	memcpy( t + 12, &trans[1], 4 );  // A1(LP)
@@ -200,18 +288,65 @@ static void ReplyRawDiag( void )
 	memcpy( t + 40, &LOOPS, 4 );
 	memcpy( t + 44, &b_pd, 2 );      // GPIOB プルダウン時
 	memcpy( t + 46, &b_pu, 2 );      // GPIOB プルアップ時
-	USBHS_SendEndpoint( 4, 48, t );
+	SendEp4( rep, 48 );
 }
 
 static void ReplyFreq( void )
 {
-	if( HSUSBCTX.USBHS_Endp_Busy[4] & 1 ) return;
-	uint8_t * t = HSUSBCTX.ENDPOINTS[4];
+	uint8_t rep[20];
+	uint8_t * t = rep;
 	t[0]='G'; t[1]='B'; t[2]='A'; t[3]='C'; t[4]='F'; t[5]=0; t[6]=0; t[7]=0;
 	memcpy( t + 8,  &g_dck_per_s, 4 );
 	memcpy( t + 12, &g_lp_per_s, 4 );
 	memcpy( t + 16, &g_sps_per_s, 4 );
-	USBHS_SendEndpoint( 4, 20, t );
+	SendEp4( rep, 20 );
+}
+
+// 'L': ラインキャプチャ。"GBAC"+'L'+pad1+u16開始ライン+u16ライン数(≤32)
+// 成功: 484B のラインパケット(0xA5,フレーム,ライン番号u16,サンプル480B) × ライン数
+// 失敗: 8B応答 {..'l', status, filled, line}
+static void HandleCaptureCmd( const uint8_t * cmd )
+{
+	uint16_t start, count;
+	memcpy( &start, cmd + 6, 2 );
+	memcpy( &count, cmd + 8, 2 );
+	if( count == 0 || count > CAP_MAX_LINES || start + count > 228 )
+	{
+		Reply8( 'l', 1, 0, 0 );
+		return;
+	}
+
+	RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
+	g_cap_start = start;
+	g_cap_count = count;
+	Tim2ConfigCapture();
+	g_cap_state = 1; // 次のSPSからキャプチャ開始
+
+	uint32_t t0 = SysTick->CNT;
+	while( g_cap_state != 3 && (uint32_t)( SysTick->CNT - t0 ) < Ticks_from_Ms( 100 ) );
+
+	uint8_t done = ( g_cap_state == 3 );
+	uint16_t filled = g_cap_filled, lastline = g_cap_line;
+	g_cap_state = 0;
+	DMA1_Channel5->CFGR &= ~DMA_CFGR1_EN;
+	Tim2ConfigCount();
+
+	if( !done )
+	{
+		Reply8( 'l', 2, (uint8_t)filled, (uint8_t)lastline );
+		return;
+	}
+
+	uint8_t frame = (uint8_t)g_sps_count;
+	for( int i = 0; i < count; i++ )
+	{
+		uint16_t line_no = start + i;
+		g_txpkt[0] = 0xA5;
+		g_txpkt[1] = frame;
+		memcpy( g_txpkt + 2, &line_no, 2 );
+		memcpy( g_txpkt + 4, g_capbuf[i], 480 );
+		if( SendEp4( g_txpkt, 484 ) ) return; // ホストが読まない場合は中断
+	}
 }
 
 // IAP 更新モードへ移行する（手放し書き込みループ。docs/flashing.md）
@@ -260,6 +395,9 @@ int main()
 				break;
 			case 'R':
 				ReplyRawDiag();
+				break;
+			case 'L':
+				HandleCaptureCmd( (const uint8_t *)HSUSBCTX.ENDPOINTS[5] );
 				break;
 			case 'U':
 				EnterIapUpdater(); // 戻らない
