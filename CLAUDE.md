@@ -59,27 +59,22 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
   初回のみ BOOT+RST + `wchisp flash firmware/gbacap_full.bin`（./make_full.sh で生成）。
   以降のAPP更新は `dotnet run --project GbaCap.Cli -- update firmware/app/gbacap_app.bin`
   だけで完結（ボタン不要）。詳細 .claude/skills/flash と docs/flashing.md
-- **M1調査で配線問題を特定（2026-07-05、docs/wiring.md の実機診断参照）**:
-  全信号線が「導通しているが定常HIGH（映像活動なし）」+ PB12(LDG2)のみ浮き。
-  当初の60Hz計測値はGBA電源断時のノイズだった。タップ先がLCD映像線でない疑い
-  （GBAのLCDコネクタ32ピン/40ピン違いを含め**ユーザーのハードウェア確認待ち**）
-- 診断ツール整備済み: `rawdiag`(エッジ/デューティ/プルテスト) と `freq`(周波数)。
-  ハード修正後はこの2つで即再検証できる
-- **M2 キャプチャパイプラインはソフト側実装済み（v0.12）**: FW 'L'コマンド
-  （SPS待ち→LPごとにTIM2_CH1負エッジ入力キャプチャ+DMA1_CH5でGPIOB取得、32ライン/回）
-  + CLI `capture <out.bmp>`（5回に分けて160ライン取得→デコード→BMP保存）。
-  エラー経路は実機確認済み。**実データでの検証は配線修正待ち**
-  （ライン境界の±1オフセット等は実画像を見て調整する想定）
-- **🎉 M2完了: 初キャプチャ成功（2026-07-05）**: docs/captures/2026-07-05_first-light.png
-  （エメラルドタイトル画面、色・形とも正確）。真の障害は配線でなく**GND**だった
-  （P2-VSSはパネル電源系でロジックGNDでない → P1-GNDへ付け替えで解決）。
-  信号タップは基板シルクのビアで最初から正しかった
-- 実測確定事項は docs/gba-video-signal.md 参照（PA2の実体はSPL、DCK=240/ライン、
-  LDx1=LSB確定、計測窓1.15倍問題は未解決）
-- 既知の軽微な課題: capture で欠落ライン数枚（要調査: パケット取りこぼし or
-  ライン番号重複）、赤下位2bit未取得（PC4/PC5、GPIOC第2DMA化はフェーズ2）
-- 次の作業: M3 = 連続フレームストリーミング（USB-HSバルクでライン即時送出）
-  → M4/M5 リアルタイムビューア（C# WinForms/WPF）
+- **M2完了（2026-07-05）初キャプチャ成功**: docs/captures/2026-07-05_first-light.png。
+  途中の大障害はGND（P2-VSSはパネル電源系≠ロジックGND → P1-GNDへ付け替えで解決）
+- **🎉 M3/M4完了（2026-07-06）: 60fpsリアルタイムビューア動作** (FW v0.21 + GbaCap.Viewer)。
+  キー知見:
+  - **1ライン周期 = 241 DCKパルス**（可視240 + H-blank中ジャンク1。stride=241必須。
+    240と仮定すると対角線ノイズ/白縦線が出る）
+  - ストリーミングは**サーキュラDMA + VBLANK休止(250µs)検出アンカー**方式。
+    ライン毎のIRQ再アームは水平ジッタの原因になるため禁止
+  - USB-HSバルクは1EPあたり実効~3.3MB/s（NAK後の再ポーリングがマイクロフレーム単位）
+    → **EP4/EP1/EP3の3本分散**で6.9MB/s(60fps)確保
+  - パケットv3(484B): 赤下位2bitはGPIOC第2DMA(TIM2_CC2→DMA1_CH7)で取得しFWがbit2/6に合成
+- 一発キャプチャ('L')は旧方式(SPL毎アーム+SampleOffset=2補正)のまま。将来v3方式へ統一余地
+- 実測確定: PA2の実体はSPL / LDx1=LSB / 計測窓1.155倍問題は未解決(相対値は正確)
+- ハード計画: docs/hardware-adapter-plan.md（基板化3段階）/ docs/audio-plan.md
+  （音声はLOUT/ROUT→PA4/PA5、ADC+DMA+USB多重化）
+- 次の作業: 映像品質の実用確認 → M6音声 / 基板化 / UVC化（docs/roadmap.md）
 
 ## スキル
 
