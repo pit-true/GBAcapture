@@ -33,6 +33,8 @@ public sealed class ViewerForm : Form
     private string _status = "接続中...";
 
     private bool _fullscreen;
+    private ToolStripMenuItem? _viewMenu;
+    private string _flash = ""; // タイトルバーへの一時メッセージ
 
     // Windows 11 の角丸を無効化（映像領域の四隅が欠けるのを防ぐ）
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
@@ -43,12 +45,13 @@ public sealed class ViewerForm : Form
         Text = "GBAcapture";
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.FixedSingle;
-        MaximizeBox = false;
+        MaximizeBox = true; // □は下のWndProcで 1x として扱う
         BackColor = Color.Black;
         KeyPreview = true;
 
         var menu = new MenuStrip();
         var view = new ToolStripMenuItem("表示(&V)");
+        _viewMenu = view;
         foreach (var s in new[] { 1, 2, 3, 4 })
         {
             var item = new ToolStripMenuItem($"{s}x") { Checked = s == _scale, Tag = s };
@@ -59,6 +62,10 @@ public sealed class ViewerForm : Form
         var fsItem = new ToolStripMenuItem("フルスクリーン (Escで戻る)");
         fsItem.Click += (_, _) => EnterFullscreen();
         view.DropDownItems.Add(fsItem);
+        view.DropDownItems.Add(new ToolStripSeparator());
+        var ssItem = new ToolStripMenuItem("スクリーンショット保存 (F12)");
+        ssItem.Click += (_, _) => SaveScreenshot();
+        view.DropDownItems.Add(ssItem);
         menu.Items.Add(view);
         MainMenuStrip = menu;
         Controls.Add(menu);
@@ -66,16 +73,58 @@ public sealed class ViewerForm : Form
         KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Escape && _fullscreen) ExitFullscreen();
+            if (e.KeyCode == Keys.F12) SaveScreenshot();
         };
 
         ApplyClientSize();
         _fpsTimer.Tick += (_, _) =>
         {
             if (!_fullscreen)
-                Text = $"GBAcapture - {_framesThisSec} fps ({_scale}x) {_status}";
+                Text = $"GBAcapture - {_framesThisSec} fps ({_scale}x) {_status}{_flash}";
             _framesThisSec = 0;
         };
         _fpsTimer.Start();
+    }
+
+    private void SaveScreenshot()
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "GBAcapture");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"gbacap_{DateTime.Now:yyyyMMdd_HHmmss_fff}.png");
+            lock (_bmpLock)
+            {
+                using var clone = new Bitmap(_bmp);
+                clone.Save(path, ImageFormat.Png);
+            }
+            _flash = $"  [保存: {path}]";
+            var t = new System.Windows.Forms.Timer { Interval = 4000 };
+            t.Tick += (_, _) => { _flash = ""; t.Dispose(); };
+            t.Start();
+        }
+        catch (Exception ex)
+        {
+            _flash = $"  [保存失敗: {ex.Message}]";
+        }
+    }
+
+    // □(最大化ボタン) は 1x に、画面上端へのスナップ(Aeroスナップ)はフルスクリーンにする
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_SYSCOMMAND = 0x0112;
+        const int SC_MAXIMIZE = 0xF030;
+        if (m.Msg == WM_SYSCOMMAND && ((int)m.WParam & 0xFFF0) == SC_MAXIMIZE)
+        {
+            // マウスが画面最上端ならスナップ操作 → フルスクリーン
+            if (MousePosition.Y <= 8)
+                EnterFullscreen();
+            else if (_viewMenu is not null)
+                SetScale(1, _viewMenu);
+            return; // 既定の最大化はさせない
+        }
+        base.WndProc(ref m);
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -90,6 +139,8 @@ public sealed class ViewerForm : Form
     {
         _fullscreen = true;
         MainMenuStrip!.Visible = false;
+        if (WindowState == FormWindowState.Maximized)
+            WindowState = FormWindowState.Normal; // 一旦戻さないと borderless 最大化が反映されない
         FormBorderStyle = FormBorderStyle.None;
         WindowState = FormWindowState.Maximized;
         Invalidate();

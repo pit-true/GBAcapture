@@ -9,3 +9,10 @@ firmware/ch32fun/
 *.lst
 *.map
 nul
+
+# 作業用画像・第三者資料はローカル限定 (docs/publishing-policy.md)
+/*.png
+/*.bmp
+/*.jpg
+docs/photos/
+viewer.log
