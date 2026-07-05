@@ -54,12 +54,12 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
 - M0.5 検証結果 (2026-07-05): USB通信・ping・保持ハンドルテストは動作。
   **ソフトISP突入は直接ジャンプ含め不可能と実機で確定**（docs/flashing.md 参照。
   V30xはメモリリマップ不可でISP ROMがBOOT0=0マッピングでは動けない）
-- **M0.6 = IAP方式の手放しループ実装済み（実機検証待ち）**:
+- **M0.6 = IAP方式の手放しループ完成・実機実証済み（2026-07-05）**:
   `firmware/iap`(16KB @0x08000000) + `firmware/app`(@0x08004000, app_offset.ldでリンク)。
   初回のみ BOOT+RST + `wchisp flash firmware/gbacap_full.bin`（./make_full.sh で生成）。
   以降のAPP更新は `dotnet run --project GbaCap.Cli -- update firmware/app/gbacap_app.bin`
   だけで完結（ボタン不要）。詳細 .claude/skills/flash と docs/flashing.md
-- 次の作業: IAP実機検証 → M1信号計測の異常調査（SPS=60Hz✓、LP=60Hz✗(期待13.6k)、
+- 次の作業: M1信号計測の異常調査（SPS=60Hz✓、LP=60Hz✗(期待13.6k)、
   DCK=58✗(期待2.3M)。DCKはPLL未使用でTIM2サンプリング上限の疑い→funconfigでPLL 144MHz化、
   LPは配線 or 信号解釈の要再検証）
 
