@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 12     // v0.12: 'L' DMAラインキャプチャを追加 (M2)
+#define FW_VERSION 13     // v0.13: 'R' にGPIOC(PC4/PC5)とGPIOBビット別エッジ数を追加
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -216,15 +216,19 @@ static void ReplyRawDiag( void )
 
 	const uint32_t LOOPS = 1000000;
 	uint32_t trans[3] = {0,0,0}, high[3] = {0,0,0};
-	uint32_t b_trans = 0;
+	uint32_t b_trans = 0, c_trans = 0;
+	uint16_t b_bit_trans[16] = {0};
 	uint16_t b_or = 0, b_and = 0xFFFF;
+	uint8_t c_or = 0, c_and = 0xFF;
 	uint32_t prev_a = GPIOA->INDR & 7;
 	uint16_t prev_b = (uint16_t)GPIOB->INDR;
+	uint8_t prev_c = (uint8_t)( GPIOC->INDR >> 4 ) & 3; // PC4/PC5 → bit0/1
 
 	for( uint32_t i = 0; i < LOOPS; i++ )
 	{
 		uint32_t a = GPIOA->INDR & 7;
 		uint16_t b = (uint16_t)GPIOB->INDR;
+		uint8_t c = (uint8_t)( GPIOC->INDR >> 4 ) & 3;
 		uint32_t chg = a ^ prev_a;
 		if( chg & 1 ) trans[0]++;
 		if( chg & 2 ) trans[1]++;
@@ -232,11 +236,20 @@ static void ReplyRawDiag( void )
 		if( a & 1 ) high[0]++;
 		if( a & 2 ) high[1]++;
 		if( a & 4 ) high[2]++;
-		if( b != prev_b ) b_trans++;
-		b_or |= b;
-		b_and &= b;
+		uint16_t bchg = b ^ prev_b;
+		if( bchg )
+		{
+			b_trans++;
+			for( int k = 0; k < 16; k++ )
+				if( ( bchg >> k ) & 1 && b_bit_trans[k] != 0xFFFF )
+					b_bit_trans[k]++;
+		}
+		if( c != prev_c ) c_trans++;
+		b_or |= b; b_and &= b;
+		c_or |= c; c_and &= c;
 		prev_a = a;
 		prev_b = b;
+		prev_c = c;
 	}
 
 	// --- プル切り分けテスト ---
@@ -273,7 +286,7 @@ static void ReplyRawDiag( void )
 		if( 0xFF3B & (1 << p) )
 			funPinMode( (PB0 + p), GPIO_CFGLR_IN_FLOAT );
 
-	uint8_t rep[48];
+	uint8_t rep[88];
 	uint8_t * t = rep;
 	t[0]='G'; t[1]='B'; t[2]='A'; t[3]='C'; t[4]='R'; t[5]=a_pd; t[6]=a_pu; t[7]=0;
 	memcpy( t + 8,  &trans[0], 4 );  // A0(DCK) エッジ数
@@ -288,7 +301,10 @@ static void ReplyRawDiag( void )
 	memcpy( t + 40, &LOOPS, 4 );
 	memcpy( t + 44, &b_pd, 2 );      // GPIOB プルダウン時
 	memcpy( t + 46, &b_pu, 2 );      // GPIOB プルアップ時
-	SendEp4( rep, 48 );
+	memcpy( t + 48, b_bit_trans, 32 ); // GPIOB ビット別エッジ数 (u16×16)
+	t[80] = c_or; t[81] = c_and;     // PC4/PC5 (bit0=PC4, bit1=PC5)
+	memcpy( t + 82, &c_trans, 4 );   // GPIOC 変化回数
+	SendEp4( rep, 88 );
 }
 
 static void ReplyFreq( void )

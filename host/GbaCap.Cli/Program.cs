@@ -174,7 +174,7 @@ switch (args[0])
     {
         using var dev = Open(context);
         if (dev is null) return 1;
-        var b = Transact(dev, MakeCmd('R'), 48, timeoutMs: 5000);
+        var b = Transact(dev, MakeCmd('R'), 88, timeoutMs: 5000);
         if (b[4] != 'R') { Console.Error.WriteLine("rawdiag 失敗"); return 1; }
         var loops = BitConverter.ToUInt32(b, 40);
         string Pct(int off) => $"{100.0 * BitConverter.ToUInt32(b, off) / loops:F1}%";
@@ -185,6 +185,17 @@ switch (args[0])
         Console.WriteLine($"GPIOB    : 変化 {BitConverter.ToUInt32(b, 32),8}, OR=0x{BitConverter.ToUInt16(b, 36):X4}, AND=0x{BitConverter.ToUInt16(b, 38):X4}");
         Console.WriteLine($"プルテスト PA0-2: PD時=0b{b[5]:B3} PU時=0b{b[6]:B3}  (PD時0&PU時1=浮き / 変化なし=外部駆動)");
         Console.WriteLine($"プルテスト GPIOB: PD時=0x{BitConverter.ToUInt16(b, 44):X4} PU時=0x{BitConverter.ToUInt16(b, 46):X4}");
+        Console.WriteLine($"PC4(LDR1)/PC5(LDR2): OR=0b{b[80]:B2} AND=0b{b[81]:B2} 変化 {BitConverter.ToUInt32(b, 82)}");
+        var names = new Dictionary<int, string> {
+            [0]="LDR3",[1]="LDR4",[3]="LDB5",[4]="LDB4",[5]="LDB3",[8]="LDB2",[9]="LDB1",
+            [10]="LDR5",[11]="LDG1",[12]="LDG2",[13]="LDG3",[14]="LDG4",[15]="LDG5" };
+        Console.Write("GPIOB ビット別エッジ: ");
+        foreach (var (bit, name) in names.OrderBy(kv => kv.Key))
+        {
+            var n = BitConverter.ToUInt16(b, 48 + bit * 2);
+            if (n > 0) Console.Write($"{name}(PB{bit})={n} ");
+        }
+        Console.WriteLine("(表示なし=全ビット変化ゼロ)");
         return 0;
     }
     case "cmd":
