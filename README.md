@@ -33,6 +33,7 @@ Windows PC (専用キャプチャソフト)
 ## ドキュメント索引
 
 - [docs/wiring.md](docs/wiring.md) — **配線表（正）**。GBA ↔ nanoCH32V305
+- [docs/gba-40pin-pinout.md](docs/gba-40pin-pinout.md) — **40ピンLCDコネクタの検証済みピン配置**と正しいタップ位置
 - [docs/gba-video-signal.md](docs/gba-video-signal.md) — GBA LCD 信号仕様
 - [docs/architecture.md](docs/architecture.md) — キャプチャ方式・DMA設計・USBプロトコル
 - [docs/hands-free-loop.md](docs/hands-free-loop.md) — **ボタンフリー開発ループ（IAP方式）の方法と手順**
