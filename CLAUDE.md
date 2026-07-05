@@ -51,10 +51,14 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
 - **M0.5 実装完了・実機検証待ち**: `firmware/m05-usb`（USB-HSバルクデバイス
   1209:C001 + ブートローダ突入/pingコマンド）と `host/GbaCap.Cli`
   （LibUsbDotNet。ping / enter-bootloader）。ビルド済み
-- M0.5 検証手順: BOOT+RST でISP → `wchisp flash firmware/m05-usb/m05_usb.bin` →
-  Zadig で 1209:C001 に WinUSB 割当（初回のみ）→ `dotnet run --project host/GbaCap.Cli -- ping` →
-  `enter-bootloader` → `wchisp info` が見えれば**手放しループ完成**
-- 次の作業: M0.5 実機検証 → M1（信号計測FW: DCK/LP/SPS の周波数・カウントをUSBで報告）
+- M0.5 検証結果 (2026-07-05): USB通信・ping・保持ハンドルテストは動作。
+  **ソフトISP突入は直接ジャンプ含め不可能と実機で確定**（docs/flashing.md 参照。
+  V30xはメモリリマップ不可でISP ROMがBOOT0=0マッピングでは動けない）
+- **次の作業: M0.6 = IAP方式の手放しループ**（IAP 16KB @0x08000000 + APP @0x08004000、
+  docs/flashing.md の設計参照）。IAP導入後は wchisp は救済用になる
+- M1信号計測は v0.7 に実装済みだが実測値が異常（SPS=60Hz✓、LP=60Hz✗(期待13.6k)、
+  DCK=58✗(期待2.3M)）。DCKはコアクロック=HSE直(PLL無し)でTIM2サンプリング上限の疑い、
+  LPは配線 or 信号理解の要再検証。IAP完成後に調査（それまでは各リフラッシュにBOOT+RST必要）
 
 ## スキル
 
