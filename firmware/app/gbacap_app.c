@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 24     // v0.24: M6 音声ストリーミング (SO1/SO2 ADC 96k→48kHz PCM)
+#define FW_VERSION 25     // v0.25: 音声ノイズ対策 (384kHzサンプリング+4x平均+高速サンプル時間)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -66,10 +66,10 @@ static uint8_t  g_st_install;    // 今の停止期間でアンカー済み
 static uint8_t  g_st_frame;      // フレーム番号
 
 // --- M6 音声 ---
-// SO1(PA4=ADC4)/SO2(PA5=ADC5) を TIM3 TRGO 96kHz トリガの ADC スキャン(2ch)で取得し
-// DMA1_CH1 がリングへ格納。FWで2サンプル平均して 48kHz ステレオにし、
-// 音声パケット(0xA6)として映像と同じEP群に多重化する
-#define AUD_RING 1024            // u16サンプル数 (L,R交互)
+// SO1(PA4=ADC4)/SO2(PA5=ADC5) を TIM3 TRGO 192kHz トリガの ADC スキャン(2ch)で取得し
+// DMA1_CH1 がリングへ格納。FWで4サンプル平均して 48kHz ステレオにし
+// (PWMキャリアを下げる箱型フィルタ)、音声パケット(0xA6)として映像EP群に多重化する
+#define AUD_RING 1536            // u16サンプル数 (L,R交互)
 static uint16_t g_audbuf[AUD_RING];
 static uint32_t g_aud_lastcur;   // 前回のDMA位置
 static uint32_t g_aud_total;     // 取り込んだサンプル総数
@@ -477,7 +477,8 @@ static void AudioAdcInit( void )
 	Delay_Ms( 1 );
 	ADC1->CTLR2 |= ADC_RSTCAL; while( ADC1->CTLR2 & ADC_RSTCAL );
 	ADC1->CTLR2 |= ADC_CAL;    while( ADC1->CTLR2 & ADC_CAL );
-	ADC1->SAMPTR2 = 0x2DB6DB6D; // サンプル時間 0b101
+	// ch4/ch5 は 192kHzペアに間に合うよう高速サンプル時間(13.5cyc)にする
+	ADC1->SAMPTR2 = ( 0x2DB6DB6D & ~( 0x3F << 12 ) ) | ( 0x2 << 12 ) | ( 0x2 << 15 );
 	ADC1->SAMPTR1 = 0x00B6DB6D;
 	ADC1->RSQR1 = ( 2 - 1 ) << 20;        // 変換数2
 	ADC1->RSQR3 = 4 | ( 5 << 5 );          // IN4 → IN5
@@ -490,10 +491,10 @@ static void AudioAdcInit( void )
 	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 	                    | DMA_Mode_Circular | DMA_CFGR1_EN;
 
-	// TIM3: 96kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
+	// TIM3: 192kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
 	TIM3->CTLR1 = 0;
 	TIM3->PSC = 0;
-	TIM3->ATRLR = 1499; // 144MHz/1500 = 96kHz
+	TIM3->ATRLR = 749; // 144MHz/750 = 192kHz
 	TIM3->CTLR2 = 0x20; // MMS=010: update を TRGO に
 	TIM3->CTLR1 = TIM_CEN;
 
@@ -537,7 +538,7 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 }
 
 // 音声パケット (484B): [0xA6][seq][pad u16][48kHz L,R交互 int16(ADC生12bit) 240個]
-// 96kHzで取った2サンプルを平均して48kHz化(簡易ローパス=PWMキャリア低減)
+// 192kHzで取った4サンプルを平均して48kHz化(箱型ローパス=PWMキャリア低減)
 static int TrySendAudio( void )
 {
 	for( int k = 0; k < 3; k++ )
@@ -550,15 +551,19 @@ static int TrySendAudio( void )
 		pkt[2] = 0; pkt[3] = 0;
 		uint16_t * dst = (uint16_t *)( pkt + 4 );
 		uint32_t base = g_aud_sent % AUD_RING;
-		for( int j = 0; j < 120; j++ ) // 出力120ステレオペア(=2.5ms) ← 入力240ペア
+		for( int j = 0; j < 120; j++ ) // 出力120ステレオペア(=2.5ms) ← 入力480ペア
 		{
-			uint32_t i0 = ( base + j * 4 ) % AUD_RING;
-			uint32_t l = ( g_audbuf[i0] + g_audbuf[( i0 + 2 ) % AUD_RING] ) / 2;
-			uint32_t r = ( g_audbuf[( i0 + 1 ) % AUD_RING] + g_audbuf[( i0 + 3 ) % AUD_RING] ) / 2;
-			dst[j * 2] = (uint16_t)l;
-			dst[j * 2 + 1] = (uint16_t)r;
+			uint32_t i0 = ( base + j * 8 ) % AUD_RING;
+			uint32_t l = 0, r = 0;
+			for( int m = 0; m < 8; m += 2 )
+			{
+				l += g_audbuf[( i0 + m ) % AUD_RING];
+				r += g_audbuf[( i0 + m + 1 ) % AUD_RING];
+			}
+			dst[j * 2] = (uint16_t)( l / 4 );
+			dst[j * 2 + 1] = (uint16_t)( r / 4 );
 		}
-		g_aud_sent += 480; // 消費: 240ペア = 480サンプル
+		g_aud_sent += 960; // 消費: 480ペア = 960サンプル
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
 		USBHS_SendEndpoint( ep, 484, 0 );
 		return 0;
@@ -710,7 +715,7 @@ int main()
 				DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
 				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
-				g_aud_sent = ( g_aud_total / 4 ) * 4; // 音声位相を揃えて追従開始
+				g_aud_sent = ( g_aud_total / 8 ) * 8; // 音声位相を揃えて追従開始
 				g_aud_seq = 0;
 				g_stream = 1;
 				break;
@@ -790,10 +795,10 @@ int main()
 					g_aud_total += adelta;
 					g_aud_lastcur = acur;
 				}
-				// リング上書きに近づいたら追いつく (L/R位相=4サンプル境界を維持)
+				// リング上書きに近づいたら追いつく (L/R位相=8サンプル境界を維持)
 				if( g_aud_total - g_aud_sent > AUD_RING - 64 )
-					g_aud_sent = ( ( g_aud_total - 480 ) / 4 ) * 4;
-				while( g_aud_total - g_aud_sent >= 480 )
+					g_aud_sent = ( ( g_aud_total - 960 ) / 8 ) * 8;
+				while( g_aud_total - g_aud_sent >= 960 )
 					if( TrySendAudio() ) break;
 			}
 		}

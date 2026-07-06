@@ -43,6 +43,7 @@ public sealed class ViewerForm : Form
     private WasapiOut? _audioOut;
     private volatile bool _mute;
     private volatile bool _swapLr;
+    private volatile float _volume = 0.5f;
     private float _dcL = 2048, _dcR = 2048; // DCオフセット追従（ポップ音防止）
 
     // Windows 11 の角丸を無効化（映像領域の四隅が欠けるのを防ぐ）
@@ -82,6 +83,31 @@ public sealed class ViewerForm : Form
         swapItem.CheckedChanged += (_, _) => _swapLr = swapItem.Checked;
         audio.DropDownItems.Add(muteItem);
         audio.DropDownItems.Add(swapItem);
+        audio.DropDownItems.Add(new ToolStripSeparator());
+
+        // 音量: プリセット + スライダー
+        var volSlider = new TrackBar
+        {
+            Minimum = 0, Maximum = 100, Value = 50,
+            TickFrequency = 25, Width = 160, AutoSize = false, Height = 28,
+        };
+        var presetItems = new List<ToolStripMenuItem>();
+        void SetVolume(int percent)
+        {
+            _volume = percent / 100f;
+            if (volSlider.Value != percent) volSlider.Value = percent;
+            foreach (var pi in presetItems)
+                pi.Checked = (int)pi.Tag! == percent;
+        }
+        foreach (var p in new[] { 25, 50, 75, 100 })
+        {
+            var item = new ToolStripMenuItem($"音量 {p}%") { Tag = p, Checked = p == 50 };
+            item.Click += (_, _) => SetVolume((int)item.Tag!);
+            presetItems.Add(item);
+            audio.DropDownItems.Add(item);
+        }
+        volSlider.ValueChanged += (_, _) => SetVolume(volSlider.Value);
+        audio.DropDownItems.Add(new ToolStripControlHost(volSlider));
         menu.Items.Add(view);
         menu.Items.Add(audio);
         MainMenuStrip = menu;
@@ -330,6 +356,22 @@ public sealed class ViewerForm : Form
         }
     }
 
+    // 2次バターワースLPF fc=15kHz @48kHz (PWMキャリア残渣の除去)
+    private sealed class Biquad
+    {
+        private const float B0 = 0.4181f, B1 = 0.8362f, B2 = 0.4181f, A1 = 0.4629f, A2 = 0.2097f;
+        private float _x1, _x2, _y1, _y2;
+        public float Process(float x)
+        {
+            var y = B0 * x + B1 * _x1 + B2 * _x2 - A1 * _y1 - A2 * _y2;
+            _x2 = _x1; _x1 = x;
+            _y2 = _y1; _y1 = y;
+            return y;
+        }
+    }
+
+    private readonly Biquad _lpfL = new(), _lpfR = new();
+
     // 音声パケット: [0xA6][seq][0][0] + 48kHz L,R交互のADC生12bit × 240
     private void PlayAudioPacket(byte[] buf, int pos)
     {
@@ -339,11 +381,13 @@ public sealed class ViewerForm : Form
         {
             int l = buf[pos + 4 + j * 4] | (buf[pos + 5 + j * 4] << 8);
             int r = buf[pos + 6 + j * 4] | (buf[pos + 7 + j * 4] << 8);
-            // DCオフセットをゆっくり追従して除去 → int16へ (12bit→16bit)
+            // DCオフセットをゆっくり追従して除去 → LPF → 音量 → int16 (12bit→16bit)
             _dcL += (l - _dcL) * 0.0005f;
             _dcR += (r - _dcR) * 0.0005f;
-            var sl = Math.Clamp((int)((l - _dcL) * 16), short.MinValue, short.MaxValue);
-            var sr = Math.Clamp((int)((r - _dcR) * 16), short.MinValue, short.MaxValue);
+            var fl = _lpfL.Process(l - _dcL);
+            var fr = _lpfR.Process(r - _dcR);
+            var sl = Math.Clamp((int)(fl * 16 * _volume), short.MinValue, short.MaxValue);
+            var sr = Math.Clamp((int)(fr * 16 * _volume), short.MinValue, short.MaxValue);
             if (_swapLr) (sl, sr) = (sr, sl);
             pcm[j * 4] = (byte)sl; pcm[j * 4 + 1] = (byte)(sl >> 8);
             pcm[j * 4 + 2] = (byte)sr; pcm[j * 4 + 3] = (byte)(sr >> 8);
