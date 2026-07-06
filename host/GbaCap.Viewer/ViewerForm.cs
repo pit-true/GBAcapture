@@ -46,6 +46,25 @@ public sealed class ViewerForm : Form
     private volatile float _volume = 0.5f;
     private float _dcL = 2048, _dcR = 2048; // DCオフセット追従（ポップ音防止）
 
+    // デバッグ録音 (生サンプルをWAV保存 → スペクトル解析用)
+    private WaveFileWriter? _dbgWav;
+    private int _dbgRemain;
+    private readonly object _dbgLock = new();
+
+    private void StartDebugRecording(int seconds)
+    {
+        lock (_dbgLock)
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "GBAcapture");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"audio_debug_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
+            _dbgWav = new WaveFileWriter(path, new WaveFormat(32802, 16, 2));
+            _dbgRemain = 32802 * seconds;
+            _flash = $"  [録音中: {path}]";
+        }
+    }
+
     // Windows 11 の角丸を無効化（映像領域の四隅が欠けるのを防ぐ）
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
@@ -108,6 +127,10 @@ public sealed class ViewerForm : Form
         }
         volSlider.ValueChanged += (_, _) => SetVolume(volSlider.Value);
         audio.DropDownItems.Add(new ToolStripControlHost(volSlider));
+        audio.DropDownItems.Add(new ToolStripSeparator());
+        var recItem = new ToolStripMenuItem("デバッグ録音 10秒 (WAV保存)");
+        recItem.Click += (_, _) => StartDebugRecording(10);
+        audio.DropDownItems.Add(recItem);
         menu.Items.Add(view);
         menu.Items.Add(audio);
         MainMenuStrip = menu;
@@ -243,7 +266,7 @@ public sealed class ViewerForm : Form
             // 音声出力: FWから32.768kHz(PWMキャリア同期)で届くのでWDLリサンプラで48kHz化
             try
             {
-                _audioBuf = new BufferedWaveProvider(new WaveFormat(32727, 16, 2)) // FW実レート(523.64k/16)に一致させドリフトを防ぐ
+                _audioBuf = new BufferedWaveProvider(new WaveFormat(32802, 16, 2)) // FW実レート(328.02k/10)に一致させドリフトを防ぐ
                 {
                     BufferDuration = TimeSpan.FromSeconds(2),
                     DiscardOnBufferOverflow = true,
@@ -258,6 +281,9 @@ public sealed class ViewerForm : Form
 
             _running = true;
             SendCmd('S');
+            // 環境変数指定時は起動直後から自動デバッグ録音（解析用）
+            if (Environment.GetEnvironmentVariable("GBACAP_AUDIODUMP") is not null)
+                StartDebugRecording(10);
             foreach (var ep in StreamEps)
             {
                 var t = new Thread(() => RxLoop(ep)) { IsBackground = true };
@@ -380,6 +406,30 @@ public sealed class ViewerForm : Form
     // 音声パケット: [0xA6][seq][ペア数][0] + 32.768kHz L,R交互のADC生12bit
     private void PlayAudioPacket(byte[] buf, int pos, int pairs)
     {
+        // デバッグ録音: 加工前の生サンプルを保存
+        if (_dbgWav is not null)
+        {
+            lock (_dbgLock)
+            {
+                if (_dbgWav is not null)
+                {
+                    for (var j = 0; j < pairs && _dbgRemain > 0; j++, _dbgRemain--)
+                    {
+                        int rl = buf[pos + 4 + j * 4] | (buf[pos + 5 + j * 4] << 8);
+                        int rr = buf[pos + 6 + j * 4] | (buf[pos + 7 + j * 4] << 8);
+                        _dbgWav.WriteSample((rl - 2048) / 2048f);
+                        _dbgWav.WriteSample((rr - 2048) / 2048f);
+                    }
+                    if (_dbgRemain <= 0)
+                    {
+                        _dbgWav.Dispose();
+                        _dbgWav = null;
+                        _flash = "  [録音完了]";
+                    }
+                }
+            }
+        }
+
         if (_audioBuf is null || _mute) return;
         var pcm = new byte[pairs * 4];
         for (var j = 0; j < pairs; j++)

@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 28     // v0.28: 音声524kHz/16点積分 (PWMデューティ分解能向上)
+#define FW_VERSION 29     // v0.29: 安全強化(IWDG先行開始/ADCタイムアウト) + 327.68kHz/10点積分
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -476,10 +476,15 @@ static void AudioAdcInit( void )
 	ADC1->CTLR1 = ADC_SCAN;
 	ADC1->CTLR2 = ADC_ADON | ADC_DMA | ADC_EXTTRIG | ( 0x4 << 17 ); // EXTSEL=100: TIM3 TRGO
 	Delay_Ms( 1 );
-	ADC1->CTLR2 |= ADC_RSTCAL; while( ADC1->CTLR2 & ADC_RSTCAL );
-	ADC1->CTLR2 |= ADC_CAL;    while( ADC1->CTLR2 & ADC_CAL );
-	// ch4/ch5 は 523.6kHzペアに間に合うよう最速サンプル時間(1.5cyc, 計14cyc=0.78µs)
-	ADC1->SAMPTR2 = ( 0x2DB6DB6D & ~( 0x3F << 12 ) );
+	uint32_t cal_t0 = SysTick->CNT;
+	ADC1->CTLR2 |= ADC_RSTCAL;
+	while( ( ADC1->CTLR2 & ADC_RSTCAL )
+		&& (uint32_t)( SysTick->CNT - cal_t0 ) < Ticks_from_Ms( 10 ) );
+	ADC1->CTLR2 |= ADC_CAL;
+	while( ( ADC1->CTLR2 & ADC_CAL )
+		&& (uint32_t)( SysTick->CNT - cal_t0 ) < Ticks_from_Ms( 20 ) );
+	// ch4/ch5 はサンプル時間13.5cyc(計26cyc=1.44µs, ペア2.9µs < トリガ周期3.05µs)
+	ADC1->SAMPTR2 = ( 0x2DB6DB6D & ~( 0x3F << 12 ) ) | ( 0x2 << 12 ) | ( 0x2 << 15 );
 	ADC1->SAMPTR1 = 0x00B6DB6D;
 	ADC1->RSQR1 = ( 2 - 1 ) << 20;        // 変換数2
 	ADC1->RSQR3 = 4 | ( 5 << 5 );          // IN4 → IN5
@@ -492,11 +497,11 @@ static void AudioAdcInit( void )
 	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 	                    | DMA_Mode_Circular | DMA_CFGR1_EN;
 
-	// TIM3: 523.6kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
-	// (32.768kHz×16。PWM1周期あたり16点でデューティ分解能を稼ぐ)
+	// TIM3: 327.68kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
+	// (32.768kHz×10。ADC変換時間に確実な余裕を持たせた10点/周期)
 	TIM3->CTLR1 = 0;
 	TIM3->PSC = 0;
-	TIM3->ATRLR = 274; // 144MHz/275 = 523.64kHz (=32.768k×16 -0.13%)
+	TIM3->ATRLR = 438; // 144MHz/439 = 328.02kHz (=32.768k×10 +0.1%)
 	TIM3->CTLR2 = 0x20; // MMS=010: update を TRGO に
 	TIM3->CTLR1 = TIM_CEN;
 
@@ -539,8 +544,8 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 	return -1;
 }
 
-// 音声パケット (484B): [0xA6][seq][ペア数=30][0] + 32.7kHz L,R交互 u16(ADC生) + 0詰め
-// 523.6kHzで取った16サンプル(=キャリア1周期)を平均して32.7kHz化
+// 音声パケット (484B): [0xA6][seq][ペア数=48][0] + 32.8kHz L,R交互 u16(ADC生) + 0詰め
+// 327.68kHzで取った10サンプル(=キャリア1周期)を平均して32.8kHz化
 static int TrySendAudio( void )
 {
 	// 音声は EP3 専用 (k=2)。順序保証のため他EPへは絶対に送らない
@@ -551,21 +556,21 @@ static int TrySendAudio( void )
 		uint8_t * pkt = g_eptx[k];
 		pkt[0] = 0xA6;
 		pkt[1] = g_aud_seq++;
-		pkt[2] = 30; pkt[3] = 0; // 出力ステレオペア数
+		pkt[2] = 48; pkt[3] = 0; // 出力ステレオペア数
 		memset( pkt + 4, 0, 480 );
 		uint16_t * dst = (uint16_t *)( pkt + 4 );
 		uint32_t base = g_aud_sent % AUD_RING;
-		for( int j = 0; j < 30; j++ ) // 出力30ペア(≈0.92ms) ← 入力480ペア
+		for( int j = 0; j < 48; j++ ) // 出力48ペア(≈1.46ms) ← 入力480ペア
 		{
-			uint32_t i0 = ( base + j * 32 ) % AUD_RING;
+			uint32_t i0 = ( base + j * 20 ) % AUD_RING;
 			uint32_t l = 0, r = 0;
-			for( int m = 0; m < 32; m += 2 )
+			for( int m = 0; m < 20; m += 2 )
 			{
 				l += g_audbuf[( i0 + m ) % AUD_RING];
 				r += g_audbuf[( i0 + m + 1 ) % AUD_RING];
 			}
-			dst[j * 2] = (uint16_t)( l / 16 );
-			dst[j * 2 + 1] = (uint16_t)( r / 16 );
+			dst[j * 2] = (uint16_t)( l / 10 );
+			dst[j * 2 + 1] = (uint16_t)( r / 10 );
 		}
 		g_aud_sent += 960; // 消費: 480ペア = 960サンプル
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
@@ -656,19 +661,19 @@ int main()
 	SystemInit();
 	g_boot_rstsckr = RCC->RSTSCKR;
 
+	// ハング自動復旧: IWDG 約6.5秒。初期化中のハングからも復帰できるよう最初に開始
+	// (純正ISP ROMもIWDGを自前で管理するので救済経路とは干渉しない)
+	IWDG->CTLR = 0x5555; IWDG->PSCR = 4;     // 40kHz/64
+	IWDG->CTLR = 0x5555; IWDG->RLDR = 0xFFF; // ~6.5s
+	IWDG->CTLR = 0xCCCC;                     // 開始
+
 	funGpioInitAll();
 	funPinMode( PA3, GPIO_CFGLR_OUT_10Mhz_PP );
 	funDigitalWrite( PA3, FUN_LOW ); // LEDは常時消灯 (2026-07-06 ユーザー要望でLチカ廃止)
 
 	SignalCountersInit();
-	AudioAdcInit(); // SO1/SO2 の常時ADC取得 (96kHz→FWで48kHz化)
+	AudioAdcInit(); // SO1/SO2 の常時ADC取得
 	HSUSBSetup();
-
-	// ハング自動復旧: IWDG 約6.5秒。メインループが固まるとリセット→IAP→APPで復帰
-	// (純正ISP ROMもIWDGを自前で管理するので救済経路とは干渉しない)
-	IWDG->CTLR = 0x5555; IWDG->PSCR = 4;     // 40kHz/64
-	IWDG->CTLR = 0x5555; IWDG->RLDR = 0xFFF; // ~6.5s
-	IWDG->CTLR = 0xCCCC;                     // 開始
 
 	uint32_t last_meas = 0;
 	uint32_t prev_dck = 0, prev_lp = 0, prev_sps = 0;
@@ -719,7 +724,7 @@ int main()
 				DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
 				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
-				g_aud_sent = ( g_aud_total / 32 ) * 32; // 音声位相を揃えて追従開始
+				g_aud_sent = ( g_aud_total / 20 ) * 20; // 音声位相を揃えて追従開始
 				g_aud_seq = 0;
 				g_stream = 1;
 				break;
@@ -799,9 +804,9 @@ int main()
 					g_aud_total += adelta;
 					g_aud_lastcur = acur;
 				}
-				// リング上書きに近づいたら追いつく (L/R位相=32サンプル境界を維持)
+				// リング上書きに近づいたら追いつく (L/R位相=20サンプル境界を維持)
 				if( g_aud_total - g_aud_sent > AUD_RING - 64 )
-					g_aud_sent = ( ( g_aud_total - 960 ) / 32 ) * 32;
+					g_aud_sent = ( ( g_aud_total - 960 ) / 20 ) * 20;
 				while( g_aud_total - g_aud_sent >= 960 )
 					if( TrySendAudio() ) break;
 			}
