@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 22     // v0.22: ジャンクパルスはライン先頭側 → 読み出し+1オフセット
+#define FW_VERSION 23     // v0.23: LED常時消灯化
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -559,6 +559,7 @@ int main()
 
 	funGpioInitAll();
 	funPinMode( PA3, GPIO_CFGLR_OUT_10Mhz_PP );
+	funDigitalWrite( PA3, FUN_LOW ); // LEDは常時消灯 (2026-07-06 ユーザー要望でLチカ廃止)
 
 	SignalCountersInit();
 	HSUSBSetup();
@@ -569,10 +570,8 @@ int main()
 	IWDG->CTLR = 0x5555; IWDG->RLDR = 0xFFF; // ~6.5s
 	IWDG->CTLR = 0xCCCC;                     // 開始
 
-	uint32_t last_toggle = 0;
 	uint32_t last_meas = 0;
 	uint32_t prev_dck = 0, prev_lp = 0, prev_sps = 0;
-	int led = 0;
 
 	while(1)
 	{
@@ -691,12 +690,6 @@ int main()
 		}
 
 		uint32_t now = SysTick->CNT;
-		if( (uint32_t)( now - last_toggle ) >= Ticks_from_Ms( 500 ) )
-		{
-			last_toggle = now;
-			led = !led;
-			funDigitalWrite( PA3, led ? FUN_HIGH : FUN_LOW );
-		}
 
 		// 1秒窓で各信号のカウントを確定
 		if( (uint32_t)( now - last_meas ) >= Ticks_from_Ms( 1000 ) )
