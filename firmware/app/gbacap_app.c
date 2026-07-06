@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 25     // v0.25: 音声ノイズ対策 (384kHzサンプリング+4x平均+高速サンプル時間)
+#define FW_VERSION 26     // v0.26: PWMキャリア同期積分 (262.144kHz→8平均→32.768kHz出力)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -66,9 +66,10 @@ static uint8_t  g_st_install;    // 今の停止期間でアンカー済み
 static uint8_t  g_st_frame;      // フレーム番号
 
 // --- M6 音声 ---
-// SO1(PA4=ADC4)/SO2(PA5=ADC5) を TIM3 TRGO 192kHz トリガの ADC スキャン(2ch)で取得し
-// DMA1_CH1 がリングへ格納。FWで4サンプル平均して 48kHz ステレオにし
-// (PWMキャリアを下げる箱型フィルタ)、音声パケット(0xA6)として映像EP群に多重化する
+// GBAのPWMキャリアは 32.768kHz の整数倍 (SOUNDBIAS設定、GBATEK)。
+// 262.144kHz(=32.768k×8) でADCスキャン(2ch)し、キャリア1周期=8サンプルを
+// 箱型平均して 32.768kHz 出力にする → 箱型フィルタの零点が全キャリア高調波に
+// 一致し、原理的にPWMノイズが消える(キャリア同期積分)。48kHz化はホスト側で行う
 #define AUD_RING 1536            // u16サンプル数 (L,R交互)
 static uint16_t g_audbuf[AUD_RING];
 static uint32_t g_aud_lastcur;   // 前回のDMA位置
@@ -491,10 +492,10 @@ static void AudioAdcInit( void )
 	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 	                    | DMA_Mode_Circular | DMA_CFGR1_EN;
 
-	// TIM3: 192kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
+	// TIM3: 262.144kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
 	TIM3->CTLR1 = 0;
 	TIM3->PSC = 0;
-	TIM3->ATRLR = 749; // 144MHz/750 = 192kHz
+	TIM3->ATRLR = 548; // 144MHz/549 = 262.30kHz (=32.768k×8 +0.06%)
 	TIM3->CTLR2 = 0x20; // MMS=010: update を TRGO に
 	TIM3->CTLR1 = TIM_CEN;
 
@@ -537,8 +538,8 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 	return -1;
 }
 
-// 音声パケット (484B): [0xA6][seq][pad u16][48kHz L,R交互 int16(ADC生12bit) 240個]
-// 192kHzで取った4サンプルを平均して48kHz化(箱型ローパス=PWMキャリア低減)
+// 音声パケット (484B): [0xA6][seq][ペア数=60][0] + 32.768kHz L,R交互 u16(ADC生) + 0詰め
+// 262.144kHzで取った8サンプル(=キャリア1周期)を平均して32.768kHz化
 static int TrySendAudio( void )
 {
 	for( int k = 0; k < 3; k++ )
@@ -548,20 +549,21 @@ static int TrySendAudio( void )
 		uint8_t * pkt = g_eptx[k];
 		pkt[0] = 0xA6;
 		pkt[1] = g_aud_seq++;
-		pkt[2] = 0; pkt[3] = 0;
+		pkt[2] = 60; pkt[3] = 0; // 出力ステレオペア数
+		memset( pkt + 4, 0, 480 );
 		uint16_t * dst = (uint16_t *)( pkt + 4 );
 		uint32_t base = g_aud_sent % AUD_RING;
-		for( int j = 0; j < 120; j++ ) // 出力120ステレオペア(=2.5ms) ← 入力480ペア
+		for( int j = 0; j < 60; j++ ) // 出力60ペア(≈1.83ms) ← 入力480ペア
 		{
-			uint32_t i0 = ( base + j * 8 ) % AUD_RING;
+			uint32_t i0 = ( base + j * 16 ) % AUD_RING;
 			uint32_t l = 0, r = 0;
-			for( int m = 0; m < 8; m += 2 )
+			for( int m = 0; m < 16; m += 2 )
 			{
 				l += g_audbuf[( i0 + m ) % AUD_RING];
 				r += g_audbuf[( i0 + m + 1 ) % AUD_RING];
 			}
-			dst[j * 2] = (uint16_t)( l / 4 );
-			dst[j * 2 + 1] = (uint16_t)( r / 4 );
+			dst[j * 2] = (uint16_t)( l / 8 );
+			dst[j * 2 + 1] = (uint16_t)( r / 8 );
 		}
 		g_aud_sent += 960; // 消費: 480ペア = 960サンプル
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
@@ -715,7 +717,7 @@ int main()
 				DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
 				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
-				g_aud_sent = ( g_aud_total / 8 ) * 8; // 音声位相を揃えて追従開始
+				g_aud_sent = ( g_aud_total / 16 ) * 16; // 音声位相を揃えて追従開始
 				g_aud_seq = 0;
 				g_stream = 1;
 				break;
@@ -795,9 +797,9 @@ int main()
 					g_aud_total += adelta;
 					g_aud_lastcur = acur;
 				}
-				// リング上書きに近づいたら追いつく (L/R位相=8サンプル境界を維持)
+				// リング上書きに近づいたら追いつく (L/R位相=16サンプル境界を維持)
 				if( g_aud_total - g_aud_sent > AUD_RING - 64 )
-					g_aud_sent = ( ( g_aud_total - 960 ) / 8 ) * 8;
+					g_aud_sent = ( ( g_aud_total - 960 ) / 16 ) * 16;
 				while( g_aud_total - g_aud_sent >= 960 )
 					if( TrySendAudio() ) break;
 			}

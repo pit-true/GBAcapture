@@ -240,16 +240,18 @@ public sealed class ViewerForm : Form
                 var drain = new byte[16384];
                 while (rd.Read(drain, 100, out var n) == Error.Success && n > 0) { }
             }
-            // 音声出力 (48kHz 16bit ステレオ)
+            // 音声出力: FWから32.768kHz(PWMキャリア同期)で届くのでWDLリサンプラで48kHz化
             try
             {
-                _audioBuf = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
+                _audioBuf = new BufferedWaveProvider(new WaveFormat(32768, 16, 2))
                 {
                     BufferDuration = TimeSpan.FromSeconds(2),
                     DiscardOnBufferOverflow = true,
                 };
+                var resampled = new NAudio.Wave.SampleProviders.WdlResamplingSampleProvider(
+                    _audioBuf.ToSampleProvider(), 48000);
                 _audioOut = new WasapiOut(AudioClientShareMode.Shared, 120);
-                _audioOut.Init(_audioBuf);
+                _audioOut.Init(resampled.ToWaveProvider16());
                 _audioOut.Play();
             }
             catch { /* 音声デバイスが無くても映像は動かす */ }
@@ -337,9 +339,9 @@ public sealed class ViewerForm : Form
                         }
                         pos += LinePacket.PacketSize;
                     }
-                    else if (buf[pos] == 0xA6 && buf[pos + 2] == 0 && buf[pos + 3] == 0)
+                    else if (buf[pos] == 0xA6 && buf[pos + 2] > 0 && buf[pos + 2] <= 120 && buf[pos + 3] == 0)
                     {
-                        PlayAudioPacket(buf, pos);
+                        PlayAudioPacket(buf, pos, buf[pos + 2]);
                         pos += LinePacket.PacketSize;
                     }
                     else
@@ -359,10 +361,10 @@ public sealed class ViewerForm : Form
         }
     }
 
-    // 2次バターワースLPF fc=15kHz @48kHz (PWMキャリア残渣の除去)
+    // 2次バターワースLPF fc=13kHz @32.768kHz (残留ノイズの安全網)
     private sealed class Biquad
     {
-        private const float B0 = 0.4181f, B1 = 0.8362f, B2 = 0.4181f, A1 = 0.4629f, A2 = 0.2097f;
+        private const float B0 = 0.6309f, B1 = 1.2618f, B2 = 0.6309f, A1 = 1.1206f, A2 = 0.4030f;
         private float _x1, _x2, _y1, _y2;
         public float Process(float x)
         {
@@ -375,12 +377,12 @@ public sealed class ViewerForm : Form
 
     private readonly Biquad _lpfL = new(), _lpfR = new();
 
-    // 音声パケット: [0xA6][seq][0][0] + 48kHz L,R交互のADC生12bit × 240
-    private void PlayAudioPacket(byte[] buf, int pos)
+    // 音声パケット: [0xA6][seq][ペア数][0] + 32.768kHz L,R交互のADC生12bit
+    private void PlayAudioPacket(byte[] buf, int pos, int pairs)
     {
         if (_audioBuf is null || _mute) return;
-        var pcm = new byte[480];
-        for (var j = 0; j < 120; j++)
+        var pcm = new byte[pairs * 4];
+        for (var j = 0; j < pairs; j++)
         {
             int l = buf[pos + 4 + j * 4] | (buf[pos + 5 + j * 4] << 8);
             int r = buf[pos + 6 + j * 4] | (buf[pos + 7 + j * 4] << 8);
@@ -395,7 +397,7 @@ public sealed class ViewerForm : Form
             pcm[j * 4] = (byte)sl; pcm[j * 4 + 1] = (byte)(sl >> 8);
             pcm[j * 4 + 2] = (byte)sr; pcm[j * 4 + 3] = (byte)(sr >> 8);
         }
-        _audioBuf.AddSamples(pcm, 0, 480);
+        _audioBuf.AddSamples(pcm, 0, pcm.Length);
     }
 
     private static void DecodeRow(byte[] buf, int pos, int[] row)
