@@ -202,8 +202,11 @@ public sealed class ViewerForm : Form
     private void SetScale(int s, ToolStripMenuItem parent)
     {
         _scale = s;
-        foreach (ToolStripMenuItem it in parent.DropDownItems)
-            it.Checked = (int)it.Tag! == s;
+        // セパレータ等が混ざるので ToolStripMenuItem だけを対象にする
+        foreach (var it in parent.DropDownItems.OfType<ToolStripMenuItem>())
+            it.Checked = it.Tag is int v && v == s;
+        if (_fullscreen)
+            ExitFullscreen();
         ApplyClientSize();
         Invalidate();
     }
