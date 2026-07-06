@@ -243,7 +243,7 @@ public sealed class ViewerForm : Form
             // 音声出力: FWから32.768kHz(PWMキャリア同期)で届くのでWDLリサンプラで48kHz化
             try
             {
-                _audioBuf = new BufferedWaveProvider(new WaveFormat(32768, 16, 2))
+                _audioBuf = new BufferedWaveProvider(new WaveFormat(32727, 16, 2)) // FW実レート(523.64k/16)に一致させドリフトを防ぐ
                 {
                     BufferDuration = TimeSpan.FromSeconds(2),
                     DiscardOnBufferOverflow = true,
