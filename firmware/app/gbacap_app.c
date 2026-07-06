@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 26     // v0.26: PWMキャリア同期積分 (262.144kHz→8平均→32.768kHz出力)
+#define FW_VERSION 27     // v0.27: 音声はEP3専用に(順序保証)、映像はEP4/EP1の2本
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -504,15 +504,15 @@ static void AudioAdcInit( void )
 	g_aud_sent = 0;
 }
 
-// ストリーミング送出: EP4/EP1/EP3 のうち空いているエンドポイントで1ライン送る。
+// ストリーミング送出:
+//   映像 = EP4/EP1 の2本に分散 (必要帯域4.6MB/s < 2×3.3MB/s)
+//   音声 = EP3 専用 (パケット順序が保証される。複数EPに撒くと順序が壊れ音割れする)
 // 1EPあたり実効~3.3MB/s(NAK後のホスト再ポーリングがマイクロフレーム単位のため)
-// なので3本に分散して 60fps に必要な ~6.9MB/s を確保する。
-// cbase はサーキュラバッファ内のサンプル開始位置 (240の倍数なのでライン跨ぎなし)
 static const uint8_t k_stream_eps[3] = { 4, 1, 3 };
 static uint8_t g_eptx[3][484];
 static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 {
-	for( int k = 0; k < 3; k++ )
+	for( int k = 0; k < 2; k++ ) // 映像は EP4/EP1 のみ
 	{
 		int ep = k_stream_eps[k];
 		if( HSUSBCTX.USBHS_Endp_Busy[ep] & 1 ) continue;
@@ -542,10 +542,11 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 // 262.144kHzで取った8サンプル(=キャリア1周期)を平均して32.768kHz化
 static int TrySendAudio( void )
 {
-	for( int k = 0; k < 3; k++ )
+	// 音声は EP3 専用 (k=2)。順序保証のため他EPへは絶対に送らない
 	{
+		const int k = 2;
 		int ep = k_stream_eps[k];
-		if( HSUSBCTX.USBHS_Endp_Busy[ep] & 1 ) continue;
+		if( HSUSBCTX.USBHS_Endp_Busy[ep] & 1 ) return -1;
 		uint8_t * pkt = g_eptx[k];
 		pkt[0] = 0xA6;
 		pkt[1] = g_aud_seq++;
