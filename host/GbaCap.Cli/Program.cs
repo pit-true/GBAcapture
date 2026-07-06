@@ -231,16 +231,16 @@ switch (args[0])
     {
         using var dev = Open(context);
         if (dev is null) return 1;
-        var b = Transact(dev, MakeCmd('A'), 28, timeoutMs: 5000);
+        var b = Transact(dev, MakeCmd('A'), 36, timeoutMs: 5000);
         if (b[4] != 'A') { Console.Error.WriteLine("volt 失敗"); return 1; }
-        string[] names = ["PA0 DCK ", "PA1 LP  ", "PA2 SPS ", "PC4 LDR1", "PC5 LDR2"];
-        for (var c = 0; c < 5; c++)
+        string[] names = ["PA0 DCK ", "PA1 LP  ", "PA2 SPL ", "PC4 LDR1", "PC5 LDR2", "PA4 SO1 ", "PA5 SO2 "];
+        for (var c = 0; c < 7; c++)
         {
             var lo = BitConverter.ToUInt16(b, 8 + c * 4) * 3.3 / 4095;
             var hi = BitConverter.ToUInt16(b, 10 + c * 4) * 3.3 / 4095;
             Console.WriteLine($"{names[c]}: {lo:F2} 〜 {hi:F2} V");
         }
-        Console.WriteLine("(GBAロジックHなら~2.4-2.9V / nanoの3.3V電源張り付きならGND浮き疑い / 変動大なら信号あり)");
+        Console.WriteLine("(音声SO1/SO2: 音が出ていれば min-max が大きく開く(PWM)。0V張り付きなら未接続疑い)");
         return 0;
     }
     case "streamtest": // 'S'を送り2秒間EP4/1/3を読んで統計を出す

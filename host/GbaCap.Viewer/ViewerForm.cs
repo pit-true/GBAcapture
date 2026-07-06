@@ -3,6 +3,8 @@ using System.Drawing.Imaging;
 using LibUsbDotNet;
 using LibUsbDotNet.LibUsb;
 using LibUsbDotNet.Main;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 namespace GbaCap.Viewer;
 
@@ -36,6 +38,13 @@ public sealed class ViewerForm : Form
     private ToolStripMenuItem? _viewMenu;
     private string _flash = ""; // タイトルバーへの一時メッセージ
 
+    // 音声 (パケット0xA6: 48kHz 12bit生 → int16 PCM)
+    private BufferedWaveProvider? _audioBuf;
+    private WasapiOut? _audioOut;
+    private volatile bool _mute;
+    private volatile bool _swapLr;
+    private float _dcL = 2048, _dcR = 2048; // DCオフセット追従（ポップ音防止）
+
     // Windows 11 の角丸を無効化（映像領域の四隅が欠けるのを防ぐ）
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
@@ -66,7 +75,15 @@ public sealed class ViewerForm : Form
         var ssItem = new ToolStripMenuItem("スクリーンショット保存 (F12)");
         ssItem.Click += (_, _) => SaveScreenshot();
         view.DropDownItems.Add(ssItem);
+        var audio = new ToolStripMenuItem("音声(&A)");
+        var muteItem = new ToolStripMenuItem("ミュート") { CheckOnClick = true };
+        muteItem.CheckedChanged += (_, _) => _mute = muteItem.Checked;
+        var swapItem = new ToolStripMenuItem("L/R入替") { CheckOnClick = true };
+        swapItem.CheckedChanged += (_, _) => _swapLr = swapItem.Checked;
+        audio.DropDownItems.Add(muteItem);
+        audio.DropDownItems.Add(swapItem);
         menu.Items.Add(view);
+        menu.Items.Add(audio);
         MainMenuStrip = menu;
         Controls.Add(menu);
 
@@ -194,6 +211,20 @@ public sealed class ViewerForm : Form
                 var drain = new byte[16384];
                 while (rd.Read(drain, 100, out var n) == Error.Success && n > 0) { }
             }
+            // 音声出力 (48kHz 16bit ステレオ)
+            try
+            {
+                _audioBuf = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
+                {
+                    BufferDuration = TimeSpan.FromSeconds(2),
+                    DiscardOnBufferOverflow = true,
+                };
+                _audioOut = new WasapiOut(AudioClientShareMode.Shared, 120);
+                _audioOut.Init(_audioBuf);
+                _audioOut.Play();
+            }
+            catch { /* 音声デバイスが無くても映像は動かす */ }
+
             _running = true;
             SendCmd('S');
             foreach (var ep in StreamEps)
@@ -228,6 +259,7 @@ public sealed class ViewerForm : Form
             }
         }
         catch { }
+        try { _audioOut?.Stop(); _audioOut?.Dispose(); } catch { }
         _dev?.Dispose();
         _ctx?.Dispose();
         base.OnFormClosing(e);
@@ -264,20 +296,27 @@ public sealed class ViewerForm : Form
                 var pos = 0;
                 while (len - pos >= LinePacket.PacketSize)
                 {
-                    if (!(buf[pos] == 0xA5 && buf[pos + 3] == 0 && buf[pos + 2] < 160))
+                    if (buf[pos] == 0xA5 && buf[pos + 3] == 0 && buf[pos + 2] < 160)
+                    {
+                        var line = buf[pos + 2];
+                        DecodeRow(buf, pos, row);
+                        WriteRow(line, row);
+                        if (line == H - 1)
+                        {
+                            _framesThisSec++;
+                            BeginInvoke(Invalidate);
+                        }
+                        pos += LinePacket.PacketSize;
+                    }
+                    else if (buf[pos] == 0xA6 && buf[pos + 2] == 0 && buf[pos + 3] == 0)
+                    {
+                        PlayAudioPacket(buf, pos);
+                        pos += LinePacket.PacketSize;
+                    }
+                    else
                     {
                         pos++; // マジック再同期
-                        continue;
                     }
-                    var line = buf[pos + 2];
-                    DecodeRow(buf, pos, row);
-                    WriteRow(line, row);
-                    if (line == H - 1)
-                    {
-                        _framesThisSec++;
-                        BeginInvoke(Invalidate);
-                    }
-                    pos += LinePacket.PacketSize;
                 }
                 // 未処理の端数を先頭へ詰める
                 Buffer.BlockCopy(buf, pos, buf, 0, len - pos);
@@ -289,6 +328,27 @@ public sealed class ViewerForm : Form
             _status = "受信停止";
             try { File.AppendAllText("viewer.log", $"[{epId}] {ex}\n"); } catch { }
         }
+    }
+
+    // 音声パケット: [0xA6][seq][0][0] + 48kHz L,R交互のADC生12bit × 240
+    private void PlayAudioPacket(byte[] buf, int pos)
+    {
+        if (_audioBuf is null || _mute) return;
+        var pcm = new byte[480];
+        for (var j = 0; j < 120; j++)
+        {
+            int l = buf[pos + 4 + j * 4] | (buf[pos + 5 + j * 4] << 8);
+            int r = buf[pos + 6 + j * 4] | (buf[pos + 7 + j * 4] << 8);
+            // DCオフセットをゆっくり追従して除去 → int16へ (12bit→16bit)
+            _dcL += (l - _dcL) * 0.0005f;
+            _dcR += (r - _dcR) * 0.0005f;
+            var sl = Math.Clamp((int)((l - _dcL) * 16), short.MinValue, short.MaxValue);
+            var sr = Math.Clamp((int)((r - _dcR) * 16), short.MinValue, short.MaxValue);
+            if (_swapLr) (sl, sr) = (sr, sl);
+            pcm[j * 4] = (byte)sl; pcm[j * 4 + 1] = (byte)(sl >> 8);
+            pcm[j * 4 + 2] = (byte)sr; pcm[j * 4 + 3] = (byte)(sr >> 8);
+        }
+        _audioBuf.AddSamples(pcm, 0, 480);
     }
 
     private static void DecodeRow(byte[] buf, int pos, int[] row)

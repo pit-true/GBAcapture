@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 23     // v0.23: LED常時消灯化
+#define FW_VERSION 24     // v0.24: M6 音声ストリーミング (SO1/SO2 ADC 96k→48kHz PCM)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -64,6 +64,17 @@ static uint32_t g_st_lastchange; // 最後にDMAが進んだ時刻
 static uint8_t  g_st_anchored;   // アンカー有効
 static uint8_t  g_st_install;    // 今の停止期間でアンカー済み
 static uint8_t  g_st_frame;      // フレーム番号
+
+// --- M6 音声 ---
+// SO1(PA4=ADC4)/SO2(PA5=ADC5) を TIM3 TRGO 96kHz トリガの ADC スキャン(2ch)で取得し
+// DMA1_CH1 がリングへ格納。FWで2サンプル平均して 48kHz ステレオにし、
+// 音声パケット(0xA6)として映像と同じEP群に多重化する
+#define AUD_RING 1024            // u16サンプル数 (L,R交互)
+static uint16_t g_audbuf[AUD_RING];
+static uint32_t g_aud_lastcur;   // 前回のDMA位置
+static uint32_t g_aud_total;     // 取り込んだサンプル総数
+static uint32_t g_aud_sent;      // 消費済みサンプル数
+static uint8_t  g_aud_seq;       // 音声パケット連番
 
 void EXTI1_IRQHandler( void ) __attribute__((interrupt));
 void EXTI1_IRQHandler( void )
@@ -364,6 +375,8 @@ static void ReplyRawDiag( void )
 // 'A': PA0(DCK)/PA1(LP)/PA2(SPS)/PC4(LDR1)/PC5(LDR2) のアナログ電圧を測る。
 // 各ch 16回サンプルの min/max (ADC生値 0-4095, Vref=3.3V) を返す。
 // GND浮きなら全ピンがVDD付近に張り付き、本物のGBAロジックHなら~2.9V/3.3*4095≈3600
+static void AudioAdcInit( void );
+
 // V30x(F1型)のADC: SWSTART をトリガ源に選ばないと変換が始まらない
 // (ch32fun の funAnalogInit/Read はこれを設定せず無限ループする → 自前実装)
 static void AdcInit( void )
@@ -392,10 +405,13 @@ static uint16_t AdcRead( uint8_t ch )
 
 static void ReplyAdc( void )
 {
-	static const uint8_t chans[5] = { 0, 1, 2, 14, 15 }; // ADC-IN番号
-	uint16_t vmin[5], vmax[5];
+	// 0-2:映像制御(PA0-2), 14-15:赤LSB(PC4-5), 4-5:音声SO1/SO2(PA4-5)
+	static const uint8_t chans[7] = { 0, 1, 2, 14, 15, 4, 5 };
+	uint16_t vmin[7], vmax[7];
 
 	AdcInit();
+	funPinMode( PA4, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PA5, GPIO_CFGLR_IN_ANALOG );
 	// 対象ピンをアナログ入力に
 	funPinMode( PA0, GPIO_CFGLR_IN_ANALOG );
 	funPinMode( PA1, GPIO_CFGLR_IN_ANALOG );
@@ -403,10 +419,12 @@ static void ReplyAdc( void )
 	funPinMode( PC4, GPIO_CFGLR_IN_ANALOG );
 	funPinMode( PC5, GPIO_CFGLR_IN_ANALOG );
 
-	for( int c = 0; c < 5; c++ )
+	for( int c = 0; c < 7; c++ )
 	{
 		vmin[c] = 0xFFFF; vmax[c] = 0;
-		for( int i = 0; i < 16; i++ )
+		// 音声ch(末尾2つ)はPWM/波形を捉えるためサンプル数を増やす
+		int n = ( c >= 5 ) ? 256 : 16;
+		for( int i = 0; i < n; i++ )
 		{
 			uint16_t v = AdcRead( chans[c] );
 			if( v < vmin[c] ) vmin[c] = v;
@@ -421,14 +439,15 @@ static void ReplyAdc( void )
 	funPinMode( PC4, GPIO_CFGLR_IN_FLOAT );
 	funPinMode( PC5, GPIO_CFGLR_IN_FLOAT );
 
-	uint8_t rep[28];
+	uint8_t rep[36];
 	rep[0]='G'; rep[1]='B'; rep[2]='A'; rep[3]='C'; rep[4]='A'; rep[5]=0; rep[6]=0; rep[7]=0;
-	for( int c = 0; c < 5; c++ )
+	for( int c = 0; c < 7; c++ )
 	{
 		memcpy( rep + 8 + c * 4, &vmin[c], 2 );
 		memcpy( rep + 10 + c * 4, &vmax[c], 2 );
 	}
-	SendEp4( rep, 28 );
+	SendEp4( rep, 36 );
+	AudioAdcInit(); // 診断でADC設定を壊すので音声取得を復元
 }
 
 static void ReplyFreq( void )
@@ -440,6 +459,47 @@ static void ReplyFreq( void )
 	memcpy( t + 12, &g_lp_per_s, 4 );
 	memcpy( t + 16, &g_sps_per_s, 4 );
 	SendEp4( rep, 20 );
+}
+
+// 音声ADCの常時取得を開始する（起動時に1回。'A'診断の後にも再実行が必要）
+static void AudioAdcInit( void )
+{
+	RCC->APB2PCENR |= RCC_APB2Periph_ADC1;
+	RCC->APB1PCENR |= RCC_APB1Periph_TIM3;
+	RCC->AHBPCENR |= RCC_AHBPeriph_DMA1;
+	RCC->CFGR0 |= RCC_ADCPRE_DIV8;
+	funPinMode( PA4, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PA5, GPIO_CFGLR_IN_ANALOG );
+
+	// ADC1: スキャン2ch(IN4,IN5)、TIM3 TRGO トリガ、DMA
+	ADC1->CTLR1 = ADC_SCAN;
+	ADC1->CTLR2 = ADC_ADON | ADC_DMA | ADC_EXTTRIG | ( 0x4 << 17 ); // EXTSEL=100: TIM3 TRGO
+	Delay_Ms( 1 );
+	ADC1->CTLR2 |= ADC_RSTCAL; while( ADC1->CTLR2 & ADC_RSTCAL );
+	ADC1->CTLR2 |= ADC_CAL;    while( ADC1->CTLR2 & ADC_CAL );
+	ADC1->SAMPTR2 = 0x2DB6DB6D; // サンプル時間 0b101
+	ADC1->SAMPTR1 = 0x00B6DB6D;
+	ADC1->RSQR1 = ( 2 - 1 ) << 20;        // 変換数2
+	ADC1->RSQR3 = 4 | ( 5 << 5 );          // IN4 → IN5
+
+	DMA1_Channel1->CFGR &= ~DMA_CFGR1_EN;
+	DMA1_Channel1->PADDR = (uintptr_t)&ADC1->RDATAR;
+	DMA1_Channel1->MADDR = (uintptr_t)g_audbuf;
+	DMA1_Channel1->CNTR = AUD_RING;
+	DMA1_Channel1->CFGR = DMA_Priority_High | DMA_MemoryDataSize_HalfWord
+	                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
+	                    | DMA_Mode_Circular | DMA_CFGR1_EN;
+
+	// TIM3: 96kHz で TRGO(update) → 1トリガでL,Rの2変換が走る
+	TIM3->CTLR1 = 0;
+	TIM3->PSC = 0;
+	TIM3->ATRLR = 1499; // 144MHz/1500 = 96kHz
+	TIM3->CTLR2 = 0x20; // MMS=010: update を TRGO に
+	TIM3->CTLR1 = TIM_CEN;
+
+	g_aud_lastcur = 0;
+	g_aud_total = 0;
+	g_aud_sent = 0;
 }
 
 // ストリーミング送出: EP4/EP1/EP3 のうち空いているエンドポイントで1ライン送る。
@@ -469,6 +529,36 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 			       | ( ( g_capbuf_c[idx] & 0x20 ) << 1 );
 		}
 		// UEPn_TX_DMA は UEP1 から連続配置
+		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
+		USBHS_SendEndpoint( ep, 484, 0 );
+		return 0;
+	}
+	return -1;
+}
+
+// 音声パケット (484B): [0xA6][seq][pad u16][48kHz L,R交互 int16(ADC生12bit) 240個]
+// 96kHzで取った2サンプルを平均して48kHz化(簡易ローパス=PWMキャリア低減)
+static int TrySendAudio( void )
+{
+	for( int k = 0; k < 3; k++ )
+	{
+		int ep = k_stream_eps[k];
+		if( HSUSBCTX.USBHS_Endp_Busy[ep] & 1 ) continue;
+		uint8_t * pkt = g_eptx[k];
+		pkt[0] = 0xA6;
+		pkt[1] = g_aud_seq++;
+		pkt[2] = 0; pkt[3] = 0;
+		uint16_t * dst = (uint16_t *)( pkt + 4 );
+		uint32_t base = g_aud_sent % AUD_RING;
+		for( int j = 0; j < 120; j++ ) // 出力120ステレオペア(=2.5ms) ← 入力240ペア
+		{
+			uint32_t i0 = ( base + j * 4 ) % AUD_RING;
+			uint32_t l = ( g_audbuf[i0] + g_audbuf[( i0 + 2 ) % AUD_RING] ) / 2;
+			uint32_t r = ( g_audbuf[( i0 + 1 ) % AUD_RING] + g_audbuf[( i0 + 3 ) % AUD_RING] ) / 2;
+			dst[j * 2] = (uint16_t)l;
+			dst[j * 2 + 1] = (uint16_t)r;
+		}
+		g_aud_sent += 480; // 消費: 240ペア = 480サンプル
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
 		USBHS_SendEndpoint( ep, 484, 0 );
 		return 0;
@@ -562,6 +652,7 @@ int main()
 	funDigitalWrite( PA3, FUN_LOW ); // LEDは常時消灯 (2026-07-06 ユーザー要望でLチカ廃止)
 
 	SignalCountersInit();
+	AudioAdcInit(); // SO1/SO2 の常時ADC取得 (96kHz→FWで48kHz化)
 	HSUSBSetup();
 
 	// ハング自動復旧: IWDG 約6.5秒。メインループが固まるとリセット→IAP→APPで復帰
@@ -619,6 +710,8 @@ int main()
 				DMA1_Channel7->CFGR = DMA_Priority_VeryHigh | DMA_MemoryDataSize_Byte
 				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
+				g_aud_sent = ( g_aud_total / 4 ) * 4; // 音声位相を揃えて追従開始
+				g_aud_seq = 0;
 				g_stream = 1;
 				break;
 			case 'X': // ストリーミング停止
@@ -686,6 +779,22 @@ int main()
 				if( TrySendLine( g_st_frame, (uint16_t)line, ( g_st_sent + 1 ) % STR_RING_SAMPLES ) )
 					break; // 全EP使用中 → 次周で再試行
 				g_st_sent += STR_LINE_STRIDE;
+			}
+
+			// --- 音声の消費と送出 ---
+			{
+				uint32_t acur = AUD_RING - DMA1_Channel1->CNTR;
+				uint32_t adelta = ( acur + AUD_RING - g_aud_lastcur ) % AUD_RING;
+				if( adelta )
+				{
+					g_aud_total += adelta;
+					g_aud_lastcur = acur;
+				}
+				// リング上書きに近づいたら追いつく (L/R位相=4サンプル境界を維持)
+				if( g_aud_total - g_aud_sent > AUD_RING - 64 )
+					g_aud_sent = ( ( g_aud_total - 480 ) / 4 ) * 4;
+				while( g_aud_total - g_aud_sent >= 480 )
+					if( TrySendAudio() ) break;
 			}
 		}
 
