@@ -1,97 +1,102 @@
-# GBAcapture (Nisekoro-capture)
+# GBAcapture (Nisekoro-capture) — 偽ころキャプチャ
 
-A DIY video/audio capture system for the original Game Boy Advance (AGB-001),
-built around a **nanoCH32V305** (WCH CH32V305, RISC-V) board — in the spirit of the
-Japanese "偽トロキャプチャ" (Nisetro) capture mods. Named after its author's handle "koro".
+*A DIY 60fps video + audio capture mod for the original Game Boy Advance, built on a
+nanoCH32V305 (RISC-V). Documentation is in Japanese.*
 
-**2026-07-05: first light!**
+初代ゲームボーイアドバンス（AGB-001）の**液晶信号と音声をデジタルのまま取り出す**
+自作キャプチャシステム。いわゆる「偽トロキャプチャ」を、約1,000円のRISC-Vマイコンボード
+**nanoCH32V305**（WCH CH32V305）でゼロから実装したもの。名前は偽トロ+作者HN「ころ」から。
 
-![first light](docs/captures/2026-07-05_first-light.png)
+![capture quality](docs/captures/final-quality.png)
 
-## Features
+## 特徴
 
-- **Video**: 240×160, 15-bit RGB, **60 fps** real-time streaming over USB High-Speed
-- **Audio**: stereo, tapped at the CPU's SO1/SO2 outputs (**pre-volume** — works with the
-  wheel at zero), PWM-carrier-synchronous integration + analog RC front-end for clean sound
-- **Viewer** (Windows, C#/.NET 8): pixel-perfect integer scaling (1x–4x), aspect-correct
-  fullscreen, screenshots (F12), volume control, NO SIGNAL overlay
-- **Recording**: designed to be captured with OBS (window capture + desktop audio)
-- No custom kernel drivers — WinUSB via Zadig, vendor bulk protocol
+- **映像**: 240×160 / 15bit RGB / **60fps**（フレーム落ちなし・実機と同一タイミング）
+- **音声**: ステレオ。CPUの音声出力（SO1/SO2）から**プリボリューム**で取得
+  — 本体の音量ホイールが0でもPCにはフル音量で流れる
+- **ビューア**（Windows / C# / .NET 8）: ピクセルパーフェクト整数拡大(1x-4x)、
+  アスペクト比維持フルスクリーン、スクリーンショット(F12)、音量調整、NO SIGNAL表示
+- **録画**: OBSのウィンドウキャプチャ+デスクトップ音声でそのまま録画可能
+- カーネルドライバ不要（WinUSB + 独自バルクプロトコル）
+- **ボタンフリー開発**: 自作IAPブートローダによりFW更新はUSB経由で全自動（約10秒）
 
-## How it works
+## 仕組み（概要）
 
 ```
-GBA LCD bus (taps on labeled vias) ──> nanoCH32V305 ──USB-HS bulk──> Windows viewer
-  DCK 4.19MHz burst clock              timer-triggered DMA            decode + render
-  SPL line sync                        circular capture               WASAPI audio
-  15-bit RGB parallel                  3-endpoint streaming
-  SO1/SO2 audio (PWM) ──RC filter──>   262kHz ADC + carrier-sync integration
+GBA実機（基板の印字付きビア19本にタップ）
+  ├ 映像: DCK(ドットクロック4.19MHz) + SPL(ライン同期) + RGB15bitパラレル
+  │   → タイマ入力キャプチャ→DMA（サーキュラ）でクロック同期取り込み
+  │   → VBLANK休止検出 + SPLによるハイブリッドフレーム同期
+  ├ 音声: SO1/SO2 → RCフィルタ → 262kHz級ADC → PWMキャリア同期積分
+  ▼
+nanoCH32V305 ──USB High-Speed(480Mbps) バルク3EP──> Windowsビューア
 ```
 
-Key techniques (hard-won; see `docs/` for the full story):
+技術的な要点（詳細は docs/ 参照）:
 
-- One line = **241 DCK pulses** (240 visible + 1 junk in H-blank)
-- Jitter-free capture: circular DMA armed once, frame anchor derived from the
-  **VBLANK pause in the data itself** — no per-line interrupts in the data path
-- USB-HS bulk tops out at ~3.3 MB/s per endpoint (NAK → next-microframe retry),
-  so video is striped across two endpoints; audio gets its own (ordering!)
-- GBA audio PWM carrier is always a multiple of 32.768 kHz (SOUNDBIAS) — sampling at
-  N×32.768 kHz and box-averaging N kills the carrier exactly
+- 1ライン周期は実測 **DCK 241パルス**（可視240+ジャンク1）、1フレームは**161バースト**
+  （可視160+VBLANK中のダミー1）— どちらも文献に無い実測知見
+- ライン毎の割り込み処理はジッタの原因になるため排除（DMAは開始時に1回アームするだけ）
+- USB-HSバルクは1EPあたり実効~3.3MB/s → 映像2EP+音声専用1EPに分離
+- GBA音声のPWMキャリア（32.768kHzの整数倍）は、キャリア1周期分の箱型平均で厳密に除去
 
-## Repository layout
+## リポジトリ構成
 
-| Path | Contents |
+| パス | 内容 |
 |---|---|
-| `firmware/app/` | Capture firmware (C, [ch32fun](https://github.com/cnlohr/ch32fun)) |
-| `firmware/iap/` | Self-update bootloader — flash new app firmware over USB, no buttons |
-| `firmware/gba-pantest/` | Tiny GBA ROM to verify L/R channel mapping |
-| `host/GbaCap/` | Core library (packet parsing, pixel decode) + xUnit tests |
-| `host/GbaCap.Viewer/` | The viewer app (WinForms) |
-| `host/GbaCap.Cli/` | Developer CLI (flash, diagnostics, still capture) |
-| `docs/` | Documentation (Japanese): wiring, signal analysis, design notes |
+| `firmware/app/` | キャプチャFW本体（C, [ch32fun](https://github.com/cnlohr/ch32fun)） |
+| `firmware/iap/` | 自作ブートローダ（USB経由の手放しFW更新） |
+| `firmware/gba-pantest/` | L/R判定用の自作GBAテストROM |
+| `host/GbaCap/` | コアライブラリ（パケット解析・デコード）+ xUnitテスト |
+| `host/GbaCap.Viewer/` | ビューア本体（WinForms） |
+| `host/GbaCap.Cli/` | 開発用CLI（FW更新・診断・静止画取得） |
+| `docs/` | ドキュメント一式（配線・信号仕様・設計・トラブル記録） |
 
-## Getting started (development)
+## 使い方（開発環境）
 
-Prereqs: .NET 8 SDK, xPack RISC-V GCC, GNU Make, wchisp — see `docs/setup.md`.
+前提ツールは [docs/setup.md](docs/setup.md) 参照（.NET 8 / RISC-V GCC / wchisp など）。
 
 ```bash
-# Host tests
+# ホスト側テスト
 cd host && dotnet test
 
-# Build firmware and update the device over USB (no buttons needed)
+# FWビルド → ボタンフリー更新
 cd firmware && ./build.sh app
 cd ../host && dotnet run --project GbaCap.Cli -- update ../firmware/app/gbacap_app.bin
 
-# Run the viewer
+# ビューア起動
 host/GbaCap.Viewer/bin/Debug/net8.0-windows/GbaCap.Viewer.exe
 ```
 
-Hardware wiring is documented in `docs/wiring.md` (GBA-side taps on the
-silkscreen-labeled vias of an AGB-CPU-02/03 board) and `docs/gba-40pin-pinout.md`.
+ハード配線は [docs/wiring.md](docs/wiring.md)（GBA側は基板シルク印字のビアにタップ）と
+[docs/gba-40pin-pinout.md](docs/gba-40pin-pinout.md) を参照。
 
-## Documentation index (Japanese)
+## ドキュメント索引
 
+- [docs/specification.md](docs/specification.md) — **仕様説明書**（人に説明するならまずこれ）
+- [docs/capture-logic-invariants.md](docs/capture-logic-invariants.md) — 🔒 確定ロジックの不変条件（変更禁止事項）
 - [docs/wiring.md](docs/wiring.md) — 配線表（正）と実機診断の記録
 - [docs/gba-40pin-pinout.md](docs/gba-40pin-pinout.md) — 40ピンLCDコネクタの検証済みピン配置
 - [docs/gba-video-signal.md](docs/gba-video-signal.md) — 映像信号仕様（実測値）
-- [docs/audio-plan.md](docs/audio-plan.md) — 音声取得（SO1/SO2、RCフィルタ、キャリア同期積分）
+- [docs/audio-plan.md](docs/audio-plan.md) — 音声取得（SO1/SO2・RCフィルタ・キャリア同期積分）
 - [docs/hands-free-loop.md](docs/hands-free-loop.md) — ボタンフリー開発ループ（IAP方式）
 - [docs/flashing.md](docs/flashing.md) — 書き込み方式の検討経緯・救済手順
 - [docs/architecture.md](docs/architecture.md) — 全体設計
 - [docs/hardware-adapter-plan.md](docs/hardware-adapter-plan.md) — 基板化プラン
+- [docs/recorder-plan.md](docs/recorder-plan.md) — スタンドアロン録画デバイス計画
 - [docs/setup.md](docs/setup.md) — 開発環境の再現手順
 - [docs/publishing-policy.md](docs/publishing-policy.md) — 公開時のコンテンツ方針
 
-## Status / Roadmap
+## ステータス / ロードマップ
 
-- [x] 60 fps video capture + viewer
-- [x] Clean stereo audio (pre-volume tap)
-- [x] Button-free development loop (IAP self-update)
-- [ ] UVC/UAC composite device (driverless, works with any capture software)
-- [ ] Custom interposer PCB (32-pin & 40-pin FFC support)
-- [ ] Standalone recorder
+- [x] 60fps映像キャプチャ + ビューア
+- [x] クリアなステレオ音声（プリボリューム取得）
+- [x] ボタンフリー開発基盤（IAP自己更新）
+- [ ] スタンドアロン録画デバイス（[検討中](docs/recorder-plan.md)）
+- [ ] UVC/UAC複合デバイス化（ドライバレスで任意のキャプチャソフト対応）
+- [ ] 専用インターポーザ基板（32ピン/40ピン両対応）
 
-## License
+## ライセンス
 
-TBD (private repository for now — see `docs/publishing-policy.md` for what must be
-scrubbed before any public release).
+未定（現在プライベートリポジトリ。公開前の必須作業は
+[docs/publishing-policy.md](docs/publishing-policy.md) を参照 — ゲーム画面等の履歴浄化が必要）。
