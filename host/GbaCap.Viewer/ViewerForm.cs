@@ -441,8 +441,8 @@ public sealed class ViewerForm : Form
             _dcR += (r - _dcR) * 0.0005f;
             var fl = _lpfL.Process(l - _dcL);
             var fr = _lpfR.Process(r - _dcR);
-            var sl = Math.Clamp((int)(fl * 16 * _volume), short.MinValue, short.MaxValue);
-            var sr = Math.Clamp((int)(fr * 16 * _volume), short.MinValue, short.MaxValue);
+            var sl = Math.Clamp((int)(fl * 2 * _volume), short.MinValue, short.MaxValue); // 100%で常識的音量になる基準ゲイン
+            var sr = Math.Clamp((int)(fr * 2 * _volume), short.MinValue, short.MaxValue);
             if (_swapLr) (sl, sr) = (sr, sl);
             pcm[j * 4] = (byte)sl; pcm[j * 4 + 1] = (byte)(sl >> 8);
             pcm[j * 4 + 2] = (byte)sr; pcm[j * 4 + 3] = (byte)(sr >> 8);
