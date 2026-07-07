@@ -283,6 +283,31 @@ switch (args[0])
         Console.WriteLine($"観測ライン番号: {lineSeen.Count}種 min={(lineSeen.Count > 0 ? lineSeen.Min() : -1)} max={(lineSeen.Count > 0 ? lineSeen.Max() : -1)}");
         return 0;
     }
+    case "framestat": // ストリーミング中のフレームサンプル数統計 ('Q')
+    {
+        using var dev = Open(context);
+        if (dev is null) return 1;
+        Write(dev, MakeCmd('S'));
+        var epids = new[] { ReadEndpointID.Ep04, ReadEndpointID.Ep01, ReadEndpointID.Ep03 };
+        var stop = false;
+        var ths = epids.Select(id => new Thread(() =>
+        {
+            try { var rd = dev.OpenEndpointReader(id); var b = new byte[65536];
+                  while (!stop) rd.Read(b, 200, out _); } catch { }
+        })).ToList();
+        ths.ForEach(t => t.Start());
+        Thread.Sleep(4000); // 数百フレーム分の統計を溜める
+        var q = Transact(dev, MakeCmd('Q'), 16, timeoutMs: 3000);
+        stop = true;
+        Write(dev, MakeCmd('X'));
+        ths.ForEach(t => t.Join(500));
+        var last = BitConverter.ToInt32(q, 8);
+        var min = BitConverter.ToInt32(q, 12);
+        var max = (int)BitConverter.ToInt16(q, 5);
+        Console.WriteLine($"フレームサンプル数-38560: last={last} min={min} max={max}");
+        Console.WriteLine("(全て0が理想。非0はVBLANK境界に余分/不足パルスがある証拠)");
+        return 0;
+    }
     case "cmd":
     {
         using var dev = Open(context);

@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 30     // v0.30: 偽ころキャプチャ改名 + LEDはキャプチャ中のみ点灯
+#define FW_VERSION 33     // v0.33: SPLでライン0を特定しアンカー補正 (ダミーライン対策)
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -64,6 +64,12 @@ static uint32_t g_st_lastchange; // 最後にDMAが進んだ時刻
 static uint8_t  g_st_anchored;   // アンカー有効
 static uint8_t  g_st_install;    // 今の停止期間でアンカー済み
 static uint8_t  g_st_frame;      // フレーム番号
+static uint32_t g_st_prev_anchor;   // 診断: 前回アンカー位置
+static int32_t  g_st_fs_last;       // 診断: 直近フレームのサンプル数-38560
+static int32_t  g_st_fs_min = 999;  // 診断: 最小(同上)
+static int32_t  g_st_fs_max = -999; // 診断: 最大(同上)
+static volatile uint32_t g_spl_frame_pos;  // フレーム先頭SPL時のリング位置
+static volatile uint8_t  g_spl_frame_flag;
 
 // --- M6 音声 ---
 // GBAのPWMキャリアは 32.768kHz の整数倍 (SOUNDBIAS設定、GBATEK)。
@@ -106,10 +112,19 @@ void EXTI2_IRQHandler( void )
 	else if( g_spl_line < 227 )
 		g_spl_line++;
 
-	// ストリーミング中はSPL割り込みをデータ経路に使わない
-	// （サーキュラDMA + VBLANK休止検出で全て賄う。ジッタ源を排除）
+	// ストリーミング中: フレーム先頭のSPLでDMA位置を記録する
+	// （実測でフレームは161バースト = 可視160 + VBLANK中のダミー1。
+	//   ダミーにはSPLが無いので、SPL位置から「どのバーストがライン0か」を特定できる。
+	//   列の位相はサンプル精度のストールアンカーが持ち、SPLはライン選択のみ担当）
 	if( g_stream )
+	{
+		if( frame_start )
+		{
+			g_spl_frame_pos = STR_RING_SAMPLES - DMA1_Channel5->CNTR;
+			g_spl_frame_flag = 1;
+		}
 		return;
+	}
 
 	if( g_cap_state == 1 && frame_start )
 	{
@@ -700,6 +715,18 @@ int main()
 			case 'A':
 				ReplyAdc();
 				break;
+			case 'Q': // 診断: フレームサンプル数統計 12B応答 {last,min,max} (i32, -38560済み)
+			{
+				uint8_t rep[16];
+				rep[0]='G'; rep[1]='B'; rep[2]='A'; rep[3]='C'; rep[4]='q'; rep[5]=0; rep[6]=0; rep[7]=0;
+				memcpy( rep + 8, &g_st_fs_last, 4 );
+				memcpy( rep + 12, &g_st_fs_min, 4 );
+				// min/max 両方は16Bに収まらないためmaxは別途: rep[5..6]にi16で
+				int16_t mx = (int16_t)( g_st_fs_max > 32767 ? 32767 : g_st_fs_max < -32768 ? -32768 : g_st_fs_max );
+				memcpy( rep + 5, &mx, 2 );
+				SendEp4( rep, 16 );
+				break;
+			}
 			case 'D': // 診断: 直近 'L' の最終スロットDMA残量
 				Reply8( 'd', (uint8_t)( g_dbg_last_cntr & 0xFF ),
 				        (uint8_t)( g_dbg_last_cntr >> 8 ), 0 );
@@ -725,6 +752,8 @@ int main()
 				                    | DMA_PeripheralDataSize_HalfWord | DMA_MemoryInc_Enable
 				                    | DMA_Mode_Circular | DMA_CFGR1_EN;
 				g_aud_sent = ( g_aud_total / 20 ) * 20; // 音声位相を揃えて追従開始
+				g_st_prev_anchor = 0; // フレーム統計をリセット
+				g_st_fs_last = 0; g_st_fs_min = 999; g_st_fs_max = -999;
 				g_aud_seq = 0;
 				g_stream = 1;
 				break;
@@ -767,6 +796,15 @@ int main()
 					if( line < 160 )
 						TrySendLine( g_st_frame, (uint16_t)line, ( g_st_sent + 1 ) % STR_RING_SAMPLES );
 				}
+				// 診断: フレームあたりサンプル数の統計 (理論値 160×241=38560)
+				if( g_st_prev_anchor )
+				{
+					int32_t d = (int32_t)( g_st_total - g_st_prev_anchor ) - 38560;
+					g_st_fs_last = d;
+					if( d < g_st_fs_min ) g_st_fs_min = d;
+					if( d > g_st_fs_max ) g_st_fs_max = d;
+				}
+				g_st_prev_anchor = g_st_total;
 				// → 次に来るサンプルがライン0の先頭。ここがフレーム境界
 				g_st_anchor = g_st_total;
 				g_st_sent = g_st_total;
@@ -776,6 +814,23 @@ int main()
 			}
 
 			// 1ライン周期 = 241サンプル (可視240 + ジャンク1)。241揃うごとに240を送る
+			// SPLによるライン0補正: ストールアンカーがダミーバーストを指していたら
+			// 241の整数倍だけ進めて本物のライン0に合わせる（列位相は不変）
+			if( g_spl_frame_flag && g_st_anchored )
+			{
+				g_spl_frame_flag = 0;
+				uint32_t behind = ( g_st_lastcur + STR_RING_SAMPLES - g_spl_frame_pos )
+				                  % STR_RING_SAMPLES;
+				uint32_t spl_total = g_st_total - behind; // SPL時点のサンプル総数
+				uint32_t k = ( spl_total + 120 - g_st_anchor ) / STR_LINE_STRIDE;
+				if( k > 0 && k < 8 ) // 常識的な範囲のダミー数のみ補正
+				{
+					g_st_anchor += k * STR_LINE_STRIDE;
+					if( g_st_sent < g_st_anchor )
+						g_st_sent = g_st_anchor;
+				}
+			}
+
 			while( g_st_anchored && g_st_total - g_st_sent >= STR_LINE_STRIDE )
 			{
 				// リング一周分以上遅れたら(上書きされたら)このフレームは諦める
