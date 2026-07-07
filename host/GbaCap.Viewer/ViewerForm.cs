@@ -438,8 +438,9 @@ public sealed class ViewerForm : Form
         var pcm = new byte[pairs * 4];
         for (var j = 0; j < pairs; j++)
         {
-            int l = buf[pos + 4 + j * 4] | (buf[pos + 5 + j * 4] << 8);
-            int r = buf[pos + 6 + j * 4] | (buf[pos + 7 + j * 4] << 8);
+            // パケット内の並びは [SO1, SO2]。pantest ROM での実測により SO1=右, SO2=左 と確定
+            int r = buf[pos + 4 + j * 4] | (buf[pos + 5 + j * 4] << 8);
+            int l = buf[pos + 6 + j * 4] | (buf[pos + 7 + j * 4] << 8);
             // DCオフセットをゆっくり追従して除去 → LPF → 音量 → int16 (12bit→16bit)
             _dcL += (l - _dcL) * 0.0005f;
             _dcR += (r - _dcR) * 0.0005f;
