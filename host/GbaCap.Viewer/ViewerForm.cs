@@ -32,6 +32,7 @@ public sealed class ViewerForm : Form
         [ReadEndpointID.Ep04, ReadEndpointID.Ep01, ReadEndpointID.Ep03];
     private int _scale = 3;
     private int _framesThisSec;
+    private long _lastFrameMs; // 最後にフレームが完成した時刻 (NO SIGNAL 表示用)
     private string _status = "接続中...";
 
     private bool _fullscreen;
@@ -71,7 +72,7 @@ public sealed class ViewerForm : Form
 
     public ViewerForm()
     {
-        Text = "GBAcapture";
+        Text = "偽ころキャプチャ";
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = true; // □は下のWndProcで 1x として扱う
@@ -146,8 +147,10 @@ public sealed class ViewerForm : Form
         _fpsTimer.Tick += (_, _) =>
         {
             if (!_fullscreen)
-                Text = $"GBAcapture - {_framesThisSec} fps ({_scale}x) {_status}{_flash}";
+                Text = $"偽ころキャプチャ - {_framesThisSec} fps ({_scale}x) {_status}{_flash}";
             _framesThisSec = 0;
+            if (Environment.TickCount64 - _lastFrameMs > 1500)
+                Invalidate(); // NO SIGNAL オーバーレイ更新
         };
         _fpsTimer.Start();
     }
@@ -361,6 +364,7 @@ public sealed class ViewerForm : Form
                         if (line == H - 1)
                         {
                             _framesThisSec++;
+                            _lastFrameMs = Environment.TickCount64;
                             BeginInvoke(Invalidate);
                         }
                         pos += LinePacket.PacketSize;
@@ -472,6 +476,22 @@ public sealed class ViewerForm : Form
         }
     }
 
+    // 映像が一定時間来ていないときのオーバーレイ (GBA電源断・ケーブル抜け等)
+    private void DrawNoSignal(Graphics g, Rectangle area)
+    {
+        if (Environment.TickCount64 - _lastFrameMs <= 1500) return;
+        using var dim = new SolidBrush(Color.FromArgb(140, 0, 0, 0));
+        g.FillRectangle(dim, area);
+        using var font = new Font("Segoe UI", Math.Max(10, area.Height / 12f), FontStyle.Bold);
+        const string msg = "NO SIGNAL";
+        var size = g.MeasureString(msg, font);
+        var pt = new PointF(area.X + (area.Width - size.Width) / 2,
+                            area.Y + (area.Height - size.Height) / 2);
+        using var shadow = new SolidBrush(Color.FromArgb(180, 0, 0, 0));
+        g.DrawString(msg, font, shadow, pt.X + 2, pt.Y + 2);
+        g.DrawString(msg, font, Brushes.White, pt);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
@@ -486,12 +506,14 @@ public sealed class ViewerForm : Form
             var dh = (int)(H * fit);
             lock (_bmpLock)
                 e.Graphics.DrawImage(_bmp, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+            DrawNoSignal(e.Graphics, new Rectangle((cw - dw) / 2, (ch - dh) / 2, dw, dh));
         }
         else
         {
             var menuH = MainMenuStrip?.Height ?? 24;
             lock (_bmpLock)
                 e.Graphics.DrawImage(_bmp, 0, menuH, W * _scale, H * _scale);
+            DrawNoSignal(e.Graphics, new Rectangle(0, menuH, W * _scale, H * _scale));
         }
     }
 }

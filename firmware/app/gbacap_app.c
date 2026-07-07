@@ -13,7 +13,7 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 29     // v0.29: 安全強化(IWDG先行開始/ADCタイムアウト) + 327.68kHz/10点積分
+#define FW_VERSION 30     // v0.30: 偽ころキャプチャ改名 + LEDはキャプチャ中のみ点灯
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -813,6 +813,12 @@ int main()
 		}
 
 		uint32_t now = SysTick->CNT;
+
+		// LED: キャプチャ中(ストリーミング + GBA信号が生きている)のみ点灯
+		{
+			int alive = (uint32_t)( now - g_spl_last ) < Ticks_from_Ms( 100 );
+			funDigitalWrite( PA3, ( g_stream && alive ) ? FUN_HIGH : FUN_LOW );
+		}
 
 		// 1秒窓で各信号のカウントを確定
 		if( (uint32_t)( now - last_meas ) >= Ticks_from_Ms( 1000 ) )

@@ -69,7 +69,7 @@ static const uint8_t config_descriptor[] = {
 };
 
 #define STR_MANUFACTURER u"pit-true"
-#define STR_PRODUCT      u"GBAcapture"
+#define STR_PRODUCT      u"NisekoroCapture"
 #define STR_SERIAL       u"GBACAP-001"
 
 struct usb_string_descriptor_struct {
