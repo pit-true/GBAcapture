@@ -43,7 +43,6 @@ public sealed class ViewerForm : Form
     private BufferedWaveProvider? _audioBuf;
     private WasapiOut? _audioOut;
     private volatile bool _mute;
-    private volatile bool _swapLr;
     private volatile float _volume = 0.5f;
     private float _dcL = 2048, _dcR = 2048; // DCオフセット追従（ポップ音防止）
 
@@ -99,10 +98,7 @@ public sealed class ViewerForm : Form
         var audio = new ToolStripMenuItem("&Audio");
         var muteItem = new ToolStripMenuItem("Mute") { CheckOnClick = true };
         muteItem.CheckedChanged += (_, _) => _mute = muteItem.Checked;
-        var swapItem = new ToolStripMenuItem("Swap L/R") { CheckOnClick = true };
-        swapItem.CheckedChanged += (_, _) => _swapLr = swapItem.Checked;
         audio.DropDownItems.Add(muteItem);
-        audio.DropDownItems.Add(swapItem);
         audio.DropDownItems.Add(new ToolStripSeparator());
 
         // 音量: プリセット + スライダー
@@ -448,7 +444,6 @@ public sealed class ViewerForm : Form
             var fr = _lpfR.Process(r - _dcR);
             var sl = Math.Clamp((int)(fl * 2 * _volume), short.MinValue, short.MaxValue); // 100%で常識的音量になる基準ゲイン
             var sr = Math.Clamp((int)(fr * 2 * _volume), short.MinValue, short.MaxValue);
-            if (_swapLr) (sl, sr) = (sr, sl);
             pcm[j * 4] = (byte)sl; pcm[j * 4 + 1] = (byte)(sl >> 8);
             pcm[j * 4 + 2] = (byte)sr; pcm[j * 4 + 3] = (byte)(sr >> 8);
         }
