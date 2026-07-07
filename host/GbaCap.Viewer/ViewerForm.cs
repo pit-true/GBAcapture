@@ -33,7 +33,7 @@ public sealed class ViewerForm : Form
     private int _scale = 3;
     private int _framesThisSec;
     private long _lastFrameMs; // 最後にフレームが完成した時刻 (NO SIGNAL 表示用)
-    private string _status = "接続中...";
+    private string _status = "Connecting...";
 
     private bool _fullscreen;
     private ToolStripMenuItem? _viewMenu;
@@ -62,7 +62,7 @@ public sealed class ViewerForm : Form
             var path = Path.Combine(dir, $"audio_debug_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
             _dbgWav = new WaveFileWriter(path, new WaveFormat(32802, 16, 2));
             _dbgRemain = 32802 * seconds;
-            _flash = $"  [録音中: {path}]";
+            _flash = $"  [Recording: {path}]";
         }
     }
 
@@ -72,7 +72,7 @@ public sealed class ViewerForm : Form
 
     public ViewerForm()
     {
-        Text = "偽ころキャプチャ";
+        Text = "GBAcapture (Nisekoro-capture)";
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = true; // □は下のWndProcで 1x として扱う
@@ -80,7 +80,7 @@ public sealed class ViewerForm : Form
         KeyPreview = true;
 
         var menu = new MenuStrip();
-        var view = new ToolStripMenuItem("表示(&V)");
+        var view = new ToolStripMenuItem("&View");
         _viewMenu = view;
         foreach (var s in new[] { 1, 2, 3, 4 })
         {
@@ -89,17 +89,17 @@ public sealed class ViewerForm : Form
             view.DropDownItems.Add(item);
         }
         view.DropDownItems.Add(new ToolStripSeparator());
-        var fsItem = new ToolStripMenuItem("フルスクリーン (Escで戻る)");
+        var fsItem = new ToolStripMenuItem("Fullscreen (Esc to exit)");
         fsItem.Click += (_, _) => EnterFullscreen();
         view.DropDownItems.Add(fsItem);
         view.DropDownItems.Add(new ToolStripSeparator());
-        var ssItem = new ToolStripMenuItem("スクリーンショット保存 (F12)");
+        var ssItem = new ToolStripMenuItem("Save Screenshot (F12)");
         ssItem.Click += (_, _) => SaveScreenshot();
         view.DropDownItems.Add(ssItem);
-        var audio = new ToolStripMenuItem("音声(&A)");
-        var muteItem = new ToolStripMenuItem("ミュート") { CheckOnClick = true };
+        var audio = new ToolStripMenuItem("&Audio");
+        var muteItem = new ToolStripMenuItem("Mute") { CheckOnClick = true };
         muteItem.CheckedChanged += (_, _) => _mute = muteItem.Checked;
-        var swapItem = new ToolStripMenuItem("L/R入替") { CheckOnClick = true };
+        var swapItem = new ToolStripMenuItem("Swap L/R") { CheckOnClick = true };
         swapItem.CheckedChanged += (_, _) => _swapLr = swapItem.Checked;
         audio.DropDownItems.Add(muteItem);
         audio.DropDownItems.Add(swapItem);
@@ -121,7 +121,7 @@ public sealed class ViewerForm : Form
         }
         foreach (var p in new[] { 25, 50, 75, 100 })
         {
-            var item = new ToolStripMenuItem($"音量 {p}%") { Tag = p, Checked = p == 50 };
+            var item = new ToolStripMenuItem($"Volume {p}%") { Tag = p, Checked = p == 50 };
             item.Click += (_, _) => SetVolume((int)item.Tag!);
             presetItems.Add(item);
             audio.DropDownItems.Add(item);
@@ -129,7 +129,7 @@ public sealed class ViewerForm : Form
         volSlider.ValueChanged += (_, _) => SetVolume(volSlider.Value);
         audio.DropDownItems.Add(new ToolStripControlHost(volSlider));
         audio.DropDownItems.Add(new ToolStripSeparator());
-        var recItem = new ToolStripMenuItem("デバッグ録音 10秒 (WAV保存)");
+        var recItem = new ToolStripMenuItem("Debug Record 10s (WAV)");
         recItem.Click += (_, _) => StartDebugRecording(10);
         audio.DropDownItems.Add(recItem);
         menu.Items.Add(view);
@@ -147,7 +147,7 @@ public sealed class ViewerForm : Form
         _fpsTimer.Tick += (_, _) =>
         {
             if (!_fullscreen)
-                Text = $"偽ころキャプチャ - {_framesThisSec} fps ({_scale}x) {_status}{_flash}";
+                Text = $"GBAcapture (Nisekoro-capture) - {_framesThisSec} fps ({_scale}x) {_status}{_flash}";
             _framesThisSec = 0;
             if (Environment.TickCount64 - _lastFrameMs > 1500)
                 Invalidate(); // NO SIGNAL オーバーレイ更新
@@ -168,14 +168,14 @@ public sealed class ViewerForm : Form
                 using var clone = new Bitmap(_bmp);
                 clone.Save(path, ImageFormat.Png);
             }
-            _flash = $"  [保存: {path}]";
+            _flash = $"  [Saved: {path}]";
             var t = new System.Windows.Forms.Timer { Interval = 4000 };
             t.Tick += (_, _) => { _flash = ""; t.Dispose(); };
             t.Start();
         }
         catch (Exception ex)
         {
-            _flash = $"  [保存失敗: {ex.Message}]";
+            _flash = $"  [Save failed: {ex.Message}]";
         }
     }
 
@@ -252,7 +252,7 @@ public sealed class ViewerForm : Form
             _dev = _ctx.Find(d => d.VendorId == Vid && d.ProductId == Pid);
             if (_dev is null)
             {
-                _status = "デバイス未接続";
+                _status = "Device not found";
                 return;
             }
             _dev.Open();
@@ -297,7 +297,7 @@ public sealed class ViewerForm : Form
         }
         catch (Exception ex)
         {
-            _status = $"接続失敗: {ex.Message}";
+            _status = $"Connect failed: {ex.Message}";
         }
     }
 
@@ -386,7 +386,7 @@ public sealed class ViewerForm : Form
         }
         catch (Exception ex)
         {
-            _status = "受信停止";
+            _status = "RX stopped";
             try { File.AppendAllText("viewer.log", $"[{epId}] {ex}\n"); } catch { }
         }
     }
@@ -428,7 +428,7 @@ public sealed class ViewerForm : Form
                     {
                         _dbgWav.Dispose();
                         _dbgWav = null;
-                        _flash = "  [録音完了]";
+                        _flash = "  [Recording done]";
                     }
                 }
             }
