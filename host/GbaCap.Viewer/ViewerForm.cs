@@ -91,6 +91,14 @@ public sealed class ViewerForm : Form
         public void OnPropertyValueChanged(string pwstrDeviceId, NAudio.CoreAudioApi.PropertyKey key) { }
     }
 
+    private string? _currentAudioDevId;
+
+    private string? DefaultRenderId()
+    {
+        try { return _mmEnum?.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia)?.ID; }
+        catch { return null; }
+    }
+
     private void RestartAudioOut()
     {
         lock (_audioOutLock)
@@ -102,6 +110,7 @@ public sealed class ViewerForm : Form
                 _audioOut = new WasapiOut(AudioClientShareMode.Shared, 120); // 新しい既定デバイスで開き直す
                 _audioOut.Init(_audioChain);
                 _audioOut.Play();
+                _currentAudioDevId = DefaultRenderId();
             }
             catch { _audioOut = null; }
         }
@@ -191,10 +200,6 @@ public sealed class ViewerForm : Form
         }
         volSlider.ValueChanged += (_, _) => SetVolume(volSlider.Value);
         audio.DropDownItems.Add(new ToolStripControlHost(volSlider));
-        audio.DropDownItems.Add(new ToolStripSeparator());
-        var recItem = new ToolStripMenuItem("Debug Record 10s (WAV)");
-        recItem.Click += (_, _) => StartDebugRecording(10);
-        audio.DropDownItems.Add(recItem);
         menu.Items.Add(view);
         menu.Items.Add(audio);
         MainMenuStrip = menu;
@@ -242,7 +247,9 @@ public sealed class ViewerForm : Form
         }
     }
 
-    // ドラッグで画面端にぶつけた(スナップ)→フルスクリーン / □ボタンクリック→1x
+    // ドラッグで画面上端にぶつけて離す→フルスクリーン / □ボタンクリック→1x
+    // 注意: ウィンドウスタイル変更はドラッグのモーダルループ内で行うと表示が壊れるため、
+    // 必ず BeginInvoke でループ脱出後に実行する
     protected override void WndProc(ref Message m)
     {
         const int WM_SYSCOMMAND = 0x0112;
@@ -250,14 +257,26 @@ public sealed class ViewerForm : Form
         const int WM_ENTERSIZEMOVE = 0x0231;
         const int WM_EXITSIZEMOVE = 0x0232;
         if (m.Msg == WM_ENTERSIZEMOVE) _dragging = true;
-        if (m.Msg == WM_EXITSIZEMOVE) _dragging = false;
+        if (m.Msg == WM_EXITSIZEMOVE)
+        {
+            _dragging = false;
+            if (!_fullscreen)
+            {
+                if (MousePosition.Y <= 6)
+                    BeginInvoke(EnterFullscreen);       // 上端で離した → フルスクリーン
+                else
+                    BeginInvoke(ApplyClientSize);        // スナップ等で崩れたサイズを自己修復
+            }
+        }
         if (m.Msg == WM_SYSCOMMAND && ((int)m.WParam & 0xFFF0) == SC_MAXIMIZE)
         {
-            // ドラッグ操作由来(スナップ) → フルスクリーン / ボタンクリック → 1x
             if (_dragging || MousePosition.Y <= 8)
-                EnterFullscreen();
+                BeginInvoke(EnterFullscreen);
             else if (_viewMenu is not null)
-                SetScale(1, _viewMenu);
+            {
+                var vm = _viewMenu;
+                BeginInvoke(() => SetScale(1, vm));
+            }
             return; // 既定の最大化はさせない
         }
         base.WndProc(ref m);
@@ -382,15 +401,25 @@ public sealed class ViewerForm : Form
                 _audioOut.Init(_audioChain);
                 _audioOut.Play();
 
-                // Windowsの既定出力デバイス変更に追従 (デバウンス300ms)
+                // Windowsの既定出力デバイス変更に即時追従
                 _mmEnum = new MMDeviceEnumerator();
-                var debounce = new System.Windows.Forms.Timer { Interval = 300 };
-                debounce.Tick += (_, _) => { debounce.Stop(); RestartAudioOut(); };
+                _currentAudioDevId = DefaultRenderId();
+                var kick = new System.Windows.Forms.Timer { Interval = 50 };
+                kick.Tick += (_, _) => { kick.Stop(); RestartAudioOut(); };
                 _mmWatcher = new AudioDeviceWatcher(() =>
                 {
-                    try { BeginInvoke(() => { debounce.Stop(); debounce.Start(); }); } catch { }
+                    try { BeginInvoke(() => { kick.Stop(); kick.Start(); }); } catch { }
                 });
-                _mmEnum.RegisterEndpointNotificationCallback(_mmWatcher);
+                try { _mmEnum.RegisterEndpointNotificationCallback(_mmWatcher); } catch { }
+                // フォールバック: 通知が来ない環境向けに500msごとに既定デバイスIDを照合
+                var poll = new System.Windows.Forms.Timer { Interval = 500 };
+                poll.Tick += (_, _) =>
+                {
+                    var id = DefaultRenderId();
+                    if (id is not null && id != _currentAudioDevId)
+                        RestartAudioOut();
+                };
+                poll.Start();
             }
             catch { /* 音声デバイスが無くても映像は動かす */ }
 
