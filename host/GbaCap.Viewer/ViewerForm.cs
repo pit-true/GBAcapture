@@ -30,18 +30,82 @@ public sealed class ViewerForm : Form
     private volatile bool _running;
     private static readonly ReadEndpointID[] StreamEps =
         [ReadEndpointID.Ep04, ReadEndpointID.Ep01, ReadEndpointID.Ep03];
-    private int _scale = 3;
+    private int _scale = 1; // 既定1x。前回終了時の値を設定ファイルから復元する
+    private int _volumePercent = 50;
     private int _framesThisSec;
     private long _lastFrameMs; // 最後にフレームが完成した時刻 (NO SIGNAL 表示用)
     private string _status = "Connecting...";
+    private bool _dragging;   // タイトルバードラッグ中 (WM_ENTER/EXITSIZEMOVE)
+
+    private static string SettingsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "GBAcapture", "viewer.json");
+
+    private void LoadSettings()
+    {
+        try
+        {
+            var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(SettingsPath));
+            if (json.RootElement.TryGetProperty("scale", out var sc)) _scale = Math.Clamp(sc.GetInt32(), 1, 4);
+            if (json.RootElement.TryGetProperty("volume", out var vo)) _volumePercent = Math.Clamp(vo.GetInt32(), 0, 100);
+        }
+        catch { /* 初回起動など */ }
+        _volume = _volumePercent / 100f;
+    }
+
+    private void SaveSettings()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+            File.WriteAllText(SettingsPath,
+                $"{{\"scale\":{_scale},\"volume\":{_volumePercent}}}");
+        }
+        catch { }
+    }
 
     private bool _fullscreen;
     private ToolStripMenuItem? _viewMenu;
     private string _flash = ""; // タイトルバーへの一時メッセージ
 
-    // 音声 (パケット0xA6: 48kHz 12bit生 → int16 PCM)
+    // 音声 (パケット0xA6: 32.8kHz 12bit生 → int16 PCM → 48kHzリサンプル)
     private BufferedWaveProvider? _audioBuf;
     private WasapiOut? _audioOut;
+    private IWaveProvider? _audioChain;      // リサンプル済みの再生チェーン
+    private MMDeviceEnumerator? _mmEnum;     // 既定出力デバイス変更の監視
+    private AudioDeviceWatcher? _mmWatcher;
+    private readonly object _audioOutLock = new();
+
+    // 既定出力デバイスが変わったら WasapiOut を作り直して追従する
+    private sealed class AudioDeviceWatcher : NAudio.CoreAudioApi.Interfaces.IMMNotificationClient
+    {
+        private readonly Action _onChanged;
+        public AudioDeviceWatcher(Action onChanged) => _onChanged = onChanged;
+        public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
+        {
+            if (flow == DataFlow.Render && role == Role.Multimedia) _onChanged();
+        }
+        public void OnDeviceAdded(string pwstrDeviceId) { }
+        public void OnDeviceRemoved(string deviceId) { }
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState) { }
+        public void OnPropertyValueChanged(string pwstrDeviceId, NAudio.CoreAudioApi.PropertyKey key) { }
+    }
+
+    private void RestartAudioOut()
+    {
+        lock (_audioOutLock)
+        {
+            if (_audioChain is null) return;
+            try { _audioOut?.Stop(); _audioOut?.Dispose(); } catch { }
+            try
+            {
+                _audioOut = new WasapiOut(AudioClientShareMode.Shared, 120); // 新しい既定デバイスで開き直す
+                _audioOut.Init(_audioChain);
+                _audioOut.Play();
+            }
+            catch { _audioOut = null; }
+        }
+    }
     private volatile bool _mute;
     private volatile float _volume = 0.5f;
     private float _dcL = 2048, _dcR = 2048; // DCオフセット追従（ポップ音防止）
@@ -71,6 +135,7 @@ public sealed class ViewerForm : Form
 
     public ViewerForm()
     {
+        LoadSettings();
         Text = "GBAcapture (Nisekoro-capture)";
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -104,20 +169,22 @@ public sealed class ViewerForm : Form
         // 音量: プリセット + スライダー
         var volSlider = new TrackBar
         {
-            Minimum = 0, Maximum = 100, Value = 50,
+            Minimum = 0, Maximum = 100, Value = _volumePercent,
             TickFrequency = 25, Width = 160, AutoSize = false, Height = 28,
         };
         var presetItems = new List<ToolStripMenuItem>();
         void SetVolume(int percent)
         {
             _volume = percent / 100f;
+            _volumePercent = percent;
             if (volSlider.Value != percent) volSlider.Value = percent;
             foreach (var pi in presetItems)
                 pi.Checked = (int)pi.Tag! == percent;
+            SaveSettings();
         }
         foreach (var p in new[] { 25, 50, 75, 100 })
         {
-            var item = new ToolStripMenuItem($"Volume {p}%") { Tag = p, Checked = p == 50 };
+            var item = new ToolStripMenuItem($"Volume {p}%") { Tag = p, Checked = p == _volumePercent };
             item.Click += (_, _) => SetVolume((int)item.Tag!);
             presetItems.Add(item);
             audio.DropDownItems.Add(item);
@@ -175,21 +242,58 @@ public sealed class ViewerForm : Form
         }
     }
 
-    // □(最大化ボタン) は 1x に、画面上端へのスナップ(Aeroスナップ)はフルスクリーンにする
+    // ドラッグで画面端にぶつけた(スナップ)→フルスクリーン / □ボタンクリック→1x
     protected override void WndProc(ref Message m)
     {
         const int WM_SYSCOMMAND = 0x0112;
         const int SC_MAXIMIZE = 0xF030;
+        const int WM_ENTERSIZEMOVE = 0x0231;
+        const int WM_EXITSIZEMOVE = 0x0232;
+        if (m.Msg == WM_ENTERSIZEMOVE) _dragging = true;
+        if (m.Msg == WM_EXITSIZEMOVE) _dragging = false;
         if (m.Msg == WM_SYSCOMMAND && ((int)m.WParam & 0xFFF0) == SC_MAXIMIZE)
         {
-            // マウスが画面最上端ならスナップ操作 → フルスクリーン
-            if (MousePosition.Y <= 8)
+            // ドラッグ操作由来(スナップ) → フルスクリーン / ボタンクリック → 1x
+            if (_dragging || MousePosition.Y <= 8)
                 EnterFullscreen();
             else if (_viewMenu is not null)
                 SetScale(1, _viewMenu);
             return; // 既定の最大化はさせない
         }
         base.WndProc(ref m);
+    }
+
+    // フルスクリーン中に上部をつまんでドラッグ → 通常サイズに戻して掴んだまま移動
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    private bool _fsGrab;
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (_fullscreen && e.Button == MouseButtons.Left && e.Y < 48)
+            _fsGrab = true;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (_fsGrab && e.Button == MouseButtons.Left)
+        {
+            _fsGrab = false;
+            ExitFullscreen();
+            // 掴んだままウィンドウ移動を継続 (通常のタイトルバードラッグへ移譲)
+            ReleaseCapture();
+            SendMessage(Handle, 0x00A1 /*WM_NCLBUTTONDOWN*/, (IntPtr)2 /*HTCAPTION*/, IntPtr.Zero);
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        _fsGrab = false;
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -230,6 +334,7 @@ public sealed class ViewerForm : Form
         if (_fullscreen)
             ExitFullscreen();
         ApplyClientSize();
+        SaveSettings();
         Invalidate();
     }
 
@@ -272,9 +377,20 @@ public sealed class ViewerForm : Form
                 };
                 var resampled = new NAudio.Wave.SampleProviders.WdlResamplingSampleProvider(
                     _audioBuf.ToSampleProvider(), 48000);
+                _audioChain = resampled.ToWaveProvider16();
                 _audioOut = new WasapiOut(AudioClientShareMode.Shared, 120);
-                _audioOut.Init(resampled.ToWaveProvider16());
+                _audioOut.Init(_audioChain);
                 _audioOut.Play();
+
+                // Windowsの既定出力デバイス変更に追従 (デバウンス300ms)
+                _mmEnum = new MMDeviceEnumerator();
+                var debounce = new System.Windows.Forms.Timer { Interval = 300 };
+                debounce.Tick += (_, _) => { debounce.Stop(); RestartAudioOut(); };
+                _mmWatcher = new AudioDeviceWatcher(() =>
+                {
+                    try { BeginInvoke(() => { debounce.Stop(); debounce.Start(); }); } catch { }
+                });
+                _mmEnum.RegisterEndpointNotificationCallback(_mmWatcher);
             }
             catch { /* 音声デバイスが無くても映像は動かす */ }
 
@@ -315,7 +431,16 @@ public sealed class ViewerForm : Form
             }
         }
         catch { }
-        try { _audioOut?.Stop(); _audioOut?.Dispose(); } catch { }
+        try
+        {
+            if (_mmEnum is not null && _mmWatcher is not null)
+                _mmEnum.UnregisterEndpointNotificationCallback(_mmWatcher);
+        }
+        catch { }
+        lock (_audioOutLock)
+        {
+            try { _audioOut?.Stop(); _audioOut?.Dispose(); } catch { }
+        }
         _dev?.Dispose();
         _ctx?.Dispose();
         base.OnFormClosing(e);
