@@ -81,9 +81,11 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
 - ハード計画: docs/hardware-adapter-plan.md（基板化3段階）/ docs/audio-plan.md
   （音声はLOUT/ROUT→PA4/PA5、ADC+DMA+USB多重化）
 - 次の作業: 映像品質の実用確認 → M6音声 / 基板化 / UVC化（docs/roadmap.md）
-- **録画デバイス要件確定（2026-07-08）**: オフ会でポケモン対戦を1日10試合録画、小型・
-  バッテリー駆動、mp4(4x)+無劣化生データ同時保存。構成は Raspberry Pi Zero 2 W 案で確定、
-  電源は共有バッテリー基板(docs/photos/battery.png)を拡張。詳細 docs/recorder-plan.md
+- **録画デバイス要件確定（2026-07-08 改訂2）**: オフ会でポケモン対戦を1日10試合録画、
+  小型重視。**mp4のみ（4x/960×640, 16Mbps目安, 音声AAC）、生データ保存なし**。
+  電源は**モバイルバッテリー(Type-C)給電**（LiPo基板統合は将来の基板化で）。
+  **Wi-Fi不使用**（時刻はDS3231 RTC）。ボードは Raspberry Pi Zero 2 W
+  （HWエンコーダがv4l2m2mで普通に使える唯一の小型ボード）。詳細 docs/recorder-plan.md
 
 ## スキル
 
