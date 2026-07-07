@@ -171,7 +171,6 @@ public sealed class ViewerForm : Form
         view.DropDownItems.Add(ssItem);
         var audio = new ToolStripMenuItem("&Audio");
         var muteItem = new ToolStripMenuItem("Mute") { CheckOnClick = true };
-        muteItem.CheckedChanged += (_, _) => _mute = muteItem.Checked;
         audio.DropDownItems.Add(muteItem);
         audio.DropDownItems.Add(new ToolStripSeparator());
 
@@ -186,11 +185,19 @@ public sealed class ViewerForm : Form
         {
             _volume = percent / 100f;
             _volumePercent = percent;
+            if (muteItem.Checked) muteItem.Checked = false; // 音量操作でミュート解除
             if (volSlider.Value != percent) volSlider.Value = percent;
             foreach (var pi in presetItems)
                 pi.Checked = (int)pi.Tag! == percent;
             SaveSettings();
         }
+        // Mute と Volume は排他: ミュート中は音量チェックを外し、解除で復元
+        muteItem.CheckedChanged += (_, _) =>
+        {
+            _mute = muteItem.Checked;
+            foreach (var pi in presetItems)
+                pi.Checked = !_mute && (int)pi.Tag! == _volumePercent;
+        };
         foreach (var p in new[] { 25, 50, 75, 100 })
         {
             var item = new ToolStripMenuItem($"Volume {p}%") { Tag = p, Checked = p == _volumePercent };

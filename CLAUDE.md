@@ -9,6 +9,10 @@ GBA の LCD 信号を nanoCH32V305 で取り込み USB-HS で Windows PC に送�
 
 ## 絶対ルール
 
+0. **映像・音声のキャプチャロジックは確定済み（2026-07-08）。
+   docs/capture-logic-invariants.md の不変条件を読まずに関連コードを変更しないこと。**
+   変更した場合は同文書末尾の検証コマンドを全て通すこと
+
 1. **t-wada 流 TDD で開発する**（docs/tdd.md）。テストリスト → Red → Green → Refactor
 2. **配線は最終確定済み・変更提案禁止**（パターン剥がれ懸念。docs/wiring.md が正）
 3. **ホスト側（受信・表示）は C# / .NET 8、FW は C (ch32fun)**（ユーザー指定）
