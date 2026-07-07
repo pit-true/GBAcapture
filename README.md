@@ -7,6 +7,13 @@ nanoCH32V305 (RISC-V). Documentation is in Japanese.*
 自作キャプチャシステム。いわゆる「偽トロキャプチャ」を、約1,000円のRISC-Vマイコンボード
 **nanoCH32V305**（WCH CH32V305）でゼロから実装したもの。名前は偽トロ+作者HN「ころ」から。
 
+**2026-07-05: 初キャプチャ成功！** 記念すべき一枚（黒線はUSB送信バッファの
+上書きバグ。今となってはいい思い出）:
+
+![first light](docs/captures/2026-07-05_first-light.png)
+
+**2026-07-08: 完成形。** 60fps・クリアなステレオ音声・乱れゼロ。着工から3日:
+
 ![capture quality](docs/captures/final-quality.png)
 
 ## 特徴
@@ -96,7 +103,9 @@ host/GbaCap.Viewer/bin/Debug/net8.0-windows/GbaCap.Viewer.exe
 - [ ] UVC/UAC複合デバイス化（ドライバレスで任意のキャプチャソフト対応）
 - [ ] 専用インターポーザ基板（32ピン/40ピン両対応）
 
-## ライセンス
+## 公開について
 
-未定（現在プライベートリポジトリ。公開前の必須作業は
-[docs/publishing-policy.md](docs/publishing-policy.md) を参照 — ゲーム画面等の履歴浄化が必要）。
+このリポジトリは**テスト基板の開発記録として非公開のまま運用する方針**（2026-07-08決定）。
+そのためREADMEやdocsはゲーム画面スクショ込みで自由に（日記帳的に）記録してよい。
+もし将来、基板化版などを公開することになったら、その時は新規リポジトリを起こし
+[docs/publishing-policy.md](docs/publishing-policy.md) に従ってコンテンツを選別する。

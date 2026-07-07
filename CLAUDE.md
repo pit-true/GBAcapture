@@ -21,7 +21,9 @@ GBA の LCD 信号を nanoCH32V305 で取り込み USB-HS で Windows PC に送�
 6. 書き込みは wchisp を使い、Claude 上で完結させる（docs/flashing.md の手放しループ）。
    物理操作が必要な場合の依頼文言:
    「BOOTを押したまま → RSTを押して離す → BOOTを離す」（ISP突入。抜き差し不要）
-7. GitHub リモート: https://github.com/pit-true/GBAcapture（main に push）
+7. GitHub リモート: https://github.com/pit-true/GBAcapture（main に push）。
+   **非公開リポジトリのまま運用する方針（2026-07-08決定）** — テスト基板の開発記録扱い。
+   README/docs はゲーム画面スクショ込みで日記帳的に書いてよい。READMEは日本語
 
 ## よく使うコマンド
 
