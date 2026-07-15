@@ -5,7 +5,8 @@
 ## プロジェクト概要
 
 GBA の LCD 信号を nanoCH32V305 で取り込み USB-HS で Windows PC に送る自作キャプチャ。
-詳細は README.md とdocs/ を参照。**まず docs/wiring.md と docs/architecture.md を読むこと。**
+**プロジェクトの現在地は docs/project-status.md（現状サマリ）を最初に読むこと。**
+詳細は README.md とdocs/ を参照（配線・設計は docs/wiring.md と docs/architecture.md）。
 
 ## 絶対ルール
 
