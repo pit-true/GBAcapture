@@ -20,5 +20,6 @@ viewer.log
 # ESP-IDF レコーダ (recorder/): 生成物・ダウンロード品
 recorder/managed_components/
 recorder/build/
+recorder/build-*/
 recorder/sdkconfig
 recorder/sdkconfig.old

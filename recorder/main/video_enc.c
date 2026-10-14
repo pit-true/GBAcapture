@@ -166,8 +166,16 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     /* YUV は 1 枚で足りる。esp_h264_enc_process は同期なので、
      * エンコード中に次のフレームを書き換えることがない。 */
     if (g_yuv == NULL) {
-        g_yuv = heap_caps_aligned_alloc(64, g_yuv_len, MALLOC_CAP_SPIRAM);
-        g_encout = heap_caps_aligned_alloc(64, g_encout_len, MALLOC_CAP_SPIRAM);
+        /* esp_h264 はエンコード後に出力バッファを
+         * esp_cache_msync(..., DIR_M2C) で無効化する。この方向は
+         * UNALIGNED フラグを使えず、アドレスとサイズがキャッシュラインの
+         * 倍数でないと ESP_ERR_INVALID_ARG を返して無効化が飛ぶ
+         * (components/esp_mm/esp_cache_msync.c 120 行目)。
+         * P4 の既定ラインは 64B だが Espressif の P4 テスト設定は 128B を
+         * 選ぶので、どちらでも安全な 128 に揃える。
+         * サイズ側は 960*640*3/2 = 921600 で 128 の倍数。 */
+        g_yuv = heap_caps_aligned_alloc(128, g_yuv_len, MALLOC_CAP_SPIRAM);
+        g_encout = heap_caps_aligned_alloc(128, g_encout_len, MALLOC_CAP_SPIRAM);
         if (g_yuv == NULL || g_encout == NULL) {
             ESP_LOGE(TAG, "PSRAM に %u バイト x2 が確保できない", (unsigned)g_yuv_len);
             return ESP_ERR_NO_MEM;
