@@ -11,6 +11,8 @@ idf_component_register(
         "sd_recorder.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
+        gbacap
+        usb
         ff
         sdmmc
         esp_driver_sdmmc

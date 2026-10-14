@@ -44,7 +44,7 @@ Waveshare 配布の回路図（ESP32-P4-Pico-datasheet.pdf）のネット名か�
 | 4ピン USB ヘッダ（P1, MX1.25 4P） | `VCC_5V / USBD_N / USBD_P / GND`。USBD_P/N は ESP32-P4 の **専用 HS PHY ピン（49/50）** | nano を繋ぐ HS ホストポート。5V はスイッチ無しの直出し |
 | FS USB PHY | **GPIO26 = D- / GPIO27 = D+**（デフォルトで OTG_FS 側に接続。eFuse 不要）。両方ヘッダに出ている | PC 向け MSC デバイス用 |
 | 電源経路 | Type-C `USB0_5V` → Q2(AO3401 Pch) → `VCC_5V` → MP1658（3A）→ `ESP_3V3` | 外部 5V は **VSYS ピン（=VCC_5V）**に入れる |
-| Pico 互換ピン | **VBUS(40) = USB0_5V、VSYS(39) = VCC_5V、3V3_OUT(36) = ESP_3V3** | |
+| Pico 互換ピン | **VBUS = USB0_5V、VSYS = VCC_5V、3V3 = ESP_3V3**。パッド番号は資料間で食い違い（KiCad シンボルでは VBUS=21 / VSYS=22 / 3V3=25）。**シルクの名前で確認する**（要実機確認） | |
 | LED1 | VCC_5V の電源表示（基板上、ケースに入れると見えない） | ケース面には別 LED を付ける |
 | TF スロット | SDIO 4bit: CLK=43 CMD=44 D0=39 D1=40 D2=41 D3=42、電源スイッチ Q1(SI2301)、CD=GPIO45(要確認) | 短体スロット。**基板裏か表か実物で確認**（ケース切り欠き位置） |
 | コーデック | ES8311 + NS4150B（I2C=GPIO7/8、I2S=GPIO9-13、PA_EN=GPIO53） | 今回は未使用（音は nano から来る） |
@@ -69,13 +69,15 @@ GBA ──(既存タップ19本)── nanoCH32V305 ═══ USB-C(USB2-HS側) 
 
 ## 配線表（P4-Pico ↔ 追加部品）
 
+> 実作業版（はんだ・結線・使い方）は **docs/recorder-wiring-esp32p4.md**。ピンは番号でなくシルク名で書く。
+
 | 部品 | P4-Pico 側 | 備考 |
 |---|---|---|
 | nano へのケーブル（MX1.25 4P） | P1: V=VCC_5V / D- / D+ / G | 反対側は Type-C オス変換基板へ **VBUS, D-, D+, GND** の4線。CC は不要（nano は受電側だがデバイス機なので CC 処理不要。nano 側 J1 は 5V 直結） |
-| パネル Type-C メス（秋月 AE-USB2.0-TYPE-C-PNL） | VBUS →**SS14（ショットキー）**→ **VSYS(39)**、GND → GND、D+ → **GPIO27**、D- → **GPIO26** | CC1/CC2 に **5.1kΩ プルダウン必須**（C-C ケーブルで 5V を出させるため）。SS14 は基板 Type-C と同時挿しで 5V 同士がぶつかるのを防ぐ（約0.3V 落ちるが 3V3 レギュレータも nano の LDO も問題なし） |
+| パネル Type-C メス（秋月 AE-USB2.0-TYPE-C-PNL） | VBUS →**SS14（ショットキー）**→ **VSYS（シルク名）**、GND → GND、D+ → **GPIO27**、D- → **GPIO26** | CC1/CC2 に **5.1kΩ プルダウン必須**（C-C ケーブルで 5V を出させるため）。SS14 は基板 Type-C と同時挿しで 5V 同士がぶつかるのを防ぐ（約0.3V 落ちるが 3V3 レギュレータも nano の LDO も問題なし） |
 | タクトスイッチ TS-06104 | **GPIO2** ↔ GND | 内部プルアップ。30ms デバウンス。表面実装品なので **小片のユニバーサル基板か SMD→2.54 変換基板に載せてリード線を出す** |
 | 録画 LED（3mm 赤） | **GPIO3** → 470Ω → LED → GND | |
-| 電源 LED（3mm 緑） | **3V3_OUT(36)** → 1kΩ → LED → GND | 給電されていれば点灯 |
+| 電源 LED（3mm 緑） | **3V3（シルク名）** → 1kΩ → LED → GND | 給電されていれば点灯 |
 | D+/D- 配線 | 15cm 以内、2本を撚る | FS なので神経質でなくてよい |
 
 ## ソフトウェア構成（ESP-IDF 5.5 以降、C）
