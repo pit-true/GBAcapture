@@ -236,7 +236,7 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_enc_us_max = 0;
     g_run = true;
     ESP_LOGI(TAG, "エンコード開始 %dx%d scale=%d %dkbps bench=%d",
-             g_W, g_H, g_scale, cfg->bitrate_kbps, bench_frames);
+             g_W, g_H, g_scale, (int)cfg->bitrate_kbps, bench_frames);
     xTaskCreatePinnedToCore(enc_task, "enc", 4096, NULL, 5, &g_task, 1);
     return ESP_OK;
 }

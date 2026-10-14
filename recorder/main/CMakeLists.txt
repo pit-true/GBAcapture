@@ -13,7 +13,7 @@ idf_component_register(
     PRIV_REQUIRES
         gbacap
         usb
-        ff
+        fatfs
         sdmmc
         esp_driver_sdmmc
         nvs_flash

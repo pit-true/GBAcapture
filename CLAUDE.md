@@ -85,9 +85,8 @@ tools/wchisp-win-x64/wchisp.exe flash firmware/m0-blink/m0_blink.bin
 - **録画デバイス要件確定（2026-07-08 改訂2）**: オフ会でポケモン対戦を1日10試合録画、
   小型重視。**mp4のみ（4x/960×640, 16Mbps目安, 音声AAC）、生データ保存なし**。
   電源は**モバイルバッテリー(Type-C)給電**（LiPo基板統合は将来の基板化で）。
-  **Wi-Fi不使用**（時刻はDS3231 RTC）。ボードは **Pi Zero 2 W をフリマ/マーケプレで調達**
-  （2026-07-10確定。新品流通が枯れており、Radxa Zero 3Wも公式ストア全滅で撤回。
-  在庫調査結果と代替順位は docs/recorder-plan.md に記録）
+  **Wi-Fi不使用**。ボードは **ESP32-P4-Pico に変更（2026-10-09 改訂5、docs/recorder-plan-esp32p4.md）**。
+  Pi Zero 2 W 案（改訂4、docs/recorder-plan.md）は調達難で撤回。録画FWは ESP-IDF / C
 
 ## スキル
 

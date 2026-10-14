@@ -62,7 +62,7 @@ static void start_recording(void)
     gbac_led_rec(true);
     g_recording = true;
     ESP_LOGI(TAG, "録画開始 scale=%dx %dkbps split=%dmin vol=%d%%",
-             g_cfg.scale, g_cfg.bitrate_kbps, g_cfg.split_min, g_cfg.volume_pct);
+             (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
 }
 
 static void stop_recording(void)
@@ -79,7 +79,7 @@ void app_main(void)
     gbac_board_init();
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
-             g_cfg.scale, g_cfg.bitrate_kbps, g_cfg.split_min, g_cfg.volume_pct);
+             (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
 
     frame_pipe_init();
     audio_pipe_init(g_cfg.volume_pct);

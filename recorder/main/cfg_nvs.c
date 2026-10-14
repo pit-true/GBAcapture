@@ -68,7 +68,7 @@ void gbac_cfg_load(gbac_cfg_t *c)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
         ESP_LOGI(TAG, "設定なし。既定値(scale %d, %dkbps, %d分)",
-                 c->scale, c->bitrate_kbps, c->split_min);
+                 (int)c->scale, (int)c->bitrate_kbps, (int)c->split_min);
         return;
     }
     nvs_get_i32(h, KEY_SCALE, &c->scale);
@@ -79,7 +79,7 @@ void gbac_cfg_load(gbac_cfg_t *c)
 
     gbac_cfg_clamp(c);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
-             c->scale, c->bitrate_kbps, c->split_min, c->volume_pct);
+             (int)c->scale, (int)c->bitrate_kbps, (int)c->split_min, (int)c->volume_pct);
 }
 
 void gbac_cfg_save(const gbac_cfg_t *c)

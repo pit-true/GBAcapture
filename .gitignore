@@ -16,3 +16,9 @@ nul
 /*.jpg
 docs/photos/
 viewer.log
+
+# ESP-IDF レコーダ (recorder/): 生成物・ダウンロード品
+recorder/managed_components/
+recorder/build/
+recorder/sdkconfig
+recorder/sdkconfig.old
