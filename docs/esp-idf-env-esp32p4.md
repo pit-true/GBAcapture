@@ -58,6 +58,15 @@ $env:GIT_CONFIG_KEY_0 = 'safe.directory'; $env:GIT_CONFIG_VALUE_0 = '*'
 6. **ESP-IDF の Python 実行は `python` ではなく venv の python**。`export.ps1` が選んでくれる。
 7. `idf.py` は cmake/ninja を子プロセスとして起動する。**サンドボックス（workspace-write 等）では
    子プロセス用パイプが作れずハングする**。サンドボックスなし（フルアクセス）で実行すること。
+ 8. **`powershell.exe`（Windows PowerShell 5.1）で .ps1 を走らせると、UTF-8 BOM なしだと
+    日本語のコメント・文字列が文字化けして構文エラーになる。** pwsh 7 の `-Encoding utf8` は
+    BOM を付けないので、.ps1 を書いたら `-Encoding utf8BOM` で保存し直す
+    （BOM 付きなら 5.1 でも 7 でも正しく読める）。
+ 9. **`idf.py -B build-hoge` を指定しても `SDKCONFIG` の既定はビルドディレクトリではなく
+    プロジェクト直下の `sdkconfig`**（`tools/cmake/project.cmake` 9 行目が `CMAKE_SOURCE_DIR/sdkconfig`）。
+    別プロファイルでビルドするなら `-D SDKCONFIG=build-hoge/sdkconfig` を必ず付ける。
+    付けないと本体側の `sdkconfig` を書き換えて設定が混ざる
+    （2026-10-14 に BRINGUP 設定が本体へ漏れた）。
 
 ## チップリビジョン（実機で確定・重要）
 

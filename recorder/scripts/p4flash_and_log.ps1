@@ -1,4 +1,4 @@
-# ESP32-P4-Pico に書いて起動ログまで取る。docs/esp32p4-flashing.md 参照。
+﻿# ESP32-P4-Pico に書いて起動ログまで取る。docs/esp32p4-flashing.md 参照。
 # 使い: BOOT+RST でダウンロードモードに入った基板に対して
 #   powershell -File recorder\scripts\p4flash_and_log.ps1
 param(
