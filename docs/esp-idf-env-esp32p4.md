@@ -94,6 +94,26 @@ python -m esptool --port COM6 --connect-attempts 1 chip_id
 - ESP32-P4 のブートローダは `-Os` でも **0x60c0 バイト**あり、既定のパーティション表オフセット
   `0x8000` に収まらない → `CONFIG_PARTITION_TABLE_OFFSET=0x10000`（パーティションは 0x11000 以降）。
 
+## esp_h264 をソースから確認した制約（2026-10-14、実機前の静的調査）
+
+- Espressif 自身の CI が **P4 v1 系**で使う設定は `test_apps/sdkconfig.ci.p4_v1` で、
+  `SELECTS_REV_LESS_V3=y` / `REV_MIN_100=y` / `REV_MIN_FULL=100` / `ESP_REV_MIN_FULL=100`。
+  本プロジェクトの設定と一致している。
+- テストの `sdkconfig.defaults.esp32p4` は PSRAM HEX 200MHz / CPU 360MHz / L2 128KB /
+  `FREERTOS_HZ=1000` / `COMPILER_OPTIMIZATION_PERF`。うちと同じ。
+  ただしキャッシュラインは 128B を選んでいる（P4 の IDF 既定は 64B）。
+- **PSRAM バッファでエンコードできる**。`soc_caps.h` に `SOC_PSRAM_DMA_CAPABLE=1`、
+  `SOC_AHB_GDMA_SUPPORT_PSRAM=1`、`SOC_AXI_GDMA_SUPPORT_PSRAM=1` があり、
+  ドライバ側が入力に対して `esp_cache_msync(DIR_C2M | UNALIGNED)` の writeback、
+  出力に対して M2C の invalidate を自前で呼んでいる（`esp_h264_enc_single_hw.c` 231 / 169 行目）。
+- **落とし穴は出力バッファの整列**。出力の invalidate は `UNALIGNED` フラグなしの M2C で、
+  `esp_cache_msync` は M2C 方向で `UNALIGNED` を明示的に拒否する
+  （`components/esp_mm/esp_cache_msync.c` 120〜131 行目）。
+  アドレスとサイズの両方がキャッシュラインの倍数でないと `ESP_ERR_INVALID_ARG` を返し、
+  ドライバはその戻り値を無視するので**キャッシュが無効化されず NAL が壊れたデータになる**。
+  → `g_yuv` / `g_encout` は 128 バイト境界に確保し、サイズ 921600（= 960*640*3/2）は 128 の倍数。
+  64B ラインでも 128B ラインでも通る。
+
 ## managed components（recorder/main/idf_component.yml）
 
 解決された版（2026-10-14、`recorder/dependencies.lock` に記録）:
