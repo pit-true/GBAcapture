@@ -3,5 +3,9 @@ dependencies:
   idf: ">=5.5"
   espressif/esp_h264: "^1.0.0"
   espressif/esp_muxer: "^1.0.0"
-  espressif/esp_audio_codec: "^1.0.0"
+  # AAC。1.0.x は esp32p4 のプリビルドライブラリを持たずリンクできない。
+  # 2.6 以上はチップ rev >= 3.0 を必須にする(CMake でビルドを止める)。
+  # 実機は ESP32-P4 rev v1.3 なので、esp32p4 ライブラリがあり rev 制限のない 2.5.x に張る。
+  # ^ や ~> では 2.6.x を拾ってしまうので ~= (2.5.* に限定) を使う。
+  espressif/esp_audio_codec: "~=2.5.0"
   espressif/esp_tinyusb: "^1.0.0"

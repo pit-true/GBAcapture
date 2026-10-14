@@ -76,8 +76,12 @@ esp_err_t gbac_sd_mount(void)
         return e;
     }
     g_mounted = true;
+    /* IDF 5.5 の sdmmc_csd_t は csd_ver/mmc_ver/capacity/sector_size/
+     * card_command_class/tr_speed。capacity はセクタ数なので sector_size を掛ける。 */
     ESP_LOGI(TAG, "SD マウント完了 %s クラス=%d 容量=%lluMB", SD_BASE,
-             (int)g_card->csd.card_class, (unsigned long long)(g_card->csd.capacity / 2048));
+             g_card->csd.card_command_class,
+             (unsigned long long)g_card->csd.capacity *
+                 (unsigned long long)g_card->csd.sector_size / (1024ULL * 1024ULL));
     return ESP_OK;
 }
 
@@ -86,7 +90,7 @@ void gbac_sd_unmount(void)
     if (!g_mounted) {
         return;
     }
-    esp_vfs_fat_sdmmc_unmount();
+    esp_vfs_fat_sdcard_unmount(SD_BASE, g_card);
     g_mounted = false;
     g_card = NULL;
 }
@@ -200,20 +204,25 @@ static esp_err_t open_muxer(void)
         ESP_LOGE(TAG, "video stream 追加失敗");
         goto fail;
     }
-    /* esp_audio_codec 2.6.2 の esp_audio_enc_info_t には codec_spec_info が
-     * 無いので、AAC の AudioSpecificConfig は自前で組み立てる。
-     * AAC-LC(AOT=2) + 48000Hz(freqIndex=3) + stereo(chanCfg=2)
-     *   byte0 = (2<<3)|(3>>1) = 0x11
-     *   byte1 = ((3&1)<<7)|(2<<3) = 0x90
-     *   byte2 = 0x00
-     * (44100Hz stereo が 0x12 0x10 になるのと同じ式)。mp4 の esds に入る。 */
+    /* AAC の AudioSpecificConfig は esp_audio_codec 2.5.x が enc_info で返す
+     * (AAC-LC 48000Hz stereo なら 0x11 0x90 0x00)。返さない版向けの
+     * フォールバックも持っておく。mp4 の esds に入る値。 */
     static const uint8_t k_asc[] = { 0x11, 0x90, 0x00 };
+    const void *asc = k_asc;
+    int asc_len = (int)sizeof(k_asc);
     esp_audio_enc_info_t ai = { 0 };
     if (esp_audio_enc_get_info(g_aac, &ai) != ESP_AUDIO_ERR_OK) {
         ESP_LOGW(TAG, "AAC info が取れない。48000Hz/2ch/16bit として書く");
-    } else if (ai.sample_rate != AAC_RATE || ai.channel != 2) {
-        ESP_LOGW(TAG, "AAC info が想定と違う(sr=%u ch=%u bps=%u)",
-                 (unsigned)ai.sample_rate, (unsigned)ai.channel, (unsigned)ai.bit_per_sample);
+    } else {
+        if (ai.sample_rate != AAC_RATE || ai.channel != 2) {
+            ESP_LOGW(TAG, "AAC info が想定と違う(sr=%u ch=%u bps=%u br=%u)",
+                     (unsigned)ai.sample_rate, (unsigned)ai.channel,
+                     (unsigned)ai.bits_per_sample, (unsigned)ai.bitrate);
+        }
+        if (ai.codec_spec_info && ai.spec_info_len > 0) {
+            asc = ai.codec_spec_info;
+            asc_len = (int)ai.spec_info_len;
+        }
     }
     esp_muxer_audio_stream_info_t au = {
         .codec = ESP_MUXER_ADEC_AAC,
@@ -221,8 +230,8 @@ static esp_err_t open_muxer(void)
         .bits_per_sample = 16,
         .sample_rate = AAC_RATE,
         .min_packet_duration = 21,
-        .codec_spec_info = (void *)k_asc,
-        .spec_info_len = (int)sizeof(k_asc),
+        .codec_spec_info = (void *)asc,
+        .spec_info_len = asc_len,
     };
     if (esp_muxer_add_audio_stream(g_muxer, &au, &g_aidx) != ESP_MUXER_ERR_OK) {
         ESP_LOGE(TAG, "audio stream 追加失敗");
@@ -351,12 +360,21 @@ static void next_base(void)
 
 static esp_err_t aac_open(void)
 {
-    /* esp_audio_codec 2.6.2 ではコーデックの登録は不要(組み込み)。
-     * 設定のフィールド名は bit_per_sample(bits_per_sample ではない)。 */
+    /* esp_audio_codec 2.5.x はコーデックを登録してから開く。
+     * esp_audio_enc_register_default() は全コーデックをプリビルドライブラリから
+     * 引き込んでサイズになるので、AAC だけ登録する(2 回目以降はそのまま)。 */
+    static bool s_reg;
+    if (!s_reg) {
+        if (esp_aac_enc_register() != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "AAC コーデックの登録に失敗");
+            return ESP_FAIL;
+        }
+        s_reg = true;
+    }
     esp_aac_enc_config_t ac = {
         .sample_rate = AAC_RATE,
-        .channel = 2,
-        .bit_per_sample = 16,
+        .channel = 2, /* ESP_AUDIO_DUAL */
+        .bits_per_sample = 16,
         .bitrate = AAC_BITRATE,
         .adts_used = false,
     };

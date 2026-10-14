@@ -2,8 +2,15 @@
 # 1) ターゲット
 CONFIG_IDF_TARGET="esp32p4"
 
-# 2) CPU / 自由動作(省電力しない。モバイルバッテリー給電だが性能優先)
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
+# 2) チップリビジョン。実機の esptool 表示は "ESP32-P4 (revision v1.3)"
+#    (2026-10-14 実機確認)。Waveshare 公式の rev1_3 プロファイルに合わせる。
+#    rev >= 3.0 と < 3.0 は相互排他。既定(v3.1)でビルドすると v1.3 では起動しない。
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# 3) CPU / 自由動作(省電力しない。モバイルバッテリー給電だが性能優先)
+#    rev < 3.0 の上限は 360MHz。400MHz は追加審査を通ったチップだけの実験的オプション
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 CONFIG_FREERTOS_HZ=1000
 
 # 3) PSRAM 32MB(HEX)。フレームバッファとエンコーダ入出力用
@@ -19,9 +26,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 # 5) シリアル書き込み(CH343P 経由。BOOT 保持で UART ブート)
-CONFIG_ESPTOOLPY_BAUD_921600=y
-CONFIG_ESPTOOLPY_BEFORE_RESET=y
-CONFIG_ESPTOOLPY_AFTER_RESET="hard"
+#    書き込みボーレートは idf.py -b 921600 で指定する(5.5 に BAUD の Kconfig は無い)。
+#    ESPTOOLPY_AFTER_RESET は bool(既定 y = 書き込み後にハードリセット)。
+CONFIG_ESPTOOLPY_AFTER_RESET=y
+CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
 
 # 6) SD(SDMMC 4bit, FATFS)
 CONFIG_FATFS_VOLUME_COUNT=1

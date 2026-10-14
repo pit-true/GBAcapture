@@ -1,6 +1,6 @@
 dependencies:
   espressif/esp_audio_codec:
-    component_hash: 20711fa2fdaf3e4ebac231f9e393f9892a0f05d77df47cae20580b8e4d52a9c1
+    component_hash: 16e2880dbdd5a72264051f750f33a6e5a38fd25621c83e3a32a85a152d2d2643
     dependencies:
     - name: idf
       require: private
@@ -8,7 +8,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.0.1
+    version: 2.5.0
   espressif/esp_h264:
     component_hash: 3d60078419ceac61cd87579664ae6a5a9b9a42d6f2edf4e23d753af8d2a67da9
     dependencies:
@@ -70,6 +70,6 @@ direct_dependencies:
 - espressif/esp_muxer
 - espressif/esp_tinyusb
 - idf
-manifest_hash: 3eaaa3f6d4dbb46049784f38ddab2899e2056dbde3da77cd355bd35c6abb8684
+manifest_hash: 4b48dc4952ef4704763a5a8398f0c8338e6065f984a9796376c2a49898973c3c
 target: esp32p4
 version: 2.0.0

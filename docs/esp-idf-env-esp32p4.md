@@ -59,16 +59,45 @@ $env:GIT_CONFIG_KEY_0 = 'safe.directory'; $env:GIT_CONFIG_VALUE_0 = '*'
 7. `idf.py` は cmake/ninja を子プロセスとして起動する。**サンドボックス（workspace-write 等）では
    子プロセス用パイプが作れずハングする**。サンドボックスなし（フルアクセス）で実行すること。
 
+## チップリビジョン（実機で確定・重要）
+
+```powershell
+python -m esptool --port COM6 --connect-attempts 1 chip_id
+# → Chip is ESP32-P4 (revision v1.3)   MAC e8:f6:0a:e5:38:cb
+```
+
+- 基板のシリアルは **COM6**（COM5 は CH343P のもう一方の UART。esptool は応答なし）。
+- **ESP32-P4 の rev >= 3.0 と < 3.0 は相互排他**。IDF の既定は v3.1 で、そのままビルドすると
+  v1.3 の基板ではブートローダが起動を拒否する。Waveshare 公式（`waveshareteam/ESP32-P4-Platform` の
+  `docs/ESP32P4_REVISION_CONFIG.md`）どおり **rev1_3 プロファイル**を使う:
+  ```
+  CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+  CONFIG_ESP32P4_REV_MIN_100=y        # REV_MIN_FULL=100 / REV_MAX_FULL=199
+  CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y   # rev < 3.0 の上限は 360MHz（400 は追加審査が必要）
+  ```
+- `esp_h264` はこの設定でプリビルドライブラリのプロファイルが **`esp32p4_less_v3`** に切り替わる
+  （cmake のログに出る: `esp_h264: ESP32-P4 prebuilt library profile: esp32p4_less_v3`）。
+- `esp_audio_codec` **2.6 以上は `CONFIG_ESP32P4_REV_MIN_FULL >= 300` を要求してビルドを止める**
+  （v1.3 では使えない）。1.0.x には esp32p4 のライブラリが無い（`lib/` に esp32/c3/s2/s3 だけ）。
+  → **2.0.0〜2.5.0 に esp32p4 ライブラリがある**。本プロジェクトは `~=2.5.0` で張っている。
+  版のライブラリ有無は `https://components-file.espressif.com/components/espressif/<name>/<ver>/CHECKSUMS.json`
+  の `files[].path` に `lib/esp32p4/...` があるかで確認できる（レジストリの `targets` 欄は空で当てにならない）。
+- ESP32-P4 のブートローダは `-Os` でも **0x60c0 バイト**あり、既定のパーティション表オフセット
+  `0x8000` に収まらない → `CONFIG_PARTITION_TABLE_OFFSET=0x10000`（パーティションは 0x11000 以降）。
+
 ## managed components（recorder/main/idf_component.yml）
 
 解決された版（2026-10-14、`recorder/dependencies.lock` に記録）:
 
 | コンポーネント | 版 |
 |---|---|
-| espressif/esp_h264 | 1.4.1（P4 の HW エンコードはプリビルドライブラリ。プロファイル `esp32p4`） |
+| espressif/esp_h264 | 1.4.1（P4 の HW エンコードはプリビルドライブラリ。プロファイル `esp32p4_less_v3`） |
 | espressif/esp_muxer | 1.2.3 |
-| espressif/esp_audio_codec | 2.6.2 |
+| espressif/esp_audio_codec | 2.5.0（`~=2.5.0` に固定。2.6 以上は rev 3.0 必須、1.0.x は P4 ライブラリ無し） |
 | espressif/esp_tinyusb | 1.7.6~2（+ espressif/tinyusb 0.21.0~2） |
+
+依存の版指定は `^` だと意図より広く解決される（`^2.5.0` は 2.6.2 を拾った）。
+`~=` は「その系列のみ」。`~>` はこのマニフェストでは構文エラー。
 
 ヘッダの写し（API 確認用・読み取り専用）は `D:\esp\comps\` に置いてある。
 
