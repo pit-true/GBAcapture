@@ -1,0 +1,7 @@
+## ESP-IDF コンポーネントレジストリからの依存。docs/recorder-plan-esp32p4.md の表どおり。
+dependencies:
+  idf: ">=5.5"
+  espressif/esp_h264: "^1.0.0"
+  espressif/esp_muxer: "^1.0.0"
+  espressif/esp_audio_codec: "^1.0.0"
+  espressif/esp_tinyusb: "^1.0.0"

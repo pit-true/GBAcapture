@@ -1,0 +1,28 @@
+menu "GBAcapture レコーダ"
+
+    config GBAC_BENCH_FRAMES
+        int "HWエンコーダのベンチフレーム数(0 で無効)"
+        default 0
+        help
+            0 のままなら通常動作。N を入れると起動時に合成映像を N 枚
+            エンコードして microSD に mp4 を書き、実測 fps をログに出す。
+            docs/recorder-plan-esp32p4.md の開発手順 2(最大のリスク確認)用。
+
+    config GBAC_SD_PWR_GPIO
+        int "TF カード電源スイッチの GPIO(-1 なら常時給電扱い)"
+        default -1
+        range -1 54
+        help
+            Waveshare ESP32-P4-Pico の TF 給電スイッチ Q1(SI2301、ゲート
+            Low でオン)を駆動する GPIO。回路図で GPIO 番号が未確認のため
+            既定は -1(TF は常時給電)。実機で判明したらここに番号を書く。
+
+    config GBAC_ENABLE_MSC
+        bool "PC に microSD を MSC として見せる(未実装)"
+        default n
+        help
+            FS 側の USB(GPIO26=D-, GPIO27=D+)に esp_tinyusb の MSC を載せて、
+            録画していないときに PC から SD を読めるようにする機能。
+            開発手順 4。まだ実装していないので有効にしないこと。
+
+endmenu

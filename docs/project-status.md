@@ -19,7 +19,7 @@ USB-HSでPCへ → 自作ビューア「GBAcapture (Nisekoro-capture)」で表�
 | FW更新基盤 | ✅ 完成（IAP自己更新、ボタン不要、約10秒） |
 | **確定ロジック** | 🔒 **2026-07-08確定。変更前に docs/capture-logic-invariants.md 必読（絶対ルール）** |
 | README | ✅ 日本語化済み。日記帳スタイル（リポジトリは非公開のまま運用と決定済み） |
-| 録画デバイス | 📋 計画確定（docs/recorder-plan.md 改訂4）、**ボード調達待ちで一時停止中** |
+| 録画デバイス | 📋 **改訂5（2026-10-09）: ESP32-P4-Pico 構成に変更**（docs/recorder-plan-esp32p4.md）。Pi Zero 2 W 案（改訂4）は調達難で撤回 |
 | UVC化・基板化 | 未着手（ロードマップ） |
 
 ## 環境・場所
@@ -50,15 +50,15 @@ cd host && dotnet run --project GbaCap.Cli -- framestat  # 診断: フレーム�
 
 ## 進行中・次のアクション
 
-- **録画デバイス**（詳細: docs/recorder-plan.md 改訂4）
-  - 構成確定: Pi Zero 2 W + HWエンコーダ(h264_v4l2m2m) + mp4(4x/960×640/16Mbps/AAC)のみ保存、
-    Wi-Fi不使用(DS3231 RTC)、モバイルバッテリー給電（ケース面は秋月Type-Cパネルキット）、
-    タカチSW-125ケース
-  - **次のアクション = ボード調達**: Pi Zero 2 Wをメルカリ/ヤフオク（相場¥3,000〜4,500）か
-    マーケプレ（¥5,000台まで）で確保する。2026-07-10時点で新品流通は枯れ
-    （秋月4ヶ月待ち・SS/共立売切、Radxa Zero 3Wも公式ストア全滅で撤回）
-  - 他の購入品: microSD 64GB、L型OTGアダプタ、秋月Type-Cパネルキット、DS3231、
-    LED付きボタン、SW-125（リスト詳細は recorder-plan.md）
+- **録画デバイス**（詳細: docs/recorder-plan-esp32p4.md 改訂5、2026-10-09）
+  - 構成: **ESP32-P4-Pico**（手元にあり）+ esp_h264 HWエンコーダ + mp4(4x/960×640/16Mbps/AAC)
+    を基板上の microSD(FAT32) へ。nano とは 4ピン USB ヘッダ(HS)→Type-C オスで接続・給電。
+    PC 向け SD 公開はパネル Type-C → GPIO26/27 の FS USB MSC（遅いので基本はカード抜き）。
+    ケースはタカチ SW-75B、タクトSW TS-06104 + LED×2
+  - **次のアクション**: ESP-IDF 環境構築 → リスク検証3点（HWエンコーダ 960×640@60 実測 /
+    usb_host で nano 受信 10k転送/秒 / HSホスト+FSデバイス同時動作）
+  - 手持ちの 1.25mm **6P** ケーブルは 4P ヘッダに合わない → 4P 品（製品同梱ケーブルを確認）
+  - 改訂4（Pi Zero 2 W）は docs/recorder-plan.md に記録として残す
 - （その後）UVC/UAC化、専用基板化（battery.pngのLiPo基板拡張を含む）
 
 ## 開発履歴の要点（トラブルと解決は specification.md の年表参照）

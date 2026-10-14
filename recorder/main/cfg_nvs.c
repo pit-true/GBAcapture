@@ -1,0 +1,103 @@
+#include "cfg_nvs.h"
+
+#include <stdbool.h>
+#include <stdlib.h>
+
+#include "esp_err.h"
+#include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+
+static const char *TAG = "cfg";
+
+#define NVS_NS        "gbac"
+#define KEY_SCALE     "scale"
+#define KEY_BITRATE   "bitrate"
+#define KEY_SPLIT     "split_min"
+#define KEY_VOLUME    "volume"
+
+void gbac_cfg_default(gbac_cfg_t *c)
+{
+    c->scale = 4;
+    c->bitrate_kbps = 16000;
+    c->split_min = 15;
+    c->volume_pct = 100;
+}
+
+void gbac_cfg_clamp(gbac_cfg_t *c)
+{
+    if (c->scale < 1 || c->scale > 4) {
+        c->scale = 4;
+    }
+    if (c->bitrate_kbps < 1000 || c->bitrate_kbps > 40000) {
+        c->bitrate_kbps = 16000;
+    }
+    if (c->split_min < 1 || c->split_min > 60) {
+        c->split_min = 15;
+    }
+    if (c->volume_pct < 0 || c->volume_pct > 400) {
+        c->volume_pct = 100;
+    }
+}
+
+/* 起動時に 1 回だけ呼ぶ。消えていたら作り直す(録画設定だけなので許容)。 */
+static void nfs_init_once(void)
+{
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS を初期化し直す");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        e = nvs_flash_init();
+    }
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "NVS 起動失敗(%s)。既定値で動く", esp_err_to_name(e));
+    }
+}
+
+void gbac_cfg_load(gbac_cfg_t *c)
+{
+    gbac_cfg_default(c);
+    nfs_init_once();
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        ESP_LOGI(TAG, "設定なし。既定値(scale %d, %dkbps, %d分)",
+                 c->scale, c->bitrate_kbps, c->split_min);
+        return;
+    }
+    nvs_get_i32(h, KEY_SCALE, &c->scale);
+    nvs_get_i32(h, KEY_BITRATE, &c->bitrate_kbps);
+    nvs_get_i32(h, KEY_SPLIT, &c->split_min);
+    nvs_get_i32(h, KEY_VOLUME, &c->volume_pct);
+    nvs_close(h);
+
+    gbac_cfg_clamp(c);
+    ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
+             c->scale, c->bitrate_kbps, c->split_min, c->volume_pct);
+}
+
+void gbac_cfg_save(const gbac_cfg_t *c)
+{
+    nfs_init_once();
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "NVS を開けない");
+        return;
+    }
+    nvs_set_i32(h, KEY_SCALE, c->scale);
+    nvs_set_i32(h, KEY_BITRATE, c->bitrate_kbps);
+    nvs_set_i32(h, KEY_SPLIT, c->split_min);
+    nvs_set_i32(h, KEY_VOLUME, c->volume_pct);
+    esp_err_t e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "NVS 保存失敗(%s)", esp_err_to_name(e));
+    }
+}

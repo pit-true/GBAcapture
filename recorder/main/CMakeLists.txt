@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "cfg_nvs.c"
+        "board.c"
+        "button.c"
+        "usb_host_nano.c"
+        "audio_pipe.c"
+        "frame_pipe.c"
+        "video_enc.c"
+        "sd_recorder.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        ff
+        sdmmc
+        esp_driver_sdmmc
+        nvs_flash
+        esp_driver_gpio
+        esp_timer
+        esp_hw_support
+        esp_h264
+        esp_muxer
+        esp_audio_codec
+        esp_ringbuf
+)
