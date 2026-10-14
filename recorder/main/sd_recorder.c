@@ -122,6 +122,10 @@ static const sd_probe_t k_sd_probe[] = {
 static sd_pwr_ctrl_handle_t g_pwr;
 static sd_probe_t g_win;
 static bool g_win_ok;
+/* カードとは通信できたのに FAT が読めなかった設定。
+ * FAT32 にフォーマットし直したあと、これを最初に試す。 */
+static sd_probe_t g_alive;
+static bool g_alive_ok;
 
 static void sd_pwr_release(void)
 {
@@ -131,9 +135,8 @@ static void sd_pwr_release(void)
     }
 }
 
-/* 1 回だけマウントを試みる。成功したらカードを *out_card に返すので、
- * 呼び出し側は esp_vfs_fat_sdcard_unmount するまで保持する。 */
-static esp_err_t sd_try_mount(const sd_probe_t *p, sdmmc_card_t **out_card)
+/* 電源まわり(LDO と電源ゲート)だけ先に適用する。マウントと診断で共通。 */
+static void sd_apply_power(const sd_probe_t *p)
 {
     sd_pwr_release();
     if (p->ldo > 0) {
@@ -144,25 +147,19 @@ static esp_err_t sd_try_mount(const sd_probe_t *p, sdmmc_card_t **out_card)
         }
     }
     /* 電源ゲート(推定 GPIO45)。前の試行で駆動していたかもしれないので
-     * 触らない場合も一度 GPIO 解除して-floating に戻す。 */
+     * 触らない場合も一度 GPIO 解除して floating に戻す。 */
     gpio_reset_pin(GBAC_PIN_SD_PWR);
     if (p->gate >= 0) {
         gpio_set_direction(p->gate, GPIO_MODE_OUTPUT);
         gpio_set_level(p->gate, p->gate_lvl);
     }
     vTaskDelay(pdMS_TO_TICKS(30));   /* カードの VDD が安定するのを待つ */
+}
 
-    esp_vfs_fat_mount_config_t mcfg = {
-        .format_if_mount_failed = false,
-        .max_files = 4,
-        .allocation_unit_size = 64 * 1024,
-    };
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.slot = p->slot;
-    host.max_freq_khz = p->freq;
-    host.pwr_ctrl_handle = g_pwr;
+static void sd_slot_setup(const sd_probe_t *p, sdmmc_slot_config_t *out, int width)
+{
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = p->width;
+    slot.width = width;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     if (p->slot == SDMMC_HOST_SLOT_1) {
         /* slot1 は GPIO マトリクス経由。ピン番号は回路図どおり(slot0 と同じ) */
@@ -173,6 +170,25 @@ static esp_err_t sd_try_mount(const sd_probe_t *p, sdmmc_card_t **out_card)
         slot.d2 = GBAC_PIN_SD_D2;
         slot.d3 = GBAC_PIN_SD_D3;
     }
+    *out = slot;
+}
+
+/* 1 回だけマウントを試みる。成功したらカードを *out_card に返すので、
+ * 呼び出し側は esp_vfs_fat_sdcard_unmount するまで保持する。 */
+static esp_err_t sd_try_mount(const sd_probe_t *p, sdmmc_card_t **out_card)
+{
+    sd_apply_power(p);
+    esp_vfs_fat_mount_config_t mcfg = {
+        .format_if_mount_failed = false,
+        .max_files = 4,
+        .allocation_unit_size = 64 * 1024,
+    };
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.slot = p->slot;
+    host.max_freq_khz = p->freq;
+    host.pwr_ctrl_handle = g_pwr;
+    sdmmc_slot_config_t slot;
+    sd_slot_setup(p, &slot, p->width);
     return esp_vfs_fat_sdmmc_mount(SD_BASE, &host, &slot, &mcfg, out_card);
 }
 
@@ -188,6 +204,43 @@ static void sd_log_card(void)
              (unsigned long long)(sd_free_bytes() / (1024ULL * 1024ULL)));
 }
 
+/* カードと通信できたのに FAT が読めないときに、カードの正体を直接出す。
+ * esp_vfs_fat_sdmmc_mount は失敗すると host を deinit するので、ここで組み直す。 */
+static void sd_diag_card(const sd_probe_t *p)
+{
+    sd_apply_power(p);
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.slot = p->slot;
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;   /* 情報読みだけなので遅くてよい */
+    host.pwr_ctrl_handle = g_pwr;
+    sdmmc_slot_config_t slot;
+    sd_slot_setup(p, &slot, 1);               /* 情報読みは 1bit で十分 */
+    /* IDF 5.5 の sdmmc_host_init / deinit は slot を引数に取らない(slot は init_slot 側) */
+    if (sdmmc_host_init() != ESP_OK) {
+        ESP_LOGW(TAG, "SD 診断: host が初期化できない");
+        return;
+    }
+    if (sdmmc_host_init_slot(host.slot, &slot) != ESP_OK) {
+        ESP_LOGW(TAG, "SD 診断: slot%d が初期化できない", host.slot);
+        sdmmc_host_deinit();
+        return;
+    }
+    sdmmc_card_t card;
+    memset(&card, 0, sizeof(card));
+    esp_err_t e = sdmmc_card_init(&host, &card);
+    if (e == ESP_OK) {
+        unsigned long long mb = (unsigned long long)card.csd.capacity *
+                                (unsigned long long)card.csd.sector_size / (1024ULL * 1024ULL);
+        ESP_LOGI(TAG, "SD 診断: カードは応答した 名前=%.8s 容量=%lluMB OCR=0x%08x",
+                 card.cid.name, mb, (unsigned)card.ocr);
+        ESP_LOGE(TAG, "SD 診断: FAT が見つからない。PC で FAT32 にフォーマットしてね(exFAT/NTFS/未フォーマットは読めない)");
+    } else {
+        ESP_LOGW(TAG, "SD 診断: sdmmc_card_init=%s", esp_err_to_name(e));
+    }
+    sdmmc_host_deinit_slot(host.slot);
+    sdmmc_host_deinit();
+}
+
 esp_err_t gbac_sd_mount(void)
 {
     if (g_mounted) {
@@ -196,6 +249,9 @@ esp_err_t gbac_sd_mount(void)
     sd_probe_t p;
     if (g_win_ok) {
         p = g_win;
+    } else if (g_alive_ok) {
+        /* 通信はできる。FAT のせいなので、フォーマットし直せば行けるはず */
+        p = g_alive;
     } else {
         p.slot = SDMMC_HOST_SLOT_1;
         p.width = 4;
@@ -214,11 +270,35 @@ esp_err_t gbac_sd_mount(void)
     return ESP_OK;
 }
 
+/* 成功した設定を覚えて、マウント済みの状態で戻る */
+static void sd_adopt(const sd_probe_t *p, sdmmc_card_t *card)
+{
+    g_win = *p;
+    g_win_ok = true;
+    g_card = card;
+    g_mounted = true;
+    ESP_LOGI(TAG, "SD: ここで行けた slot=%d width=%d ldo=%d gate=GPIO%d=%d freq=%dkHz",
+             p->slot, p->width, p->ldo, p->gate, p->gate_lvl, p->freq);
+    sd_log_card();
+}
+
 /* 結線の総当たり。最初に生えた設定を覚えてそのままマウントした状態で戻る。 */
 esp_err_t gbac_sd_probe(void)
 {
     if (g_mounted) {
         return ESP_OK;
+    }
+    /* 前に通信できた設定を知っていれば(FAT が読めないだけだった)、それを最初に試す。
+     * FAT32 にフォーマットし直してもらえれば、ここでそのまま生える。 */
+    if (g_alive_ok) {
+        sdmmc_card_t *card = NULL;
+        ESP_LOGI(TAG, "SD: 前に通信できた設定で再挑戦 slot=%d width=%d ldo=%d gate=GPIO%d/%d",
+                 g_alive.slot, g_alive.width, g_alive.ldo, g_alive.gate, g_alive.gate_lvl);
+        if (sd_try_mount(&g_alive, &card) == ESP_OK) {
+            sd_adopt(&g_alive, card);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "  -> 再挑戦も失敗");
     }
     for (int i = 0; i < K_SD_PROBE_N; i++) {
         const sd_probe_t *p = &k_sd_probe[i];
@@ -228,18 +308,21 @@ esp_err_t gbac_sd_probe(void)
                  p->gate, p->gate_lvl, p->freq);
         esp_err_t e = sd_try_mount(p, &card);
         if (e == ESP_OK) {
-            g_win = *p;
-            g_win_ok = true;
-            g_card = card;
-            g_mounted = true;
-            ESP_LOGI(TAG, "SD 総当たり: ここで行けた slot=%d width=%d ldo=%d gate=GPIO%d=%d freq=%dkHz",
-                     p->slot, p->width, p->ldo, p->gate, p->gate_lvl, p->freq);
-            sd_log_card();
+            sd_adopt(p, card);
             return ESP_OK;
+        }
+        if (e == ESP_FAIL && !g_alive_ok) {
+            /* ESP_FAIL は f_mount の失敗。カードとはやりとりできている */
+            g_alive = *p;
+            g_alive_ok = true;
         }
         ESP_LOGW(TAG, "  -> %s", esp_err_to_name(e));
     }
-    ESP_LOGE(TAG, "SD 総当たり: 全部失敗。カード未挿入 / FAT32 以外 / 電源系のどれか");
+    if (g_alive_ok) {
+        sd_diag_card(&g_alive);
+    } else {
+        ESP_LOGE(TAG, "SD 総当たり: 全部タイムアウト。カード未挿入か電源系");
+    }
     return ESP_FAIL;
 }
 

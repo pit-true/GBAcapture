@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "soc/lp_system_reg.h"
 #include "frame_pipe.h"
 #include "gbacap.h"
 #include "sdkconfig.h"
@@ -130,13 +131,30 @@ static void stop_pipe_test(void)
 /* コンソールの RX(GPIO38)に届いた 1 文字で操作できるようにする。
  * esptool が 460800 で ROM と握手できたので、PC→基板の RX 配線は実証済み。
  * これで RST ボタンやタクト SW に頼まず、PC 側から再起動・ベンチ・録画開始ができる。
- *   r = 再起動 / i = 状態表示 / b = エンコーダベンチ / t = 録画の ON・OFF */
+ *   r = 再起動 / i = 状態表示 / b = エンコーダベンチ / t = 録画の ON・OFF
+ *   s = SD 結線の総当たり / d = 書き込みモードで再起動 */
 static void uart_cmd_init(void)
 {
     esp_err_t e = uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
     if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "UART0 の受信設定に失敗(%s)", esp_err_to_name(e));
     }
+}
+
+/* 書き込みモード(ダウンロード起動)で再起動する。
+ * P4 は LP(常時給電)ドメインの LP_SYSTEM SYS_CTRL bit2 = FORCE_DOWNLOAD_BOOT を
+ * 立ててリセットすると、ROM がダウンロード起動を選ぶ。ボタン不要。
+ * IDF に API はないが、USB-Serial/JTAG コンソールが他チップで同じことをしている
+ * (components/esp_system/port/usb_console.c:259 で RTC_CNTL_FORCE_DOWNLOAD_BOOT)。
+ * この基板は CH343 に DTR/RTS が繋がっていないので esptool の自動リセットが効かず、
+ * これが入るまで BOOT+RST を毎回押す必要があった。 */
+static void enter_download_mode(void)
+{
+    uint32_t v = REG_READ(LP_SYSTEM_REG_SYS_CTRL_REG) | LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT;
+    REG_WRITE(LP_SYSTEM_REG_SYS_CTRL_REG, v);
+    /* ログが UART に流れきる前にリセットすると読めないので待つ */
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_restart();
 }
 
 static void uart_cmd_handle(char c)
@@ -177,6 +195,9 @@ static void uart_cmd_handle(char c)
         } else {
             gbac_sd_probe();
         }
+    } else if (c == 'd') {
+        ESP_LOGI(TAG, "書き込みモードで再起動する(esptool がつながる)");
+        enter_download_mode();
     }
 }
 
@@ -199,7 +220,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 総当たり");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 総当たり d=書き込みモード");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
