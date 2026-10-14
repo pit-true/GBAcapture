@@ -22,6 +22,10 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames);
 void gbac_enc_stop(void);
 int gbac_enc_running(void);
 
+/* microSD がなくても HW エンコーダだけ測る。完成 NAL は読み捨てるので
+ * SD・muxer 不要。enc_max が 16.6ms を超えると 60fps に載らない。 */
+void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames);
+
 /* 完成 NAL を 1 個取り出す。使い終わったら必ず gbac_enc_free() */
 int gbac_enc_pop(gbac_nal_t *out, TickType_t wait_ticks);
 void gbac_enc_free(gbac_nal_t *n);

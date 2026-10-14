@@ -259,6 +259,25 @@ int gbac_enc_running(void)
     return g_run ? 1 : 0;
 }
 
+void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames)
+{
+    int64_t t0 = esp_timer_get_time();
+    if (gbac_enc_start(cfg, bench_frames) != ESP_OK) {
+        return;
+    }
+    gbac_nal_t n;
+    while (g_run || uxQueueMessagesWaiting(g_out_q) > 0) {
+        if (gbac_enc_pop(&n, pdMS_TO_TICKS(50))) {
+            gbac_enc_free(&n);
+        }
+    }
+    gbac_enc_stop();
+    int64_t us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "エンコーダベンチ %d 枚 %.2f 秒 -> %.1f fps scale<=%uus enc<=%uus err=%u",
+             bench_frames, (double)us / 1e6, (double)bench_frames * 1e6 / (double)us,
+             (unsigned)g_scale_us_max, (unsigned)g_enc_us_max, (unsigned)g_errs);
+}
+
 int gbac_enc_pop(gbac_nal_t *out, TickType_t wait_ticks)
 {
     return xQueueReceive(g_out_q, out, wait_ticks) == pdTRUE ? 1 : 0;

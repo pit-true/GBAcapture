@@ -95,6 +95,8 @@ void app_main(void)
 {
     gbac_board_init();
     show_board();
+    /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
+    gbac_led_blink(3, 150);
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
@@ -108,8 +110,14 @@ void app_main(void)
     }
 
 #if CONFIG_GBAC_BENCH_FRAMES > 0
-    /* 手順 2: HW エンコーダが 960x640@60 に耐えるかの実測。 */
-    gbac_rec_bench(&g_cfg, CONFIG_GBAC_BENCH_FRAMES);
+    /* 手順 2: HW エンコーダが 960x640@60 に耐えるかの実測。
+     * SD がなくてもエンコーダ単体なら測れるので、両方用意しておく。 */
+    if (gbac_sd_ready()) {
+        gbac_rec_bench(&g_cfg, CONFIG_GBAC_BENCH_FRAMES);
+    } else {
+        ESP_LOGW(TAG, "SD がないのでエンコーダ単体のベンチにする");
+        gbac_enc_bench(&g_cfg, CONFIG_GBAC_BENCH_FRAMES);
+    }
     show_status();
 #endif
 
