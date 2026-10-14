@@ -29,6 +29,12 @@ static const char *TAG = "rec";
 #define AAC_RATE    48000
 #define AAC_BITRATE 128000
 
+/* SD の空き容量のしきい値。16Mbps + AAC 128kbps で毎秒約 2.1MB、
+ * 15 分のスライス 1 本が約 1.9GB(FAT32 の 1 ファイル 4GB 上限より小さい)。
+ * 開始時にこれ未満なら始めず、記録中に切ったら app_main が停止させる。 */
+#define SD_START_FREE_MIN (400ull * 1024 * 1024)
+#define SD_STOP_FREE_MIN  (250ull * 1024 * 1024)
+
 static sdmmc_card_t *g_card;
 static bool g_mounted;
 static bool g_registered;
@@ -54,6 +60,23 @@ static uint32_t g_vpkts;
 static uint32_t g_apkts;
 static uint32_t g_verr;
 static uint32_t g_aerr;
+static volatile bool g_low_space;
+static volatile uint64_t g_last_free;   /* 最後に読んだ空きバイト数 */
+
+/* FATFS の空きバイト数。取れなければ 0 を返す。
+ * 0 は「不明」ではなく「足りない」として扱う。そのまま書き続けると
+ * mp4 が途中で切れて再生できなくなるので、止める方向に使う。 */
+static uint64_t sd_free_bytes(void)
+{
+    uint64_t total = 0;
+    uint64_t freeb = 0;
+    if (esp_vfs_fat_info(SD_BASE, &total, &freeb) != ESP_OK) {
+        ESP_LOGW(TAG, "SD の空き容量が読めない");
+        freeb = 0;
+    }
+    g_last_free = freeb;
+    return freeb;
+}
 
 esp_err_t gbac_sd_mount(void)
 {
@@ -82,6 +105,8 @@ esp_err_t gbac_sd_mount(void)
              g_card->csd.card_command_class,
              (unsigned long long)g_card->csd.capacity *
                  (unsigned long long)g_card->csd.sector_size / (1024ULL * 1024ULL));
+    ESP_LOGI(TAG, "SD 空き=%lluMB",
+             (unsigned long long)(sd_free_bytes() / (1024ULL * 1024ULL)));
     return ESP_OK;
 }
 
@@ -297,6 +322,7 @@ static void pump_audio(bool flush)
 static void mux_task(void *arg)
 {
     (void)arg;
+    int64_t last_space = esp_timer_get_time();
     while (g_run) {
         gbac_nal_t n;
         if (gbac_enc_pop(&n, pdMS_TO_TICKS(10))) {
@@ -328,6 +354,17 @@ static void mux_task(void *arg)
         }
         if (g_muxer) {
             pump_audio(false);
+        }
+        /* 5 秒に 1 回、空き容量を見る。250MB は 16Mbps で約 100 秒分。
+         * ここで教えたあと app_main が録画を止めて mp4 を正しく閉じる。 */
+        if (esp_timer_get_time() - last_space > 5 * 1000 * 1000) {
+            last_space = esp_timer_get_time();
+            uint64_t f = sd_free_bytes();
+            if (f < SD_STOP_FREE_MIN && !g_low_space) {
+                g_low_space = true;
+                ESP_LOGE(TAG, "SD の空きが %lluMB まで減った。録画を止める",
+                         (unsigned long long)(f / (1024 * 1024)));
+            }
         }
     }
     if (g_muxer) {
@@ -426,6 +463,15 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
     if (g_run) {
         return ESP_ERR_INVALID_STATE;
     }
+    uint64_t freeb = sd_free_bytes();
+    if (freeb < SD_START_FREE_MIN) {
+        ESP_LOGE(TAG, "SD の空きが %lluMB しかない。%dMB 以上空けてから録画して",
+                 (unsigned long long)(freeb / (1024 * 1024)),
+                 (int)(SD_START_FREE_MIN / (1024 * 1024)));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "SD 空き=%lluMB", (unsigned long long)(freeb / (1024 * 1024)));
+    g_low_space = false;
     g_split_min = cfg->split_min;
     g_w = GBAC_WIDTH * cfg->scale;
     g_h = GBAC_HEIGHT * cfg->scale;
@@ -466,6 +512,16 @@ void gbac_rec_stop(void)
     rec_free();
     ESP_LOGI(TAG, "録画停止 %s.mp4 video=%u audio=%u", g_base,
              (unsigned)g_vpkts, (unsigned)g_apkts);
+}
+
+bool gbac_rec_low_space(void)
+{
+    return g_low_space;
+}
+
+uint64_t gbac_rec_sd_free_mb(void)
+{
+    return g_last_free / (1024ULL * 1024ULL);
 }
 
 int gbac_rec_state(void)

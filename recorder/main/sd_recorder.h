@@ -4,6 +4,9 @@
  * slice_duration + url_pattern_ex に任せる。 */
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "cfg_nvs.h"
 #include "esp_err.h"
 
@@ -15,6 +18,13 @@ int gbac_sd_ready(void);
 esp_err_t gbac_rec_start(const gbac_cfg_t *cfg);
 void gbac_rec_stop(void);
 int gbac_rec_state(void);          /* 1 = 録画中 */
+
+/* SD の空きがしきい値を割ったら true。mux_task が教えるので、
+ * app_main 側が録画を止めて mp4 を正しく閉じる。 */
+bool gbac_rec_low_space(void);
+
+/* 最後に読んだ SD の空き(MB)。状態ログ用。0 なら不明。 */
+uint64_t gbac_rec_sd_free_mb(void);
 
 /* 合成映像で bench_frames 枚だけ録画して HW エンコーダの実測を出す。
  * 完了するまで阻塞する。 */

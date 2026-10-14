@@ -52,8 +52,9 @@ static void show_board(void)
 
 static void show_status(void)
 {
-    ESP_LOGI(TAG, "sd=%d rec=%d | usb pkts=%llu err=%llu | frame ok=%llu drop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus",
+    ESP_LOGI(TAG, "sd=%d rec=%d free=%lluMB | usb pkts=%llu err=%llu | frame ok=%llu drop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus",
              gbac_sd_ready(), g_recording ? 1 : 0,
+             (unsigned long long)gbac_rec_sd_free_mb(),
              (unsigned long long)gbac_usb_packets(), (unsigned long long)gbac_usb_errors(),
              (unsigned long long)frame_pipe_completed(), (unsigned long long)frame_pipe_dropped(),
              (unsigned long long)audio_pipe_gaps(), (unsigned long long)audio_pipe_overruns(),
@@ -146,6 +147,11 @@ void app_main(void)
         if (g_recording && !gbac_usb_ready()) {
             ESP_LOGE(TAG, "nano が外れた。録画を止める");
             stop_recording();
+        }
+        if (g_recording && gbac_rec_low_space()) {
+            ESP_LOGE(TAG, "SD の空きがない。録画を止める");
+            stop_recording();
+            gbac_led_blink(4, 100);
         }
         if (esp_timer_get_time() - last_log > 10 * 1000 * 1000) {
             last_log = esp_timer_get_time();
