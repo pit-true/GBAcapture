@@ -96,9 +96,36 @@ BRINGUP モードは PSRAM を切り、USB・SD・エンコーダを初期化せ
   （Waveshare 公式 FAQ の `esp32p4_rev_pre_v3.defaults` と同じ構成）
 - フラッシュ: 搭載は 32MB。書き込みは `--flash_mode dio --flash_freq 80m --flash_size 16MB`
 - パーティションオフセット 0x10000、ブートローダ 0x2000
-- SPI2 の octal IOMUX は GPIO28〜37 を使う。**GPIO37 は UART0 TX と共有**なので、
-  SPI2 octal を使う機能（PSRAM の別経路など）を増やすときはコンソールに注意
+- SPI2 の octal IOMUX は GPIO28〜37 を使う。**GPIO37 は UART0 TX と重なる**ので、
+  SPI2 octal を自前で使う機能を増やすときはコンソールに注意
+- ただし **PSRAM は SPI2 を使わない**。P4 の PSRAM は `PSRAM_MSPI1`
+  （`DR_REG_PSRAM_MSPI1_BASE`）という専用コントローラで、Kconfig のモードは
+  `SPIRAM_MODE_HEX`（16 本）。MSPI 側の IOMUX ピンは全て `GPIO_NUM_INVALID`
+  （`soc/esp32p4/include/soc/spi_pins.h`）で専用パッド。
+  つまり **PSRAM を有効にしても GPIO37 は食われない**。コンソールは安全
 - flash / PSRAM の MSPI は専用パッドで GPIO を消費しない（`spi_pins.h` の MSPI 欄が全て `GPIO_NUM_INVALID`）
+
+## 最初にやること: 電源の抜き差し
+
+ボタンより手軽で、状態を確実にリセットできる。Type-C を抜いて差し直す（モバイルバッテリー側でもよい）。
+P4 は電源オンで ROM ブートローダから走り、書き込み済みのアプリを読みに行く。
+ダウンロードループに残っていても、アプリが走っていても、どちらでも結果が変わる。
+
+- アプリが走っていれば **10 秒ごとに状態ログが出る**。
+  `app_main.c` のループが `show_status()` を 10 秒間隔で出しているため、
+  10 秒以上無音ならアプリが走っていないことになる
+- 起動直後に GPIO3 の記録 LED が 3 回点滅する。シリアルが壊れていてもこれは見える
+
+抜き差しに耐える監視スクリプトが `recorder/scripts/p4watch.py`。
+ポートを開き直し続けるので、ケーブルを抜いても終了しない。
+
+```powershell
+# 15 分あい COM6 を拾い続ける。ログは第2引数
+& 'D:\esp\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe' `
+    C:\Users\korok\gba-capture\recorder\scripts\p4watch.py 900 D:\esp\scripts\watch1.log
+```
+
+書き込みをしたいときは先にこれを止めること。COM6 は同時に使えない。
 
 ## 分かっていないこと（実機待ち）
 
