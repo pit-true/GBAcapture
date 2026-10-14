@@ -24,6 +24,7 @@ static uint8_t *g_encout;
 static uint32_t g_yuv_len;
 static uint32_t g_encout_len;
 static esp_h264_enc_handle_t g_enc;
+static esp_h264_enc_param_hw_handle_t g_param;
 static TaskHandle_t g_task;
 static volatile bool g_run;
 static bool g_bench;
@@ -237,6 +238,13 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
         g_enc = NULL;
         return ESP_FAIL;
     }
+    /* IDR を任意の位置で打つためのパラメータハンドル。
+     * mp4 のスライス先頭を IDR にしたいので muxer に教える必要がある。 */
+    e = esp_h264_enc_hw_get_param_hd(g_enc, &g_param);
+    if (e != ESP_H264_ERR_OK) {
+        ESP_LOGW(TAG, "get_param_hd 失敗(%d)。IDR 強制は使えない", (int)e);
+        g_param = NULL;
+    }
 
     g_frames = 0;
     g_errs = 0;
@@ -259,6 +267,20 @@ void gbac_enc_stop(void)
         esp_h264_enc_close(g_enc);
         esp_h264_enc_del(g_enc);
         g_enc = NULL;
+        g_param = NULL;
+    }
+}
+
+/* 次のエンコードフレームを IDR にする。mp4 のスライス切り替え時に呼ぶ。
+ * GOP の設定は変わらない。 */
+void gbac_enc_force_idr(void)
+{
+    if (g_enc == NULL || g_param == NULL) {
+        return;
+    }
+    esp_h264_err_t e = esp_h264_enc_force_idr(&g_param->base);
+    if (e != ESP_H264_ERR_OK) {
+        ESP_LOGW(TAG, "force_idr 失敗(%d)", (int)e);
     }
 }
 

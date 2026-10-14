@@ -22,6 +22,10 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames);
 void gbac_enc_stop(void);
 int gbac_enc_running(void);
 
+/* 次のフレームを IDR にする。mp4 のスライスが変わった直後に呼ぶと、
+ * 新しいファイルの先頭が IDR になり再生側が迷わない。 */
+void gbac_enc_force_idr(void);
+
 /* microSD がなくても HW エンコーダだけ測る。完成 NAL は読み捨てるので
  * SD・muxer 不要。enc_max が 16.6ms を超えると 60fps に載らない。 */
 void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames);

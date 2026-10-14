@@ -193,6 +193,10 @@ static int slice_path(esp_muxer_slice_info_t *info, void *ctx)
     } else {
         n = snprintf(info->file_path, (size_t)info->len, "%s/%s_p%d.mp4", SD_BASE, g_base,
                      info->slice_index + 1);
+        /* muxer がいつ切るかはソースが見えないので保証できない。
+         * 切った直後のフレームを IDR にしておくと、新しいファイルの先頭が
+         * IDR になり、P が混ざっていても再生側が次の IDR まで待たずに済む。 */
+        gbac_enc_force_idr();
     }
     return (n > 0 && n < info->len) ? 0 : -1;
 }
