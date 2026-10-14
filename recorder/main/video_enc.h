@@ -21,6 +21,8 @@ typedef struct {
 esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames);
 void gbac_enc_stop(void);
 int gbac_enc_running(void);
+/* まだ muxer に入れていない NAL の数。ベンチの終了判定に使う */
+int gbac_enc_queued(void);
 
 /* 次のフレームを IDR にする。mp4 のスライスが変わった直後に呼ぶと、
  * 新しいファイルの先頭が IDR になり再生側が迷わない。 */

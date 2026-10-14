@@ -289,6 +289,12 @@ int gbac_enc_running(void)
     return g_run ? 1 : 0;
 }
 
+/* まだ muxer に入れていない NAL の数。ベンチの終了判定に使う。 */
+int gbac_enc_queued(void)
+{
+    return g_out_q ? (int)uxQueueMessagesWaiting(g_out_q) : 0;
+}
+
 void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames)
 {
     int64_t t0 = esp_timer_get_time();

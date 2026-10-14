@@ -323,37 +323,44 @@ static void pump_audio(bool flush)
     }
 }
 
+/* NAL を 1 本 muxer に入れる。まだ muxer がなければ SPS/PPS を拾ってから開く。 */
+static void write_video(const gbac_nal_t *n)
+{
+    if (!g_muxer) {
+        extract_sps_pps(n->buf, n->len);
+        if (!g_avcc) {
+            ESP_LOGE(TAG, "SPS/PPS が見つからない NAL(%d バイト)", n->len);
+            return;
+        }
+        if (open_muxer() != ESP_OK) {
+            g_run = false;
+            return;
+        }
+    }
+    uint32_t ms = (uint32_t)(n->pts_us / 1000);
+    esp_muxer_video_packet_t vp = {
+        .data = n->buf,
+        .len = n->len,
+        .pts = ms,
+        .dts = ms,
+        .key_frame = n->key,
+    };
+    if (esp_muxer_add_video_packet(g_muxer, g_vidx, &vp) == ESP_MUXER_ERR_OK) {
+        g_vpkts++;
+    } else {
+        g_verr++;
+        ESP_LOGE(TAG, "video packet 追加失敗");
+    }
+}
+
 static void mux_task(void *arg)
 {
     (void)arg;
     int64_t last_space = esp_timer_get_time();
-    while (g_run) {
+    while (true) {
         gbac_nal_t n;
         if (gbac_enc_pop(&n, pdMS_TO_TICKS(10))) {
-            if (!g_muxer) {
-                extract_sps_pps(n.buf, n.len);
-                if (!g_avcc) {
-                    ESP_LOGE(TAG, "SPS/PPS が見つからない NAL(%d バイト)", n.len);
-                } else if (open_muxer() != ESP_OK) {
-                    g_run = false;
-                }
-            }
-            if (g_muxer) {
-                uint32_t ms = (uint32_t)(n.pts_us / 1000);
-                esp_muxer_video_packet_t vp = {
-                    .data = n.buf,
-                    .len = n.len,
-                    .pts = ms,
-                    .dts = ms,
-                    .key_frame = n.key,
-                };
-                if (esp_muxer_add_video_packet(g_muxer, g_vidx, &vp) == ESP_MUXER_ERR_OK) {
-                    g_vpkts++;
-                } else {
-                    g_verr++;
-                    ESP_LOGE(TAG, "video packet 追加失敗");
-                }
-            }
+            write_video(&n);
             gbac_enc_free(&n);
         }
         if (g_muxer) {
@@ -369,6 +376,20 @@ static void mux_task(void *arg)
                 ESP_LOGE(TAG, "SD の空きが %lluMB まで減った。録画を止める",
                          (unsigned long long)(f / (1024 * 1024)));
             }
+        }
+        if (!g_run) {
+            /* 停止指示。エンコード済みでキューに残った NAL を書き切ってから閉じる。
+             * これをしないと mp4 の末尾が 0.1 秒分だけ欠ける。 */
+            while (gbac_enc_pop(&n, 0)) {
+                write_video(&n);
+                gbac_enc_free(&n);
+            }
+            break;
+        }
+        if (!gbac_enc_running() && gbac_enc_queued() == 0) {
+            /* ベンチはエンコーダが枚数に達して自分で止まる。
+             * g_run は立たないので、ここで抜けないと永久に終わらない。 */
+            break;
         }
     }
     if (g_muxer) {
@@ -508,11 +529,13 @@ void gbac_rec_stop(void)
     if (!g_run) {
         return;
     }
-    gbac_enc_stop();
+    /* mux_task にループを抜けて mp4 を閉じさせてからエンコーダを壊す。
+     * 逆順にすると、mux_task がまだ読む NAL の作り手を先に消してしまう。 */
     g_run = false;
     for (int i = 0; i < 300 && g_task != NULL; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    gbac_enc_stop();
     rec_free();
     ESP_LOGI(TAG, "録画停止 %s.mp4 video=%u audio=%u", g_base,
              (unsigned)g_vpkts, (unsigned)g_apkts);
@@ -543,6 +566,9 @@ esp_err_t gbac_rec_bench(const gbac_cfg_t *cfg, int bench_frames)
     while (g_task != NULL) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+    /* muxer が閉じ終わったのでエンコーダを壊してよい。
+     * 呼ばないと esp_h264 のハンドルが残ったままになり、次の開始が失敗する。 */
+    gbac_enc_stop();
     rec_free();
     int64_t us = esp_timer_get_time() - t0;
     ESP_LOGI(TAG, "ベンチ %d 枚 %.2f 秒 -> %.1f fps, video=%u err=%u",
