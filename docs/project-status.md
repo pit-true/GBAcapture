@@ -57,6 +57,12 @@ cd host && dotnet run --project GbaCap.Cli -- framestat  # 診断: フレーム�
     ケースはタカチ SW-75B、タクトSW TS-06104 + LED×2
   - **次のアクション**: ESP-IDF 環境構築 → リスク検証3点（HWエンコーダ 960×640@60 実測 /
     usb_host で nano 受信 10k転送/秒 / HSホスト+FSデバイス同時動作）
+  - **2026-10-14 実機でアプリが動いているのを初めて確認**。COM6(115200) に 10 秒ごと状態ログ、
+    uptime 約 5900 秒。中身は `sd=0 rec=0 usb pkts=0 err=0 frame ok=0 enc f=0`。
+    つまり SD 未挿入・nano 未接続・エンコーダ未実行。基板もコンソールも生きている
+  - 載っているのはベンチ導入前の古いビルド。新しいビルド（エンコーダベンチ 600 枚内蔵）を
+    書くには **BOOT+RST でダウンロードモードに入れるだけ**（DTR/RTS 未配線なので自動リセット不可）。
+    以降は `recorder/scripts/p4flash_and_log.ps1` が書き込み→起動→ログまで自動
   - 手持ちの 1.25mm **6P** ケーブルは 4P ヘッダに合わない → 4P 品（製品同梱ケーブルを確認）
   - 改訂4（Pi Zero 2 W）は docs/recorder-plan.md に記録として残す
 - （その後）UVC/UAC化、専用基板化（battery.pngのLiPo基板拡張を含む）
