@@ -400,8 +400,9 @@ static void mux_task(void *arg)
         }
         g_muxer = NULL;
     }
-    ESP_LOGI(TAG, "muxer 終了 video=%u audio=%u err=%u/%u",
-             (unsigned)g_vpkts, (unsigned)g_apkts, (unsigned)g_verr, (unsigned)g_aerr);
+    ESP_LOGI(TAG, "muxer 終了 video=%u audio=%u err=%u/%u stack 残り=%uB",
+             (unsigned)g_vpkts, (unsigned)g_apkts, (unsigned)g_verr, (unsigned)g_aerr,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     g_task = NULL;
     vTaskDelete(NULL);
 }
@@ -515,7 +516,8 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
         return e;
     }
     g_run = true;
-    xTaskCreatePinnedToCore(mux_task, "mux", 8192, NULL, 4, &g_task, 0);
+    /* AAC 符号化 + muxer + FATFS でスタックを使う。enc と同じく 12KB にしておく */
+    xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 4, &g_task, 0);
     return ESP_OK;
 }
 

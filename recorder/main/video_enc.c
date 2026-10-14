@@ -146,9 +146,10 @@ static void enc_task(void *arg)
         done++;
     }
 
-    ESP_LOGI(TAG, "エンコード終了 frames=%u errs=%u scale_max=%uus enc_max=%uus",
+    ESP_LOGI(TAG, "エンコード終了 frames=%u errs=%u scale_max=%uus enc_max=%uus stack 残り=%uB",
              (unsigned)g_frames, (unsigned)g_errs,
-             (unsigned)g_scale_us_max, (unsigned)g_enc_us_max);
+             (unsigned)g_scale_us_max, (unsigned)g_enc_us_max,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     g_task = NULL;
     vTaskDelete(NULL);
 }
@@ -253,7 +254,10 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_run = true;
     ESP_LOGI(TAG, "エンコード開始 %dx%d scale=%d %dkbps bench=%d",
              g_W, g_H, g_scale, (int)cfg->bitrate_kbps, bench_frames);
-    xTaskCreatePinnedToCore(enc_task, "enc", 4096, NULL, 5, &g_task, 1);
+    /* gbac_scale_ouyy だけで約 4.2KB のスタックを使う。実機(2026-10-14)で
+     * 4096 バイトだと "Stack protection fault" で落ちたので 12KB にした。
+     * 終了時に high water mark を出すので、それで実際の必要量が分かる。*/
+    xTaskCreatePinnedToCore(enc_task, "enc", 12288, NULL, 5, &g_task, 1);
     return ESP_OK;
 }
 

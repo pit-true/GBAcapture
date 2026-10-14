@@ -44,8 +44,9 @@ static void show_board(void)
 {
     esp_chip_info_t ci;
     esp_chip_info(&ci);
-    /* revision は MXX の 16bit(メジャー*100+マイナー)。v1.3 なら 103。 */
-    ESP_LOGI(TAG, "chip rev v%d.%02d cores=%d features=0x%x", (int)(ci.revision / 100),
+    /* revision は MXX の 16bit(メジャー*100+マイナー)。v1.3 なら 103。
+     * %02d にすると v1.03 と出るので %d にする(ROM ログは v1.3 と出す) */
+    ESP_LOGI(TAG, "chip rev v%d.%d cores=%d features=0x%x", (int)(ci.revision / 100),
              (int)(ci.revision % 100), (int)ci.cores, (unsigned)ci.features);
     ESP_LOGI(TAG, "heap free internal=%uKB psram=%uKB",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -94,6 +95,38 @@ static void stop_recording(void)
     show_status();
 }
 
+/* SD がなくても映像と音声のパイプラインを確かめるための試験。
+ * 録画と同じく USB 受信 → フレーム管 → 4 倍拡大 → HW エンコードまで通すが、
+ * mux(ファイル書き込み)は走らせない。SD の調子が悪いときに切り分ける。*/
+static bool g_pipe_test = false;
+
+static void start_pipe_test(void)
+{
+    if (g_recording || g_pipe_test) {
+        ESP_LOGW(TAG, "すでに動いている");
+        return;
+    }
+    frame_pipe_stats_reset();
+    audio_pipe_reset();
+    if (gbac_enc_start(&g_cfg, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "エンコーダを開始できない");
+        return;
+    }
+    gbac_usb_stream_start();
+    gbac_led_rec(true);
+    g_pipe_test = true;
+    ESP_LOGI(TAG, "パイプラインテスト開始(mp4 には書かない)");
+}
+
+static void stop_pipe_test(void)
+{
+    gbac_usb_stream_stop();
+    gbac_enc_stop();
+    gbac_led_rec(false);
+    g_pipe_test = false;
+    show_status();
+}
+
 /* コンソールの RX(GPIO38)に届いた 1 文字で操作できるようにする。
  * esptool が 460800 で ROM と握手できたので、PC→基板の RX 配線は実証済み。
  * これで RST ボタンやタクト SW に頼まず、PC 側から再起動・ベンチ・録画開始ができる。
@@ -125,10 +158,18 @@ static void uart_cmd_handle(char c)
             gbac_enc_bench(&g_cfg, n);
         }
     } else if (c == 't') {
-        if (g_recording) {
+        if (g_pipe_test) {
+            ESP_LOGW(TAG, "パイプラインテスト中なので録画は使えない");
+        } else if (g_recording) {
             stop_recording();
         } else {
             start_recording();
+        }
+    } else if (c == 'e') {
+        if (g_pipe_test) {
+            stop_pipe_test();
+        } else {
+            start_pipe_test();
         }
     }
 }
@@ -152,7 +193,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);

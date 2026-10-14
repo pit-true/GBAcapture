@@ -1,5 +1,5 @@
 ﻿# ESP32-P4-Pico に書いて起動ログまで取る。docs/esp32p4-flashing.md 参照。
-# ダウンロードモード(BOOT+RST)を待つ -> 書く -> RUN で起こす -> ログ収集。
+# ダウンロードモード(BOOT+RST)を待つ -> 書く -> ログ収集。
 # 進捗は Add-Content で逐次 flush するので、ログを後から tail できる。
 param(
     [string]$Port = 'COM6',
@@ -41,6 +41,12 @@ idf.py -B $BuildDir -p $Port flash 2>&1 | ForEach-Object { Add-Content -Path $Pr
 if ($LASTEXITCODE -ne 0) { Log "書き込み失敗 exit=$LASTEXITCODE"; exit 1 }
 Log "FLASH_DONE"
 
+# 書き込み後は esptool がフラッシャスタブからアプリへ戻す。ROM 接続は不要なので
+# 素のシリアル読み(p4watch.py)で拾う。何も出ないときだけ p4boot.py で起こす。
 Log "[3/3] 起動させて $LogSecs 秒ログ収集"
-& $py (Join-Path $PSScriptRoot 'p4boot.py') $LogSecs $LogFile 2>&1 | ForEach-Object { Add-Content -Path $ProgressFile -Value $_ -Encoding utf8 }
+& $py (Join-Path $PSScriptRoot 'p4watch.py') $LogSecs $LogFile 2>&1 | ForEach-Object { Add-Content -Path $ProgressFile -Value $_ -Encoding utf8 }
+if ((-not (Test-Path $LogFile)) -or ((Get-Item $LogFile).Length -lt 200)) {
+    Log "ログが空。p4boot.py で ROM 接続から起こす"
+    & $py (Join-Path $PSScriptRoot 'p4boot.py') $LogSecs $LogFile 2>&1 | ForEach-Object { Add-Content -Path $ProgressFile -Value $_ -Encoding utf8 }
+}
 Log "ログ: $LogFile"
