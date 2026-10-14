@@ -11,6 +11,9 @@
 #include "esp_err.h"
 
 esp_err_t gbac_sd_mount(void);
+/* TF の結線(スロット番号 / IO 電源の LDO / 電源ゲート GPIO)が回路図で
+ * 確定できないので、総当たりで生やす。成功するとマウントした状態で戻る。 */
+esp_err_t gbac_sd_probe(void);
 void gbac_sd_unmount(void);
 int gbac_sd_ready(void);
 

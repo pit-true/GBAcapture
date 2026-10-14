@@ -7,8 +7,10 @@
 
 #include "audio_pipe.h"
 #include "board.h"
+#include "driver/gpio.h"
 #include "driver/sdmmc_default_configs.h"
 #include "driver/sdmmc_host.h"
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "esp_audio_enc.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -78,27 +80,104 @@ static uint64_t sd_free_bytes(void)
     return freeb;
 }
 
-esp_err_t gbac_sd_mount(void)
+/* --- TF スロットの結線が回路図から読み切れないので総当たりする -----------
+ * 回路図(Waveshare 公式 PDF)から確定できたこと
+ *   - TF1 の 6 本は NLGPIO39〜44。P4 の slot0 IOMUX(CLK43/CMD44/D0-3=39〜42)と一致
+ *   - P4 の HAL は slot0 を GPIO マトリクス非対応にしている
+ *     (components/hal/esp32p4/include/hal/sdmmc_ll.h:
+ *      SDMMC_LL_SLOT_SUPPORT_GPIO_MATRIX(0) == 0)
+ *     → TF は slot0 の専用ピンに直結。IDF の既定 host.slot=1 だと別スロット
+ *   - TF1 の隣に Q1 と R17/R22 があり、R17 側へ NLGPIO45(slot0 の D4)が来る。
+ *     Q1 が TF の電源スイッチなら、この GPIO を駆動しないとカードに電気が来ない
+ * 分かっていないこと
+ *   - SD の IO 電源がオンチップ LDO(VO4)由来か。Waveshare 公式 09_sdmmc は
+ *     LDO ID 4 を既定で有効にするし、MicroPython #18984 も同じ
+ *     send_op_cond(1) returned 0x107 をこの原因で報告している
+ *   - Q1 が High でオンか Low でオンか
+ * 's'(とマウント失敗時の自動実行)で下の表を先頭から試し、
+ * 最初にカードが見えた設定を覚えておく。 */
+typedef struct {
+    int slot;       /* SDMMC_HOST_SLOT_0 / SDMMC_HOST_SLOT_1 */
+    int width;      /* 1 か 4 */
+    int ldo;        /* オンチップ LDO の chan_id。0 = 使わない */
+    int gate;       /* 電源ゲート扱いで駆動する GPIO。-1 = 触らない */
+    int gate_lvl;   /* gate に出すレベル(0/1) */
+    int freq;       /* kHz */
+} sd_probe_t;
+
+static const sd_probe_t k_sd_probe[] = {
+    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 0, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_0, 4, 4, -1,              -1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_0, 4, 0, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_0, 4, 0, -1,              -1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_1, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_1, 4, 0, -1,              -1, SDMMC_FREQ_HIGHSPEED },  /* 今の構成 */
+    { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_0, 4, 3, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
+    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+};
+#define K_SD_PROBE_N ((int)(sizeof(k_sd_probe) / sizeof(k_sd_probe[0])))
+
+static sd_pwr_ctrl_handle_t g_pwr;
+static sd_probe_t g_win;
+static bool g_win_ok;
+
+static void sd_pwr_release(void)
 {
-    if (g_mounted) {
-        return ESP_OK;
+    if (g_pwr) {
+        sd_pwr_ctrl_del_on_chip_ldo(g_pwr);
+        g_pwr = NULL;
     }
+}
+
+/* 1 回だけマウントを試みる。成功したらカードを *out_card に返すので、
+ * 呼び出し側は esp_vfs_fat_sdcard_unmount するまで保持する。 */
+static esp_err_t sd_try_mount(const sd_probe_t *p, sdmmc_card_t **out_card)
+{
+    sd_pwr_release();
+    if (p->ldo > 0) {
+        sd_pwr_ctrl_ldo_config_t lc = { .ldo_chan_id = p->ldo };
+        if (sd_pwr_ctrl_new_on_chip_ldo(&lc, &g_pwr) != ESP_OK) {
+            ESP_LOGW(TAG, "LDO%d が確保できない", p->ldo);
+            g_pwr = NULL;
+        }
+    }
+    /* 電源ゲート(推定 GPIO45)。前の試行で駆動していたかもしれないので
+     * 触らない場合も一度 GPIO 解除して-floating に戻す。 */
+    gpio_reset_pin(GBAC_PIN_SD_PWR);
+    if (p->gate >= 0) {
+        gpio_set_direction(p->gate, GPIO_MODE_OUTPUT);
+        gpio_set_level(p->gate, p->gate_lvl);
+    }
+    vTaskDelay(pdMS_TO_TICKS(30));   /* カードの VDD が安定するのを待つ */
+
     esp_vfs_fat_mount_config_t mcfg = {
         .format_if_mount_failed = false,
         .max_files = 4,
         .allocation_unit_size = 64 * 1024,
     };
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    host.slot = p->slot;
+    host.max_freq_khz = p->freq;
+    host.pwr_ctrl_handle = g_pwr;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 4;
+    slot.width = p->width;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-    esp_err_t e = esp_vfs_fat_sdmmc_mount(SD_BASE, &host, &slot, &mcfg, &g_card);
-    if (e != ESP_OK) {
-        ESP_LOGE(TAG, "SD マウント失敗(%s)", esp_err_to_name(e));
-        return e;
+    if (p->slot == SDMMC_HOST_SLOT_1) {
+        /* slot1 は GPIO マトリクス経由。ピン番号は回路図どおり(slot0 と同じ) */
+        slot.clk = GBAC_PIN_SD_CLK;
+        slot.cmd = GBAC_PIN_SD_CMD;
+        slot.d0 = GBAC_PIN_SD_D0;
+        slot.d1 = GBAC_PIN_SD_D1;
+        slot.d2 = GBAC_PIN_SD_D2;
+        slot.d3 = GBAC_PIN_SD_D3;
     }
-    g_mounted = true;
+    return esp_vfs_fat_sdmmc_mount(SD_BASE, &host, &slot, &mcfg, out_card);
+}
+
+static void sd_log_card(void)
+{
     /* IDF 5.5 の sdmmc_csd_t は csd_ver/mmc_ver/capacity/sector_size/
      * card_command_class/tr_speed。capacity はセクタ数なので sector_size を掛ける。 */
     ESP_LOGI(TAG, "SD マウント完了 %s クラス=%d 容量=%lluMB", SD_BASE,
@@ -107,7 +186,61 @@ esp_err_t gbac_sd_mount(void)
                  (unsigned long long)g_card->csd.sector_size / (1024ULL * 1024ULL));
     ESP_LOGI(TAG, "SD 空き=%lluMB",
              (unsigned long long)(sd_free_bytes() / (1024ULL * 1024ULL)));
+}
+
+esp_err_t gbac_sd_mount(void)
+{
+    if (g_mounted) {
+        return ESP_OK;
+    }
+    sd_probe_t p;
+    if (g_win_ok) {
+        p = g_win;
+    } else {
+        p.slot = SDMMC_HOST_SLOT_1;
+        p.width = 4;
+        p.ldo = 0;
+        p.gate = GBAC_SD_PWR_GPIO;
+        p.gate_lvl = 1;
+        p.freq = SDMMC_FREQ_HIGHSPEED;
+    }
+    esp_err_t e = sd_try_mount(&p, &g_card);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "SD マウント失敗(%s)", esp_err_to_name(e));
+        return e;
+    }
+    g_mounted = true;
+    sd_log_card();
     return ESP_OK;
+}
+
+/* 結線の総当たり。最初に生えた設定を覚えてそのままマウントした状態で戻る。 */
+esp_err_t gbac_sd_probe(void)
+{
+    if (g_mounted) {
+        return ESP_OK;
+    }
+    for (int i = 0; i < K_SD_PROBE_N; i++) {
+        const sd_probe_t *p = &k_sd_probe[i];
+        sdmmc_card_t *card = NULL;
+        ESP_LOGI(TAG, "SD 総当たり %d/%d slot=%d width=%d ldo=%d gate=GPIO%d/%d freq=%dkHz",
+                 i + 1, K_SD_PROBE_N, p->slot, p->width, p->ldo,
+                 p->gate, p->gate_lvl, p->freq);
+        esp_err_t e = sd_try_mount(p, &card);
+        if (e == ESP_OK) {
+            g_win = *p;
+            g_win_ok = true;
+            g_card = card;
+            g_mounted = true;
+            ESP_LOGI(TAG, "SD 総当たり: ここで行けた slot=%d width=%d ldo=%d gate=GPIO%d=%d freq=%dkHz",
+                     p->slot, p->width, p->ldo, p->gate, p->gate_lvl, p->freq);
+            sd_log_card();
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "  -> %s", esp_err_to_name(e));
+    }
+    ESP_LOGE(TAG, "SD 総当たり: 全部失敗。カード未挿入 / FAT32 以外 / 電源系のどれか");
+    return ESP_FAIL;
 }
 
 void gbac_sd_unmount(void)
@@ -118,6 +251,7 @@ void gbac_sd_unmount(void)
     esp_vfs_fat_sdcard_unmount(SD_BASE, g_card);
     g_mounted = false;
     g_card = NULL;
+    sd_pwr_release();
 }
 
 int gbac_sd_ready(void)

@@ -12,13 +12,21 @@
 #define GBAC_PIN_BTN        2   /* タクト TS-06104 ↔ GND。内部プルアップ */
 #define GBAC_PIN_LED_REC    3   /* 録画 LED → 470Ω → GND */
 
-/* --- microSD(SDMMC 4bit) --- */
+/* --- microSD(SDMMC 4bit) ---
+ * 回路図(Waveshare 公式 PDF)で TF1 の 6 本が NLGPIO39〜44 だと確認できた。
+ * P4 では slot0 が GPIO マトリクス非対応(hal/esp32p4/include/hal/sdmmc_ll.h の
+ * SDMMC_LL_SLOT_SUPPORT_GPIO_MATRIX(0) == 0)で、これらのピンは slot0 の IOMUX 直結。
+ * つまり TF スロットは slot0。IDF の SDMMC_HOST_DEFAULT() は slot=1 なので注意。 */
 #define GBAC_PIN_SD_CLK     43
 #define GBAC_PIN_SD_CMD     44
 #define GBAC_PIN_SD_D0      39
 #define GBAC_PIN_SD_D1      40
 #define GBAC_PIN_SD_D2      41
 #define GBAC_PIN_SD_D3      42
+/* TF1 の隣に Q1 + R17/R22 があり、R17 側へ NLGPIO45(slot0 の D4)が来ている。
+ * Q1 が TF の電源スイッチなら、この GPIO を駆動しないとカードに電気が行かない
+ * (4bit モードでは D4 は使われないので GPIO 出力にできる)。要検証。 */
+#define GBAC_PIN_SD_PWR     45
 
 /* --- PC に挿した側(FullSpeed。SD をマスストレージとして見せる) --- */
 #define GBAC_PIN_USB_FS_DM  26  /* D- */

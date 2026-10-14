@@ -171,6 +171,12 @@ static void uart_cmd_handle(char c)
         } else {
             start_pipe_test();
         }
+    } else if (c == 's') {
+        if (gbac_sd_ready()) {
+            ESP_LOGI(TAG, "SD はすでにマウント済み");
+        } else {
+            gbac_sd_probe();
+        }
     }
 }
 
@@ -193,7 +199,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 総当たり");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
@@ -216,7 +222,12 @@ void app_main(void)
     gbac_button_init();
     gbac_usb_start(on_packet, NULL);
     if (gbac_sd_mount() != ESP_OK) {
-        ESP_LOGW(TAG, "SD 未挿入。挿してからボタンを押してね");
+        /* 結線(スロット番号 / IO 電源の LDO / 電源ゲート)が回路図で読み切れない。
+         * 総当たりで生やすので、カードを挿していればここで復旧する。 */
+        ESP_LOGW(TAG, "SD が見えない。結線を総当たりする");
+        if (gbac_sd_probe() != ESP_OK) {
+            ESP_LOGE(TAG, "SD 未挿入。挿してからボタンを押してね");
+        }
     }
 
 #if CONFIG_GBAC_BENCH_FRAMES > 0
