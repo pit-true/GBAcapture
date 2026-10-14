@@ -18,6 +18,7 @@ idf_component_register(
         esp_driver_sdmmc
         nvs_flash
         esp_driver_gpio
+        esp_driver_uart
         esp_timer
         esp_hw_support
         esp_h264

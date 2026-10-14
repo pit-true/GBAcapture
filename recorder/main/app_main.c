@@ -7,10 +7,12 @@
 #include "board.h"
 #include "button.h"
 #include "cfg_nvs.h"
+#include "driver/uart.h"
 #include "esp_chip_info.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -92,12 +94,65 @@ static void stop_recording(void)
     show_status();
 }
 
+/* コンソールの RX(GPIO38)に届いた 1 文字で操作できるようにする。
+ * esptool が 460800 で ROM と握手できたので、PC→基板の RX 配線は実証済み。
+ * これで RST ボタンやタクト SW に頼まず、PC 側から再起動・ベンチ・録画開始ができる。
+ *   r = 再起動 / i = 状態表示 / b = エンコーダベンチ / t = 録画の ON・OFF */
+static void uart_cmd_init(void)
+{
+    esp_err_t e = uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "UART0 の受信設定に失敗(%s)", esp_err_to_name(e));
+    }
+}
+
+static void uart_cmd_handle(char c)
+{
+    if (c == 'r') {
+        ESP_LOGI(TAG, "UART の指示で再起動する");
+        esp_restart();
+    } else if (c == 'i') {
+        show_status();
+        ESP_LOGI(TAG, "heap internal=%uKB psram=%uKB largest_int=%uKB",
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    } else if (c == 'b') {
+        if (g_recording) {
+            ESP_LOGW(TAG, "録画中なのでベンチは使えない");
+        } else {
+            int n = CONFIG_GBAC_BENCH_FRAMES > 0 ? CONFIG_GBAC_BENCH_FRAMES : 600;
+            gbac_enc_bench(&g_cfg, n);
+        }
+    } else if (c == 't') {
+        if (g_recording) {
+            stop_recording();
+        } else {
+            start_recording();
+        }
+    }
+}
+
+static void uart_cmd_poll(void)
+{
+    uint8_t c;
+    while (uart_read_bytes(UART_NUM_0, &c, 1, 0) == 1) {
+        if (c == '\r' || c == '\n' || c == ' ') {
+            continue;
+        }
+        ESP_LOGI(TAG, "UART コマンド '%c' を受けた", (char)c);
+        uart_cmd_handle((char)c);
+    }
+}
+
 void app_main(void)
 {
     gbac_board_init();
     show_board();
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
+    uart_cmd_init();
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
@@ -153,6 +208,7 @@ void app_main(void)
             stop_recording();
             gbac_led_blink(4, 100);
         }
+        uart_cmd_poll();
         if (esp_timer_get_time() - last_log > 10 * 1000 * 1000) {
             last_log = esp_timer_get_time();
             show_status();
