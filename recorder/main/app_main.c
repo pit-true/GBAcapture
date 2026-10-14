@@ -7,7 +7,9 @@
 #include "board.h"
 #include "button.h"
 #include "cfg_nvs.h"
+#include "esp_chip_info.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -34,9 +36,24 @@ static void on_packet(const uint8_t *pkt, int len, void *arg)
     }
 }
 
+/* 起動時にチップとヒープを出す。rev1_3 プロファイルが実機(v1.3)と
+ * 合っているか、PSRAM が生きているかをここで確認する。 */
+static void show_board(void)
+{
+    esp_chip_info_t ci;
+    esp_chip_info(&ci);
+    /* revision は MXX の 16bit(メジャー*100+マイナー)。v1.3 なら 103。 */
+    ESP_LOGI(TAG, "chip rev v%d.%02d cores=%d features=0x%x", (int)(ci.revision / 100),
+             (int)(ci.revision % 100), (int)ci.cores, (unsigned)ci.features);
+    ESP_LOGI(TAG, "heap free internal=%uKB psram=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+}
+
 static void show_status(void)
 {
-    ESP_LOGI(TAG, "usb pkts=%llu err=%llu | frame ok=%llu drop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus",
+    ESP_LOGI(TAG, "sd=%d rec=%d | usb pkts=%llu err=%llu | frame ok=%llu drop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus",
+             gbac_sd_ready(), g_recording ? 1 : 0,
              (unsigned long long)gbac_usb_packets(), (unsigned long long)gbac_usb_errors(),
              (unsigned long long)frame_pipe_completed(), (unsigned long long)frame_pipe_dropped(),
              (unsigned long long)audio_pipe_gaps(), (unsigned long long)audio_pipe_overruns(),
@@ -77,6 +94,7 @@ static void stop_recording(void)
 void app_main(void)
 {
     gbac_board_init();
+    show_board();
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
