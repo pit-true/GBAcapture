@@ -34,6 +34,7 @@ USB-HSでPCへ → 自作ビューア「GBAcapture (Nisekoro-capture)」で表�
 
 ```bash
 cd host && dotnet test                                   # ホスト側テスト（26件）
+powershell -NoProfile -File recorder\test\run_tests.ps1   # 録画FWの単体テスト（2330項目）
 cd firmware && ./build.sh app                            # FWビルド
 cd host && dotnet run --project GbaCap.Cli -- update ../firmware/app/gbacap_app.bin  # 手放しFW更新
 cd host && dotnet run --project GbaCap.Cli -- freq       # 診断: DCK/LP/SPL周波数
@@ -64,6 +65,9 @@ cd host && dotnet run --project GbaCap.Cli -- framestat  # 診断: フレーム�
     書くには **BOOT+RST でダウンロードモードに入れるだけ**（DTR/RTS 未配線なので自動リセット不可）。
     以降は `recorder/scripts/p4flash_and_log.ps1` が書き込み→起動→ログまで自動
   - 手持ちの 1.25mm **6P** ケーブルは 4P ヘッダに合わない → 4P 品（製品同梱ケーブルを確認）
+  - **通し手順・期待ログ・mp4検査の期待値・未完了一覧は docs/recorder-esp32p4-runbook.md**
+  - 単体テストは **2330 項目 green**（`recorder/test/run_tests.ps1`。実解像度の拡大位置と
+    pts の ms 換算まで固定済み）。C# 側 26 件も green
   - 改訂4（Pi Zero 2 W）は docs/recorder-plan.md に記録として残す
 - （その後）UVC/UAC化、専用基板化（battery.pngのLiPo基板拡張を含む）
 

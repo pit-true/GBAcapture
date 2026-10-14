@@ -349,6 +349,118 @@ static void test_split(void) {
   OK_EQ(gbac_split_new_file(&s, 0, 1LL << 40, 1LL << 40), 0);
 }
 
+/* ---------- 10. 実解像度 240x160 → 960x640 の OUYY ---------- */
+static uint16_t g_src[GBAC_WIDTH * GBAC_HEIGHT];
+static uint8_t g_ouyy[GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, GBAC_MAX_SCALE)];
+
+/* 白 1 画素を流すと、拡大後は scale x scale の白いブロックだけが 255 で
+ * 他は全部 0 のはず。最近傍(画素複製)以外の補間を混ぜていない検査。
+ * 書き残し(0xAA)を拾うのも兼ねる。 */
+static int block_ok(int sx, int sy, int scale) {
+  const int W = GBAC_WIDTH * scale, H = GBAC_HEIGHT * scale;
+  long bad = 0;
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++) {
+      int want = (x / scale == sx && y / scale == sy) ? 255 : 0;
+      if (ou_y(g_ouyy, W, y, x) != want) bad++;
+    }
+  for (int i = 0; i < GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, scale); i++)
+    if (g_ouyy[i] == 0xAA) bad++;
+  if (bad)
+    printf("  white(%d,%d) scale=%d で %d 箇所が想定と違う\n", sx, sy, scale, (int)bad);
+  return bad == 0;
+}
+
+static void test_scale_real(void) {
+  /* esp_h264 はエンコード後に g_encout へ esp_cache_msync(DIR_M2C) をかける。
+   * この方向は UNALIGNED フラグが使えず、アドレスとサイズがキャッシュラインの
+   * 倍数でないと ESP_ERR_INVALID_ARG を返して無効化が飛ぶ。P4 の L2 キャッシュ
+   * ラインは既定 128B。ラインが 64B でも 128B でも安全なことをここで固定する。
+   * 倍数でないと NAL が化けるのにエラーは出ない(silent corruption)。 */
+  OK_EQ(GBAC_OUYY_STRIDE(GBAC_WIDTH, 4), 960 * 3 / 2);
+  OK_EQ(GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 4), 921600);
+  OK_EQ(GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 4) % 128, 0);
+  OK_EQ(GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 2) % 128, 0);
+  OK_EQ(GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 1) % 128, 0);
+  /* 720x480 に落とす運用(64B ラインでも安全) */
+  OK_EQ(GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 3) % 64, 0);
+
+  int pos[][2] = {{0, 0}, {239, 159}, {120, 80}, {1, 0}, {0, 1}, {238, 158}};
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < GBAC_WIDTH * GBAC_HEIGHT; j++) g_src[j] = 0x0000;
+    g_src[pos[i][1] * GBAC_WIDTH + pos[i][0]] = 0xFFFF;
+    memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+    gbac_scale_ouyy(g_src, GBAC_WIDTH, GBAC_HEIGHT, 4, g_ouyy);
+    OK(block_ok(pos[i][0], pos[i][1], 4));
+  }
+
+  /* scale 1 と 2 でも複製位置がずれていない */
+  for (int j = 0; j < GBAC_WIDTH * GBAC_HEIGHT; j++) g_src[j] = 0x0000;
+  g_src[100 * GBAC_WIDTH + 77] = 0xFFFF;
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, GBAC_WIDTH, GBAC_HEIGHT, 1, g_ouyy);
+  OK(block_ok(77, 100, 1));
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, GBAC_WIDTH, GBAC_HEIGHT, 2, g_ouyy);
+  OK(block_ok(77, 100, 2));
+
+  /* 全面赤 0xF800 = RGB(255,0,0) → Y=76、U=85、V=255。
+   * 行の先頭バイトが偶数行で U、奇数行で V になっているか(640 行全部見る)。 */
+  for (int j = 0; j < GBAC_WIDTH * GBAC_HEIGHT; j++) g_src[j] = 0xF800;
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, GBAC_WIDTH, GBAC_HEIGHT, 4, g_ouyy);
+  const int stride = GBAC_OUYY_STRIDE(GBAC_WIDTH, 4);
+  int bad_uv = 0;
+  for (int row = 0; row < GBAC_HEIGHT * 4; row++)
+    if (g_ouyy[row * stride] != ((row & 1) ? 255 : 85)) bad_uv++;
+  OK_EQ(bad_uv, 0);
+  OK_EQ(ou_y(g_ouyy, 960, 300, 500), 76);
+  OK_EQ(ou_u(g_ouyy, 960, 150, 240), 85);
+  OK_EQ(ou_v(g_ouyy, 960, 150, 240), 255);
+  int left = 0;
+  for (int i = 0; i < GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 4); i++)
+    if (g_ouyy[i] == 0xAA) left++;
+  OK_EQ(left, 0);
+}
+
+/* ---------- 11. mp4 へ渡す pts が ms である前提 ---------- */
+/* esp_muxer のヘッダには pts の単位が書かれていない(min_packet_duration だけ
+ * が明示的に ms)。公式例は上位の esp_capture 経由で生の API を示さない。
+ * そこで映像も音声も ms で揃えている前提を、単調増加と重複なしとして
+ * ここで固定する。単位を間違えると A/V 同期が倍率でずれる。 */
+static void test_pts_ms(void) {
+  gbac_pts_t p;
+  gbac_pts_init(&p);
+  uint64_t us = 0;
+  uint32_t prev = 0;
+  int dup = 0, back = 0;
+  for (int i = 1; i <= 600; i++) {
+    OK_EQ(gbac_pts_push(&p, (uint8_t)(i & 0xFF), &us), 1);
+    uint32_t ms = (uint32_t)(us / 1000);
+    if (i > 1) {
+      if (ms == prev) dup++;
+      if (ms < prev) back++;
+    }
+    prev = ms;
+  }
+  OK_EQ(dup, 0);
+  OK_EQ(back, 0);
+  /* 600 枚 @ 59.7275fps = 10028ms。ベンチの mp4 を mp4check.py で読んだ時の
+   * 期待値でもある(mdhd の長さがこれと違えば pts の単位が違う) */
+  OK_EQ(prev, 10028);
+
+  /* AAC は 1024 サンプル = 21.33ms。ms に整数化しても重複しない */
+  uint32_t aprev = 0;
+  int adup = 0;
+  for (uint32_t i = 0, smp = 0; i < 3000; i++, smp += 1024) {
+    uint32_t ms = (uint32_t)((uint64_t)1000 * smp / 48000);
+    if (i && ms <= aprev) adup++;
+    aprev = ms;
+  }
+  OK_EQ(adup, 0);
+  OK_EQ(aprev, 63978);
+}
+
 #define RUN(f)             \
   do {                     \
     printf("-- %s\n", #f); \
@@ -366,6 +478,8 @@ int main(void) {
   RUN(test_resamp);
   RUN(test_pts);
   RUN(test_split);
+  RUN(test_scale_real);
+  RUN(test_pts_ms);
   printf("%d checks, %d failures\n", g_checks, g_fails);
   return g_fails ? 1 : 0;
 }
