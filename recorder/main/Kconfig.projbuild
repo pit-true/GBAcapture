@@ -17,6 +17,14 @@ menu "GBAcapture レコーダ"
             Low でオン)を駆動する GPIO。回路図で GPIO 番号が未確認のため
             既定は -1(TF は常時給電)。実機で判明したらここに番号を書く。
 
+    config GBAC_BRINGUP
+        bool "最小起動確認モード(USB・SD・エンコーダを初期化しない)"
+        default n
+        help
+            基板が起動しているかだけを見るモード。LED を 1 回点滅させ、
+            5 秒ごとに生存ログを出す。sdkconfig.bringup.defaults と組み合わせて
+            idf.py -B build-bringup でビルドする。
+
     config GBAC_ENABLE_MSC
         bool "PC に microSD を MSC として見せる(未実装)"
         default n

@@ -101,6 +101,19 @@ void app_main(void)
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
 
+#if CONFIG_GBAC_BRINGUP
+    /* 基板が起動しているかだけを見る。重い周辺は初期化しないので、
+     * PSRAM を切った設定(sdkconfig.bringup.defaults)でも動く。 */
+    ESP_LOGI(TAG, "BRINGUP モード。周辺機器は初期化しない");
+    while (1) {
+        gbac_led_blink(1, 200);
+        ESP_LOGI(TAG, "alive internal=%uKB psram=%uKB largest_int=%uKB",
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    }
+#endif
+
     frame_pipe_init();
     audio_pipe_init(g_cfg.volume_pct);
     gbac_button_init();

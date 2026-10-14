@@ -26,8 +26,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 # 5) シリアル書き込み(CH343P 経由。BOOT 保持で UART ブート)
-#    書き込みボーレートは idf.py -b 921600 で指定する(5.5 に BAUD の Kconfig は無い)。
+#    この基板には DTR/RTS→EN/RST の自動リセット回路が無い(実機で確認済み)。
+#    なので esptool にリセットをさせない。書き込み前に BOOT+RST でダウンロードモードへ入れ、
+#    書き込み後は RST を 1 回押して起動させる。
+#    既定の default_reset だと DTR/RTS を組み合わせて無駄に失敗する。
+CONFIG_ESPTOOLPY_BEFORE_NORESET=y
 #    ESPTOOLPY_AFTER_RESET は bool(既定 y = 書き込み後にハードリセット)。
+#    RTS がないので実際にはリセットされない。p4boot.py が RUN コマンドで起動させる。
 CONFIG_ESPTOOLPY_AFTER_RESET=y
 CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
 

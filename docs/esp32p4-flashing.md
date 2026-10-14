@@ -43,11 +43,42 @@ Set-Location C:\Users\korok\gba-capture\recorder
 idf.py -p COM6 flash
 ```
 
-`idf.py flash` は `--before default_reset --after hard_reset` で走るが、
-**default_reset はこのボードでは効かない**。ボードがダウンロードモードに入っていなければ
-接続に失敗する。失敗したら BOOT+RST を依頼する。
+`recorder/sdkconfig.defaults` で `CONFIG_ESPTOOLPY_BEFORE_NORESET=y` を設定している。
+既定の `default_reset` は DTR/RTS を組み合わせるが、**このボードにはその配線がないので必ず失敗する**。
+`no_reset` にすると「リセットを試みず、115200 で同期パケットを出す」だけになる。
+だから **BOOT+RST でダウンロードモードに入った直後**（この状態の ROM は 115200 で待っている）に
+実行すれば繋がる。
+
+**書き込みが成功しても、その後リセットはかからない。**
+`--after hard_reset` は RTS パルスを出すだけで、このボードでは何も起きないため、
+チップはダウンロードループに留まり、前回合意したボーで無言のままになる。
+これが「書き込みは成功したのにコンソールが 1 バイトも出ない」現象の説明になっている。
+
+起動させるには次のどちらかをする。
+
+- **RST を 1 回押して離す**（BOOT は押さない）。いちばん確実
+- `p4boot.py` の RUN コマンドで ROM に起動させる（上の復旧セクション）
 
 書き込みログに `Hash of data verified.` が 3 枚分出ていれば書き込み自体は成功している。
+
+## 起動確認の階段（何かおかしいとき）
+
+重い機能を全部止めた最小構成で、基板が起動するかだけを見る。
+
+```powershell
+. D:\esp\scripts\idf_env.ps1
+Set-Location C:\Users\korok\gba-capture\recorder
+idf.py -B build-bringup -D SDKCONFIG=build-bringup/sdkconfig `
+    -D SDKCONFIG_DEFAULTS=sdkconfig.bringup.defaults -p COM6 flash
+```
+
+`-D SDKCONFIG=...` を忘れると本体側の `recorder/sdkconfig` を書き換えてしまうので注意
+（ESP-IDF の SDKCONFIG の既定はビルドディレクトリではなくプロジェクト直下）。
+
+BRINGUP モードは PSRAM を切り、USB・SD・エンコーダを初期化せず、
+記録 LED を 1 回点滅させて 5 秒ごとに生存ログを出す。
+これで出なければ基板/電源/UART の問題、出れば本番設定の問題と切り分かれる。
+
 
 ## ボードの観察ポイント
 
@@ -72,5 +103,8 @@ idf.py -p COM6 flash
 ## 分かっていないこと（実機待ち）
 
 - 書き込み成功後にコンソールへ 1 バイトも出ない理由。
-  候補は (a) ROM がブートローダを起動できていない、(b) チップが給電不足で止まっている、
-  (c) アプリが極早期に止まっている。電源 LED と BOOT+RST の操作で切り分ける。
+  最有力は **書き込み後にリセットがかからず、ROM がダウンロードループで無言のまま**
+  というもの（RTS 配線がないため `--after hard_reset` が効かない）。
+  RST を 1 回押せばアプリが走るはず。それでも出なければ
+  (a) ROM がブートローダを起動できていない、(b) 給電不足、(c) アプリの極早期停止。
+  BRINGUP モードと電源 LED で切り分ける。
