@@ -31,3 +31,8 @@ esp_err_t gbac_usb_ping(int *fw_ver);
 
 uint32_t gbac_usb_packets(void);   /* 受信したパケット総数 */
 uint32_t gbac_usb_errors(void);    /* 転送エラー数 */
+
+/* HS コントローラのポート状態レジスタを出す。
+ * CS(port connect status)=0 なら D+ のプルアップを物理的に見ていない
+ * = ケーブル / PHY / 給電側。CS=1 なのに列挙しなければプロトコル側。 */
+void gbac_usb_dump_port(void);

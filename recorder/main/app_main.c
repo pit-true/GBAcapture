@@ -132,7 +132,7 @@ static void stop_pipe_test(void)
  * esptool が 460800 で ROM と握手できたので、PC→基板の RX 配線は実証済み。
  * これで RST ボタンやタクト SW に頼まず、PC 側から再起動・ベンチ・録画開始ができる。
  *   r = 再起動 / i = 状態表示 / b = エンコーダベンチ / t = 録画の ON・OFF
- *   s = SD 結線の総当たり / d = 書き込みモードで再起動 */
+ *   s = SD 結線の総当たり / u = USB ポートの状態レジスタ / d = 書き込みモードで再起動 */
 static void uart_cmd_init(void)
 {
     esp_err_t e = uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
@@ -195,6 +195,8 @@ static void uart_cmd_handle(char c)
         } else {
             gbac_sd_probe();
         }
+    } else if (c == 'u') {
+        gbac_usb_dump_port();
     } else if (c == 'd') {
         ESP_LOGI(TAG, "書き込みモードで再起動する(esptool がつながる)");
         enter_download_mode();
@@ -220,7 +222,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 総当たり d=書き込みモード");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 総当たり u=USB ポート d=書き込みモード");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);

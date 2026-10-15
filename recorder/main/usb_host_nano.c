@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"
+#include "soc/usb_dwc_struct.h"
 
 static const char *TAG = "usbnano";
 
@@ -217,6 +218,26 @@ esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
 int gbac_usb_ready(void)
 {
     return g_ready ? 1 : 0;
+}
+
+/* DWC2(HS, 0x50000000)のレジスタを直接読む。ホストライブラリの内部なので
+ * ポート状態を見る公開 API がない。読み取りだけなので起動中も安全。 */
+void gbac_usb_dump_port(void)
+{
+    usb_dwc_hprt_reg_t h = USB_DWC_HS.hprt_reg;
+    usb_dwc_gusbcfg_reg_t g = USB_DWC_HS.gusbcfg_reg;
+    usb_dwc_gotgctl_reg_t o = USB_DWC_HS.gotgctl_reg;
+
+    ESP_LOGI(TAG, "HPRT0=%08x CS=%d ENA=%d PWR=%d LNSTS=%d SPD=%d OVC=%d SUSP=%d RST=%d",
+             h.val, h.prtconnsts, h.prtena, h.prtpwr, h.prtlnsts, h.prtspd,
+             h.prtovrcurract, h.prtsusp, h.prtrst);
+    ESP_LOGI(TAG, "GUSBCFG=%08x phyif=%d ulpiutmisel=%d physel=%d forcehst=%d forcedev=%d",
+             g.val, g.phyif, g.ulpiutmisel, g.physel, g.forcehstmode, g.forcedevmode);
+    ESP_LOGI(TAG, "GOTGCTL=%08x asesvld=%d bsesvld=%d curmod=%d",
+             o.val, o.asesvld, o.bsesvld, o.curmod);
+    ESP_LOGI(TAG, "GSNPSID=%08x HFNUM=%08x GINTSTS=%08x GINTMSK=%08x",
+             USB_DWC_HS.gsnpsid_reg.val, USB_DWC_HS.hfnum_reg.val,
+             USB_DWC_HS.gintsts_reg.val, USB_DWC_HS.gintmsk_reg.val);
 }
 
 /* EP5 OUT に "GBAC"+コマンドを送る */
