@@ -120,7 +120,11 @@ static esp_err_t msc_teardown(void)
     }
     esp_err_t e2 = tinyusb_driver_uninstall();
     if (e2 != ESP_OK) {
-        ESP_LOGE(TAG, "tinyusb_driver_uninstall %s", esp_err_to_name(e2));
+        /* esp_tinyusb 1.7.x は tusb_teardown()(= tusb_deinit(0))を呼ぶが、
+         * P4 の HS は rhport1 なので必ず失敗する。
+         * recorder/scripts/patch_esp_tinyusb.ps1 を当てていないとここが壊れる。 */
+        ESP_LOGE(TAG, "tinyusb_driver_uninstall %s (patch_esp_tinyusb.ps1 は当たっている?)",
+                 esp_err_to_name(e2));
         e = e2;
     }
     return e;

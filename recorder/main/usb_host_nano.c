@@ -489,7 +489,9 @@ esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
      * limit (256)" となり interface_claim が失敗した(実機で確認)。
      * fifo_settings_custom は使わない(総行数のレジスタは install 前に読めない)。 */
     esp_err_t e = usb_host_install(&hcfg);
-    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+    if (e != ESP_OK) {
+        /* ここを握りつぶすと usb_lib タスクだけ立って
+         * lib_handle_events が ESP_ERR_INVALID_STATE を垂れ流す(r13 実測)。 */
         ESP_LOGE(TAG, "usb_host_install %s", esp_err_to_name(e));
         return e;
     }

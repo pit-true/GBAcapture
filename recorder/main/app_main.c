@@ -381,8 +381,14 @@ static void uart_cmd_handle(char c)
         if (gbac_msc_active()) {
             esp_err_t e = gbac_msc_stop();
             ESP_LOGI(TAG, "MSC 解除(%s)", esp_err_to_name(e));
-            esp_err_t e2 = gbac_usb_start(on_packet, NULL);
-            ESP_LOGI(TAG, "USB ホスト復旧(%s)", esp_err_to_name(e2));
+            if (e != ESP_OK) {
+                /* OTG PHY が残ったままだとホストをもう一度立てられない。
+                 * ここで無理にやると usb_lib タスクだけ動いてログが洪水になる。 */
+                ESP_LOGE(TAG, "TinyUSB が畳みきれない。'd' で書き込みモードか電源入れ直し");
+            } else {
+                esp_err_t e2 = gbac_usb_start(on_packet, NULL);
+                ESP_LOGI(TAG, "USB ホスト復旧(%s)", esp_err_to_name(e2));
+            }
         } else {
             if (g_recording) {
                 stop_recording();
