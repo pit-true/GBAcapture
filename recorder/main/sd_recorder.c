@@ -57,6 +57,7 @@ static int g_w = 960;
 static int g_h = 640;
 static int g_in_bytes;
 static int g_out_bytes;
+static int g_pcm_cap;           /* g_pcm の容量(バイト)。1 フレーム分以上必要 */
 static int g_pcm_fill;
 static int16_t *g_pcm;
 static uint8_t *g_aacbuf;
@@ -564,7 +565,10 @@ static void encode_audio(int bytes)
         g_a_zero++;
     }
     if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && g_muxer) {
-        uint32_t ms = (uint32_t)((uint64_t)1000 * g_audio_samples / AAC_RATE);
+        /* リング溢れで捨てた分も時間として数える。捨てた分を無視すると
+         * 音声の pts が実際の時刻より前にずれ、映像と音がずれる。 */
+        uint32_t drop = audio_pipe_dropped_pairs();
+        uint32_t ms = (uint32_t)((uint64_t)1000 * (g_audio_samples + drop) / AAC_RATE);
         esp_muxer_audio_packet_t ap = {
             .data = g_aacbuf,
             .len = (int)out.encoded_bytes,
@@ -593,10 +597,13 @@ static void pump_audio(bool flush)
 {
     /* mux_task のループは SD 書き込みで 1 回 200ms 止まることもある。
      * 1 回につき AAC を 1 本しか作らないと 46.9 本/秒に足りず、
-     * mp4 の音声が数本しか入らない。読み出せるだけ読み出して符号化する。 */
+     * mp4 の音声が数本しか入らない。読み出せるだけ読み出して符号化する。
+     * 部屋は g_pcm_cap(2 フレーム分)の空きだけ渡す。1 フレームちょうどの部屋だと、
+     * リサンプルの出力に小数の残りが出て 1023 ペアまで進んだところで部屋が 1 ペアになり、
+     * 部屋を埋める入力が 0 に切り捨てられて AAC に 1 本も渡らなかった(r8 の 音声=1)。 */
     for (;;) {
-        while (g_pcm_fill < g_in_bytes) {
-            int room = g_in_bytes - g_pcm_fill;
+        while (g_pcm_fill + g_in_bytes <= g_pcm_cap) {
+            int room = g_pcm_cap - g_pcm_fill;
             int got = audio_pipe_read(g_pcm + g_pcm_fill / 2, room / 4);
             if (got <= 0) {
                 break;
@@ -608,10 +615,7 @@ static void pump_audio(bool flush)
         if (g_pcm_fill < g_in_bytes) {
             break;
         }
-        encode_audio(g_in_bytes);
-    }
-    while (g_pcm_fill >= g_in_bytes) {
-        encode_audio(g_in_bytes);
+        encode_audio(g_in_bytes); /* 余りは encode_audio が先頭へ寄せる */
     }
     if (flush && g_pcm_fill > 0) {
         int have = g_pcm_fill;
@@ -891,7 +895,10 @@ static esp_err_t aac_open(void)
         g_aac = NULL;
         return ESP_FAIL;
     }
-    g_pcm = malloc((size_t)g_in_bytes + 8);
+    /* PCM の部屋は AAC 1 フレーム分の 2 倍。ちょうどの大きさだと
+     * (1023 ペアで止まる不具合)読み出しが永久に止まる。 */
+    g_pcm_cap = g_in_bytes * 2;
+    g_pcm = malloc((size_t)g_pcm_cap + 8);
     g_aacbuf = malloc((size_t)g_out_bytes + 64);
     if (!g_pcm || !g_aacbuf) {
         return ESP_ERR_NO_MEM;

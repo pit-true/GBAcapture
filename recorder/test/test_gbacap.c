@@ -357,6 +357,164 @@ static void test_resamp(void) {
   OK(total >= 700 && total <= 704);
 }
 
+/* ---------- 7b. AAC 1 フレームちょうどの部屋では詰まらない(実機バグ) ----------
+ * 実機(r8)では g_pcm を g_in_bytes=4096B(1024 ペア)ちょうどだけ確保し、
+ * そこへ audio_pipe_read を呼んでいた。リサンプルの出力は小数の残りが出るため
+ * 1023 ペアまで進んだところで部屋が 1 ペアになり、入力個数が 0 に切り捨てられて
+ * 打ち切り。以後 4096B に届かず AAC は 1 本きり(音声=1)になった。
+ * 部屋を 2 フレーム分にして「1 フレーム分以上溜まったら出す」形にすると回る。 */
+static int16_t s_rr_in[2 * 64];
+static int16_t s_rr_out[2 * 4096];
+
+/* audio_pipe.c の読み出し方針と同じ形(入力個数だけ新 API を使う) */
+static int rr_read(gbac_resamp_t *rs, int max_pairs)
+{
+  int produced = 0;
+  while (produced < max_pairs) {
+    int room = max_pairs - produced;
+    int n = gbac_resamp_in_pairs(room, rs);
+    if (n == 0) {
+      break;
+    }
+    if (n > 64) {
+      n = 64;
+    }
+    int got = gbac_resamp_run(rs, s_rr_in, n, s_rr_out + produced * 2, room);
+    if (got == 0) {
+      break;
+    }
+    produced += got;
+  }
+  return produced;
+}
+
+/* 部屋 room を n 個の入力で埋める呼び出しを、部屋を 1 ペアずつ変えて繰り返す。
+ * n 個の入力は n*48000/32802 +1 個まで出力するので、n が大きすぎると max_out で
+ * 途中で打ち切られ、pos_q16 が span 未満のまま残る。次の呼び出しは新しい入力の
+ * 先頭ではなく前の位置から読み始めるので、入力の大半を飛ばす
+ * (r9: 入力 20.5 秒分に対し AAC 14.0 秒分 = 3 割欠け)。 */
+static int16_t s_tt_in[2 * 1024];
+static int16_t s_tt_out[2 * 1024];
+
+static void test_resamp_tail(void)
+{
+  gbac_resamp_t rs;
+  for (int i = 0; i < 1024; i++) {
+    s_tt_in[i * 2] = 300;
+    s_tt_in[i * 2 + 1] = -300;
+  }
+  for (int room = 2; room <= 1024; room++) {
+    gbac_resamp_init(&rs, 32802, 48000);
+    int n = gbac_resamp_in_pairs(room, &rs);
+    OK(n > 0);
+    int got = gbac_resamp_run(&rs, s_tt_in, n, s_tt_out, room);
+    OK(got > 0);
+    OK(got <= room);
+    /* 入力を最後まで使い切っていなければならない。
+     * 必要な出力個数は ceil(span/step)。max_out で途中で切れるとこれに届かず、
+     * pos_q16 が span を越えずに残って次の入力の大半を飛ばす。 */
+    uint32_t span = ((uint32_t)n) << 16;
+    uint32_t need = (span + rs.step_q16 - 1) / rs.step_q16;
+    OK(((uint32_t)got) >= need);
+  }
+}
+
+/* 入力にランプ(ペア i の値 = i)を与えて、補間が入力を飛ばさないことを見る。
+ * 飛ばすと出力の値が急に飛ぶ。比も 48000/32802 から外れる。 */
+static int16_t s_ns_in[2 * 64];
+static int16_t s_ns_out[2 * 1024];
+
+static void test_resamp_no_skip(void)
+{
+  gbac_resamp_t rs;
+  gbac_resamp_init(&rs, 32802, 48000);
+  int gi = 0, produced = 0, consumed = 0, maxjump = 0, prev = 0, have_prev = 0;
+  for (int c = 0; c < 400; c++) {
+    int room = 2 + (c * 37) % 1023;
+    int n = gbac_resamp_in_pairs(room, &rs);
+    if (n > 64) {
+      n = 64; /* audio_pipe_read と同じ上限 */
+    }
+    OK(n > 0);
+    for (int i = 0; i < n; i++) {
+      s_ns_in[i * 2] = (int16_t)(gi + i);
+      s_ns_in[i * 2 + 1] = (int16_t)(gi + i);
+    }
+    gi += n;
+    consumed += n;
+    int got = gbac_resamp_run(&rs, s_ns_in, n, s_ns_out, room);
+    OK(got > 0);
+    for (int i = 0; i < got; i++) {
+      int v = s_ns_out[i * 2];
+      if (have_prev && v - prev > maxjump) {
+        maxjump = v - prev;
+      }
+      prev = v;
+      have_prev = 1;
+      produced++;
+    }
+  }
+  OK(maxjump <= 1); /* 補間なので 1 ペア分以上は飛ばさない */
+  OK(produced * 32802 >= consumed * 48000 - 48000);
+  OK(produced * 32802 <= consumed * 48000 + 48000);
+}
+
+static void test_resamp_room(void)
+{
+  gbac_resamp_t rs;
+  for (int i = 0; i < 64; i++) {
+    s_rr_in[i * 2] = 1000;
+    s_rr_in[i * 2 + 1] = -1000;
+  }
+
+  /* 入力個数: 部屋が小さすぎたら 0(呼びに出るな)を返す */
+  gbac_resamp_init(&rs, 32802, 48000);
+  OK_EQ(gbac_resamp_in_pairs(0, &rs), 0);
+  OK_EQ(gbac_resamp_in_pairs(1, &rs), 0);
+  OK_EQ(gbac_resamp_in_pairs(2, &rs), 1);
+  OK_EQ(gbac_resamp_in_pairs(1024, &rs), 699);
+
+  /* 部屋 1 フレームちょうど: 1 本も作れない(r8 の症状) */
+  gbac_resamp_init(&rs, 32802, 48000);
+  int fill = 0, enc = 0, calls = 0;
+  for (int it = 0; it < 50; it++) {
+    int got = rr_read(&rs, 1024 - fill);
+    if (got == 0) {
+      break;
+    }
+    calls++;
+    fill += got;
+    if (fill >= 1024) {
+      enc++;
+      fill -= 1024;
+    }
+  }
+  OK_EQ(enc, 0);
+  OK_EQ(fill, 1023); /* 1024 ペアに 1 ペア届かない */
+  /* 残り 1 ペアを埋める入力個数が 0 なので、次も 0 を返して永久に止まる */
+  OK_EQ(rr_read(&rs, 1024 - fill), 0);
+
+  /* 部屋 2 フレーム分: AAC が回り続ける(直し方) */
+  gbac_resamp_init(&rs, 32802, 48000);
+  fill = 0;
+  enc = 0;
+  calls = 0;
+  for (int it = 0; it < 200; it++) {
+    int got = rr_read(&rs, 2048 - fill);
+    if (got == 0) {
+      break;
+    }
+    calls++;
+    fill += got;
+    while (fill >= 1024) {
+      enc++;
+      fill -= 1024;
+    }
+  }
+  OK_EQ(calls, 200);
+  OK(enc >= 8); /* 200 回 × 約 93 ペア ÷ 1024 ≒ 18 本 */
+}
+
 /* ---------- 8. PTS ---------- */
 static void test_pts(void) {
   gbac_pts_t p;
@@ -531,6 +689,20 @@ static void test_scale_real(void) {
  * が明示的に ms)。公式例は上位の esp_capture 経由で生の API を示さない。
  * そこで映像も音声も ms で揃えている前提を、単調増加と重複なしとして
  * ここで固定する。単位を間違えると A/V 同期が倍率でずれる。 */
+/* seq(8bit 循環)の飛び幅 = 失われたパケット数。
+ * 重複や逆行は飛びと数えない(0)。r9 で音声 6 秒分がどこへ行ったか測るため。 */
+static void test_seq_gap(void)
+{
+  OK_EQ(gbac_seq_gap(0, 1), 0);
+  OK_EQ(gbac_seq_gap(0, 2), 1);
+  OK_EQ(gbac_seq_gap(255, 0), 0);
+  OK_EQ(gbac_seq_gap(255, 1), 1);
+  OK_EQ(gbac_seq_gap(10, 10), 0); /* 重複 */
+  OK_EQ(gbac_seq_gap(10, 9), 0);  /* 逆行 */
+  OK_EQ(gbac_seq_gap(100, 110), 9);
+  OK_EQ(gbac_seq_gap(0, 128), 127);
+}
+
 static void test_pts_ms(void) {
   gbac_pts_t p;
   gbac_pts_init(&p);
@@ -579,10 +751,14 @@ int main(void) {
   RUN(test_scale);
   RUN(test_audio_fx);
   RUN(test_resamp);
+  RUN(test_resamp_room);
+  RUN(test_resamp_tail);
+  RUN(test_resamp_no_skip);
   RUN(test_pts);
   RUN(test_pts_back);
   RUN(test_split);
   RUN(test_scale_real);
+  RUN(test_seq_gap);
   RUN(test_pts_ms);
   printf("%d checks, %d failures\n", g_checks, g_fails);
   return g_fails ? 1 : 0;

@@ -72,18 +72,27 @@ static uint8_t g_ring[RXRING_SLOTS][GBAC_PACKET_SIZE] __attribute__((aligned(32)
 static volatile uint32_t g_wr;
 static volatile uint32_t g_rd;
 static uint32_t g_ring_drop;   /* リングが満杯で捨てたパケット */
+/* リング投入の成否を EP 別・種別(映像/音声)別に数える。
+ * r9 で ring の溢れが 6 万パケットを超え、音声の 6 秒分がここで消えている疑い
+ * (監督 2026-10-16 02:57 指示)。音声は 683 パケット/秒だけなので、
+ * 溢れに巻き込まれる割合を測る。 */
+static uint32_t g_put_ok[MAX_RX_EP];
+static uint32_t g_put_drop[MAX_RX_EP];
+static uint32_t g_put_audio_ok;
+static uint32_t g_put_audio_drop;
 static SemaphoreHandle_t g_ring_sem;
 
-static void ring_put(const uint8_t *p)
+static int ring_put(const uint8_t *p)
 {
     uint32_t wr = g_wr;   /* 書き手は usbh タスクだけ */
     if (wr - __atomic_load_n(&g_rd, __ATOMIC_ACQUIRE) >= RXRING_SLOTS) {
         g_ring_drop++;
-        return;
+        return 0;
     }
     memcpy(g_ring[wr & RXRING_MASK], p, GBAC_PACKET_SIZE);
     __atomic_store_n(&g_wr, wr + 1, __ATOMIC_RELEASE);
     xSemaphoreGive(g_ring_sem);
+    return 1;
 }
 
 static void reasm_feed(int ep, const uint8_t *src, int len)
@@ -111,7 +120,14 @@ static void reasm_feed(int ep, const uint8_t *src, int len)
         const uint8_t *p = b + pos;
         if ((p[0] == GBAC_LINE_MAGIC && p[3] == 0 && p[2] < GBAC_LINES_PER_FRAME) ||
             (p[0] == GBAC_AUDIO_MAGIC && p[3] == 0 && p[2] > 0 && p[2] <= 120)) {
-            ring_put(p);
+            int aud = (p[0] == GBAC_AUDIO_MAGIC);
+            if (ring_put(p)) {
+                g_put_ok[ep]++;
+                if (aud) g_put_audio_ok++;
+            } else {
+                g_put_drop[ep]++;
+                if (aud) g_put_audio_drop++;
+            }
             pos += GBAC_PACKET_SIZE;
         } else {
             pos++;    /* マジック再同期 */
@@ -510,6 +526,30 @@ uint32_t gbac_usb_ring_dropped(void)
 uint32_t gbac_usb_reasm_lost(void)
 {
     return g_reasm_lost;
+}
+
+/* rx リングへ入れた/捨てたパケット数。ep は g_rx_ep の添字(0..gbac_usb_ep_count-1)。
+ * 音声(0xA6)は種別で別カウントして、溢れに音声がどれだけ巻き込まれているか見る。 */
+void gbac_usb_put_stats(int ep, uint32_t *ok, uint32_t *drop)
+{
+    if (ep < 0 || ep >= MAX_RX_EP) {
+        if (ok) *ok = 0;
+        if (drop) *drop = 0;
+        return;
+    }
+    if (ok) *ok = g_put_ok[ep];
+    if (drop) *drop = g_put_drop[ep];
+}
+
+void gbac_usb_put_audio(uint32_t *ok, uint32_t *drop)
+{
+    if (ok) *ok = g_put_audio_ok;
+    if (drop) *drop = g_put_audio_drop;
+}
+
+uint32_t gbac_usb_audio_dropped(void)
+{
+    return g_put_audio_drop;
 }
 
 /* rx タスクがパケット処理に使った時間(µs 累計)と処理個数。

@@ -26,6 +26,11 @@ static int16_t clamp16(int v) {
   return (int16_t)v;
 }
 
+int gbac_seq_gap(uint8_t prev, uint8_t now) {
+  unsigned d = (unsigned)(uint8_t)(now - prev - 1);
+  return d >= 128 ? 0 : (int)d;
+}
+
 void gbac_audio_fx_init(gbac_audio_fx_t *fx, float volume) {
   fx->dc_l = 0.0f;
   fx->dc_r = 0.0f;
@@ -60,6 +65,20 @@ void gbac_resamp_init(gbac_resamp_t *rs, int in_rate, int out_rate) {
   rs->last_l = 0;
   rs->last_r = 0;
   rs->have_last = 0;
+}
+
+/* 出力部屋 room_pairs を埋めるのに必要な入力ペア数。
+ * 部屋が 1 ペアだと 32802/48000 倍が 0 に切り捨てられて 1 つも作れず、
+ * 呼び出し側が「あと 1 ペア」で永久に止まる(実機で AAC が 1 本きりになった)。
+ * 0 を返すときは呼び出し側が読み出しに出ないこと。
+ * n 個の入力は n*48000/32802 + 1 個まで出力するので、(room-1) 倍で切る。
+ * room 倍だと 1 個はみ出して gbac_resamp_run が max_out で途中終了し、
+ * pos_q16 が span 未満のまま残って次の入力の大半を飛ばした
+ * (r9: 入力 20.5 秒分に対し AAC 14.0 秒分)。 */
+int gbac_resamp_in_pairs(int room_pairs, const gbac_resamp_t *rs) {
+  if (room_pairs < 2 || rs->step_q16 == 0) return 0;
+  int n = (int)(((int64_t)(room_pairs - 1) * (int64_t)rs->step_q16) >> 16);
+  return n > 0 ? n : 1;
 }
 
 static void pick_pair(const int16_t *in, int pairs, int idx, int16_t *l,

@@ -39,6 +39,11 @@ int gbac_usb_ep_addr(int idx);
 uint32_t gbac_usb_errors(void);    /* 転送エラー数 */
 uint32_t gbac_usb_ring_dropped(void);  /* リング満杯で捨てたパケット */
 uint32_t gbac_usb_reasm_lost(void);    /* 再組み立てが壊れて捨てたバイト */
+/* rx リングへ入れた/捨てたパケット数。ep は受信 EP の並び順の添字。
+ * 音声(0xA6)は種別で別カウント(r9 で音声 6 秒分の欠落がここで起きている疑い) */
+void gbac_usb_put_stats(int ep, uint32_t *ok, uint32_t *drop);
+void gbac_usb_put_audio(uint32_t *ok, uint32_t *drop);
+uint32_t gbac_usb_audio_dropped(void);  /* rx リング溢れで捨てた音声パケット数 */
 /* rx タスクがパケット処理に使った µs 累計と個数(NULL で省略可)。
  * 割ることで 1 パケットの原価が出る */
 void gbac_usb_rx_prof(int64_t *video_us, int64_t *audio_us,

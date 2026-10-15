@@ -58,6 +58,10 @@ static int64_t g_run_us;        /* 録画/テスト開始時刻。0 = 止まっ�
 static uint32_t g_run_bytes;    /* 開始時の受信バイト累計 */
 static int64_t g_smp_us;        /* 前回サンプル時刻 */
 static uint32_t g_smp_bytes, g_smp_pkts, g_smp_ring, g_smp_fok, g_smp_fdrop;
+/* 音声入力側の 1 秒計測(監督 2026-10-16 02:57 指示)。
+ * 32,802 ペア/秒 = 683.4 パケット/秒が rx 側から届いているか、
+ * seq の飛び幅(=失われたパケット数)が 1 秒にどれだけ出るかを見る。 */
+static uint32_t g_smp_apkt, g_smp_apair, g_smp_aseqlost, g_smp_aadrop;
 static double g_rate_mbs;       /* 直近 1 秒の MB/s */
 
 static void run_begin(void)
@@ -70,6 +74,11 @@ static void run_begin(void)
     g_smp_ring = gbac_usb_ring_dropped();
     g_smp_fok = frame_pipe_completed();
     g_smp_fdrop = frame_pipe_dropped();
+    g_smp_apkt = audio_pipe_pushed_pkts();
+    g_smp_apair = audio_pipe_pushed_pairs();
+    g_smp_aseqlost = audio_pipe_seq_lost();
+    g_smp_aadrop = 0;
+    gbac_usb_put_audio(NULL, &g_smp_aadrop);
     g_rate_mbs = 0;
 }
 
@@ -107,12 +116,27 @@ static void sample_1s(void)
              (unsigned long long)(ring - g_smp_ring),
              (unsigned long long)(fok - g_smp_fok),
              (unsigned long long)(fdrop - g_smp_fdrop));
+    /* 音声入力: in=audio_pipe まで届いたパケット数、pairs=入力ペア数
+     * (32,802 ペア/秒が目標)、seqlost=seq の飛び幅の合計(=失われたパケット数)、
+     * rxadrop=USB rx リングの溢れで捨てた音声パケット数 */
+    uint32_t apk = audio_pipe_pushed_pkts(), apa = audio_pipe_pushed_pairs();
+    uint32_t asl = audio_pipe_seq_lost(), aad = 0;
+    gbac_usb_put_audio(NULL, &aad);
+    ESP_LOGI(TAG, "1s aud in=%llu(%.0f/s) pairs=%llu(%.0f/s) seqlost=%llu rxadrop+=%llu",
+             (unsigned long long)(apk - g_smp_apkt), (double)(apk - g_smp_apkt) / dt,
+             (unsigned long long)(apa - g_smp_apair), (double)(apa - g_smp_apair) / dt,
+             (unsigned long long)(asl - g_smp_aseqlost),
+             (unsigned long long)(aad - g_smp_aadrop));
     g_smp_us = now;
     g_smp_bytes = b;
     g_smp_pkts = p;
     g_smp_ring = ring;
     g_smp_fok = fok;
     g_smp_fdrop = fdrop;
+    g_smp_apkt = apk;
+    g_smp_apair = apa;
+    g_smp_aseqlost = asl;
+    g_smp_aadrop = aad;
 }
 
 /* 起動時にチップとヒープを出す。rev1_3 プロファイルが実機(v1.3)と
@@ -134,13 +158,16 @@ static void show_board(void)
  * どれか 1 本が黙っているとフレームが組立たない。切り分け用に常時出す。 */
 static const char *usb_ep_stats(void)
 {
-    static char buf[96];
+    static char buf[128];
     int n = gbac_usb_ep_count();
     int off = 0;
     for (int i = 0; i < n && off < (int)sizeof(buf) - 20; i++) {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%02x=%llu ",
+        uint32_t ok = 0, drop = 0;
+        gbac_usb_put_stats(i, &ok, &drop);
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%02x=%llu/%llu/%llu ",
                         gbac_usb_ep_addr(i),
-                        (unsigned long long)gbac_usb_ep_packets(i));
+                        (unsigned long long)gbac_usb_ep_packets(i),
+                        (unsigned long long)ok, (unsigned long long)drop);
     }
     if (off >= (int)sizeof(buf)) {
         off = (int)sizeof(buf) - 1;
@@ -155,7 +182,7 @@ static void show_status(void)
     uint32_t vn = 0, an = 0;
     gbac_usb_rx_prof(&vus, &aus, &vn, &an);
     double t_run = g_run_us ? (double)(esp_timer_get_time() - g_run_us) / 1e6 : 0.0;
-    ESP_LOGI(TAG, "sd=%d rec=%d free=%lluMB | usb pkts=%llu bytes=%lluKB err=%llu unk=%llu ring=%llu lost=%llu ep[%s] | frame ok=%llu drop=%llu ldrop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus | mux=%s %.1fs",
+    ESP_LOGI(TAG, "sd=%d rec=%d free=%lluMB | usb pkts=%llu bytes=%lluKB err=%llu unk=%llu ring=%llu lost=%llu ep[rx/put/drop %s] | frame ok=%llu drop=%llu ldrop=%llu | aud in=%llu pairs=%llu seqlost=%llu rxadrop=%llu gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus | mux=%s %.1fs",
              gbac_sd_ready(), g_recording ? 1 : 0,
              (unsigned long long)gbac_rec_sd_free_mb(),
              (unsigned long long)gbac_usb_packets(),
@@ -167,6 +194,10 @@ static void show_status(void)
              usb_ep_stats(),
              (unsigned long long)frame_pipe_completed(), (unsigned long long)frame_pipe_dropped(),
              (unsigned long long)frame_pipe_dropped_lines(),
+             (unsigned long long)audio_pipe_pushed_pkts(),
+             (unsigned long long)audio_pipe_pushed_pairs(),
+             (unsigned long long)audio_pipe_seq_lost(),
+             (unsigned long long)gbac_usb_audio_dropped(),
              (unsigned long long)audio_pipe_gaps(), (unsigned long long)audio_pipe_overruns(),
              (unsigned long long)gbac_enc_frames(), (unsigned long long)gbac_enc_errors(),
              (unsigned)gbac_enc_scale_us_max(), (unsigned)gbac_enc_enc_us_max(),

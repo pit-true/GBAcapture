@@ -44,6 +44,10 @@ typedef struct {
 
 int gbac_audio_parse(const uint8_t *pkt, size_t len, gbac_audio_t *out);
 
+/* seq(8bit 循環)の飛び幅 = 失われたパケット数。連続なら 0。
+ * 重複や逆行(半周以上戻る)は飛びと数えないので 0。 */
+int gbac_seq_gap(uint8_t prev, uint8_t now);
+
 /* ---- ピクセル復号 (host/gbacap/PixelDecoder.cs と同一) ----
  * サンプルの bit2=赤bit0(LDR1), bit6=赤bit1(LDR2)。bit7 は未使用。 */
 uint16_t gbac_decode_rgb565(uint16_t sample);
@@ -131,6 +135,10 @@ typedef struct {
 } gbac_resamp_t;
 
 void gbac_resamp_init(gbac_resamp_t *rs, int in_rate, int out_rate);
+/* 出力部屋 room_pairs ペアを埋めるのに必要な入力ペア数。
+ * 部屋が 1 ペアだと in/out 倍が 0 に切り捨てられて何も作れないので 0 を返す。
+ * 0 を返したら呼び出し側は読み出しに出ないこと(届かない待ち方で止まる)。 */
+int gbac_resamp_in_pairs(int room_pairs, const gbac_resamp_t *rs);
 /* in: 2*pairs int16 [左,右]。out に最大 max_out ペア。戻り値: 生成ペア数 */
 int gbac_resamp_run(gbac_resamp_t *rs, const int16_t *in, int pairs,
                     int16_t *out, int max_out);
