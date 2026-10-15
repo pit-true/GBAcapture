@@ -262,8 +262,15 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
              g_W, g_H, g_scale, (int)cfg->bitrate_kbps, bench_frames);
     /* gbac_scale_ouyy だけで約 4.2KB のスタックを使う。実機(2026-10-14)で
      * 4096 バイトだと "Stack protection fault" で落ちたので 12KB にした。
-     * 終了時に high water mark を出すので、それで実際の必要量が分かる。*/
-    xTaskCreatePinnedToCore(enc_task, "enc", 12288, NULL, 5, &g_task, 1);
+     * 終了時に high water mark を出すので、それで実際の必要量が分かる。
+     *
+     * コアは 0 へ移した(2026-10-16 r9/r10 実測)。core1 に置くと enc(prio5)が
+     * 1 フレーム 40〜113ms 走り続けて rx(prio4)を starvationさせ、USB rx リング
+     * (128 枠=9ms)が溢れて r9 では 61,763 パケット、うち音声約 4,100 パケット
+     * (6 秒分)が捨てられていた。rx は 1 パケット 26µs で CPU 26% なので、
+     * 同一コアに重い enc を置くこと自体が問題。
+     * core0 の上位(usb_lib=22, usbh=21)は enc(prio5)より上なので USB 受信は邪魔されない。 */
+    xTaskCreatePinnedToCore(enc_task, "enc", 12288, NULL, 5, &g_task, 0);
     return ESP_OK;
 }
 

@@ -28,6 +28,13 @@ static void *g_cb_arg;
 static usb_host_client_handle_t g_client;
 static usb_device_handle_t g_dev;
 static volatile bool g_ready;
+/* MSC へ切り替えるとき、ホスト側を素直に畳むための合図。
+ * usb_host_uninstall は「client が全解除」「lib のイベント残が 0」でないと
+ * ESP_ERR_INVALID_STATE で弾くので、client/lib のタスクは自分のループを
+ * 抜けてから消えなければならない(抜ける合図は unblock で起こす)。 */
+static volatile bool g_stop_tasks;
+static volatile bool g_client_dead, g_lib_dead;
+static TaskHandle_t g_rx_task;
 static uint32_t g_pkts;
 static uint32_t g_errs;
 static uint32_t g_bytes;      /* 転送で受け取ったバイト数の合計 */
@@ -176,7 +183,7 @@ static void rx_cb(usb_transfer_t *t)
         g_errs++;
     }
 
-    if (g_dev != NULL && usb_host_transfer_submit(t) != ESP_OK) {
+    if (!g_stop_tasks && g_dev != NULL && usb_host_transfer_submit(t) != ESP_OK) {
         g_errs++;
     }
 }
@@ -297,6 +304,30 @@ static void client_task(void *arg)
     (void)arg;
     for (;;) {
         usb_host_client_handle_events(g_client, portMAX_DELAY);
+        if (!g_stop_tasks) {
+            continue;
+        }
+        /* 抜ける合図が来た。デバイスを閉じるのは「抜かれた時」と同じ
+         * 自分のコンテキストでやる(転送の取り消しコールバックは
+         * handle_events の中でしか呼ばれないので、ここで拾い切る)。 */
+        if (g_dev != NULL) {
+            usb_host_interface_release(g_client, g_dev, 0);
+            usb_host_device_close(g_client, g_dev);
+            g_dev = NULL;
+        }
+        g_ready = false;
+        for (int i = 0; i < 10; i++) {
+            usb_host_client_handle_events(g_client, pdMS_TO_TICKS(20));
+        }
+        /* client の登録解除も自分のタスクから行うのが IDF の流儀
+         * (handle_events の途中でないと handling_events フラグが下りない) */
+        esp_err_t e = usb_host_client_deregister(g_client);
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "client_deregister %s", esp_err_to_name(e));
+        }
+        g_client = NULL;
+        g_client_dead = true;
+        vTaskDelete(NULL);
     }
 }
 
@@ -346,25 +377,59 @@ static void usb_lib_task(void *arg)
         if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
             ESP_LOGI(TAG, "全デバイス解放済み");
         }
+        if (g_stop_tasks) {
+            /* uninstall は process_pending_flags / lib_event_flags / flags が
+             * 全部 0 でないと弾かれる。残イベントをここで消化してから抜ける。 */
+            for (int i = 0; i < 6; i++) {
+                uint32_t f2 = 0;
+                if (usb_host_lib_handle_events(pdMS_TO_TICKS(30), &f2) == ESP_ERR_TIMEOUT) {
+                    break;
+                }
+                if (f2 & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+                    usb_host_device_free_all();
+                }
+            }
+            g_lib_dead = true;
+            vTaskDelete(NULL);
+        }
     }
 }
 
 esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
 {
-    g_cb = cb;
-    g_cb_arg = arg;
-    g_reply_sem = xSemaphoreCreateBinary();
-    g_ring_sem = xSemaphoreCreateCounting(RXRING_SLOTS, 0);
+    /* cb が NULL のときは前のコールバックをそのまま使う
+     * (MSC からのロールバックでホストだけ戻すときに渡すため) */
+    if (cb) {
+        g_cb = cb;
+        g_cb_arg = arg;
+    }
+    g_stop_tasks = false;
+    g_client_dead = false;
+    g_lib_dead = false;
+    if (g_reply_sem == NULL) {
+        g_reply_sem = xSemaphoreCreateBinary();
+    }
+    if (g_ring_sem == NULL) {
+        g_ring_sem = xSemaphoreCreateCounting(RXRING_SLOTS, 0);
+    }
     if (g_ring_sem == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    /* 重い仕事(復号・フレーム書き込み)は core1 の rx でやる。
+    /* MSC から戻ってきたときはリングに残った古いパケットを捨てて始める
+     * (rx タスクは生きたまま sem を待っているだけなので、読み位置を進めるだけ) */
+    g_rd = __atomic_load_n(&g_wr, __ATOMIC_ACQUIRE);
+    while (xSemaphoreTake(g_ring_sem, 0) == pdTRUE) {
+    }
+    /* rx タスクは 1 本だけ。停止しても消さないので、使い回す。
+     * 重い仕事(復号・フレーム書き込み)は core1 の rx でやる。
      * 優先度は enc(5) より下にする: rx(6) のときは rx が core1 を占有して
      * enc が動かず IDLE1 まで飢えて task_wdt が出た(2026-10-16 実測)。
      * リングが 128 枠(約 9ms 分)あるので抜かれた分は次のチャンスにまとめて処理する。 */
-    if (xTaskCreatePinnedToCore(rx_task, "rx", 8192, NULL, 4, NULL, 1) != pdPASS) {
-        ESP_LOGE(TAG, "rx タスク作成失敗");
-        return ESP_ERR_NO_MEM;
+    if (g_rx_task == NULL) {
+        if (xTaskCreatePinnedToCore(rx_task, "rx", 8192, NULL, 4, &g_rx_task, 1) != pdPASS) {
+            ESP_LOGE(TAG, "rx タスク作成失敗");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* ESP32-P4 では peripheral_map=0 が HighSpeed 側(UTMI)。
@@ -414,6 +479,68 @@ esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
     }
     xTaskCreatePinnedToCore(client_task, "usbh", 4096, NULL, 21, NULL, 0);
     return ESP_OK;
+}
+
+/* ホスト側を完全に畳む。MSC へ USB コントローラ(OTG PHY)を渡すために必要。
+ * 手順は IDF の後始末の流儀どおり:
+ *   1) nano へ 'X' を送って送信を止める(抜けなくても構わない)
+ *   2) client タスクへ合図して unblock で起こす。client 自身が
+ *      interface_release → device_close → 取消転送の回収 → deregister する
+ *   3) lib タスクへ合図して unblock。残イベントを消化させてから抜けさせる
+ *   4) usb_host_uninstall() で hub/enum/usbh/HCD/PHY を解放する
+ * rx タスクは消さない(次に gbac_usb_start したとき使い回す)。 */
+esp_err_t gbac_usb_stop(void)
+{
+    if (g_client == NULL) {
+        ESP_LOGW(TAG, "USB ホストはすでに畳んでいる");
+        return ESP_ERR_INVALID_STATE;
+    }
+    gbac_usb_stream_stop();
+    vTaskDelay(pdMS_TO_TICKS(20));      /* 'X' が飛びきるのを待つ */
+
+    g_stop_tasks = true;
+    usb_host_client_unblock(g_client);
+    for (int i = 0; i < 100 && !g_client_dead; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!g_client_dead) {
+        ESP_LOGE(TAG, "client タスクが抜けなかった");
+        return ESP_ERR_TIMEOUT;
+    }
+    /* 転送オブジェクトは host ライブラリのプールから生えている。
+     * uninstall 後に使い回すと壊れるので、ここで全部返して NULL にする
+     * (attach でまた確保し直す)。全部完了済みでないと free は弾かれる。 */
+    for (int i = 0; i < MAX_RX_EP; i++) {
+        for (int j = 0; j < RX_PER_EP; j++) {
+            if (g_rx[i][j] != NULL) {
+                usb_host_transfer_free(g_rx[i][j]);
+                g_rx[i][j] = NULL;
+            }
+        }
+    }
+    usb_host_lib_unblock();
+    for (int i = 0; i < 100 && !g_lib_dead; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!g_lib_dead) {
+        ESP_LOGE(TAG, "usb_lib タスクが抜けなかった");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t e = ESP_ERR_INVALID_STATE;
+    for (int i = 0; i < 20 && e != ESP_OK; i++) {
+        e = usb_host_uninstall();
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "usb_host_uninstall %s(リトライ)", esp_err_to_name(e));
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    g_ready = false;
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "USB ホストを畳んだ(OTG PHY を解放)");
+    } else {
+        ESP_LOGE(TAG, "USB ホストが畳めない(%s)", esp_err_to_name(e));
+    }
+    return e;
 }
 
 int gbac_usb_ready(void)

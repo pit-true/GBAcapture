@@ -5,6 +5,7 @@ idf_component_register(
         "board.c"
         "button.c"
         "usb_host_nano.c"
+        "usb_msc.c"
         "audio_pipe.c"
         "frame_pipe.c"
         "video_enc.c"

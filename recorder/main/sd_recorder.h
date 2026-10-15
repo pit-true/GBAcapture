@@ -17,6 +17,17 @@ esp_err_t gbac_sd_probe(void);
 void gbac_sd_unmount(void);
 int gbac_sd_ready(void);
 
+/* PC に SD を見せる(USB MSC)ための足場。
+ * esp_vfs_fat_sdcard_unmount はカードごと deinit するので使わない。
+ * detach は FATFS の登録だけ外してカードは初期化済みのまま残す。
+ * gbac_sd_card() は detach 後も NULL にならない(MSC 側へ渡す)。
+ * sdmmc_card_t は匿名 struct の typedef なので前方宣言できない(ヘッダを呼ぶ)。 */
+#include "sdmmc_cmd.h"
+
+sdmmc_card_t *gbac_sd_card(void);
+esp_err_t gbac_sd_fat_detach(void);
+esp_err_t gbac_sd_fat_attach(void);
+
 /* 録画開始。mp4 は /sd/REC_NNNN.mp4(分割は _p2, _p3 ...) */
 esp_err_t gbac_rec_start(const gbac_cfg_t *cfg);
 void gbac_rec_stop(void);

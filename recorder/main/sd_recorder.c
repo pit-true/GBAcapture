@@ -20,6 +20,9 @@
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
+#include "diskio_impl.h"
+#include "diskio_sdmmc.h"
+#include "vfs_fat_internal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gbacap.h"
@@ -401,6 +404,71 @@ void gbac_sd_unmount(void)
 int gbac_sd_ready(void)
 {
     return g_mounted ? 1 : 0;
+}
+
+/* ---- PC へ SD を見せる(MSC)ときの引き渡し ----------------------------
+ * esp_vfs_fat_sdcard_unmount は SD カードそのものを deinit してしまうので、
+ * ここでは FATFS の登録だけを外してカードは初期化済みのまま残す。
+ * esp_tinyusb の MSC ストレージ(tinyusb_msc_storage_init_sdmmc)は
+ * 初期化済みの sdmmc_card_t をそのまま読むので、これで引き継げる。 */
+sdmmc_card_t *gbac_sd_card(void)
+{
+    return g_card;
+}
+
+esp_err_t gbac_sd_fat_detach(void)
+{
+    if (!g_mounted || g_card == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    BYTE pdrv = ff_diskio_get_pdrv_card(g_card);
+    if (pdrv == 0xff) {
+        ESP_LOGE(TAG, "FAT 切り離し: このカードのドライブが見つからない");
+        return ESP_ERR_INVALID_STATE;
+    }
+    char drv[3] = { (char)('0' + pdrv), ':', 0 };
+    esp_vfs_fat_unregister_path(SD_BASE);
+    f_mount(NULL, drv, 0);
+    ff_diskio_unregister(pdrv);
+    g_mounted = false;
+    ESP_LOGI(TAG, "SD: FATFS の登録だけ外した(カードは初期化済みのまま pdrv=%c)", drv[0]);
+    return ESP_OK;
+}
+
+esp_err_t gbac_sd_fat_attach(void)
+{
+    if (g_mounted) {
+        return ESP_OK;
+    }
+    if (g_card == NULL) {
+        ESP_LOGE(TAG, "FAT 再接続: カードが初期化されていない");
+        return ESP_ERR_INVALID_STATE;
+    }
+    BYTE pdrv = 0xff;
+    if (ff_diskio_get_drive(&pdrv) != ESP_OK || pdrv == 0xff) {
+        ESP_LOGE(TAG, "FATFS のドライブが空いていない");
+        return ESP_FAIL;
+    }
+    ff_diskio_register_sdmmc(pdrv, g_card);
+    ff_sdmmc_set_disk_status_check(pdrv, false);
+    char drv[3] = { (char)('0' + pdrv), ':', 0 };
+    FATFS *fs = NULL;
+    esp_err_t e = esp_vfs_fat_register(SD_BASE, drv, 4, &fs);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "esp_vfs_fat_register %s", esp_err_to_name(e));
+        ff_diskio_unregister(pdrv);
+        return e;
+    }
+    FRESULT fr = f_mount(fs, drv, 1);
+    if (fr != FR_OK) {
+        ESP_LOGE(TAG, "f_mount が FR_OK でない(%d)", (int)fr);
+        esp_vfs_fat_unregister_path(SD_BASE);
+        ff_diskio_unregister(pdrv);
+        return ESP_FAIL;
+    }
+    g_mounted = true;
+    sd_log_card();
+    return ESP_OK;
 }
 
 static int sc_at(const uint8_t *d, int len, int i)

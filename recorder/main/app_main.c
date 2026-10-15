@@ -22,6 +22,7 @@
 #include "sdkconfig.h"
 #include "sd_recorder.h"
 #include "usb_host_nano.h"
+#include "usb_msc.h"
 #include "video_enc.h"
 
 static const char *TAG = "main";
@@ -375,6 +376,27 @@ static void uart_cmd_handle(char c)
     } else if (c == 'd') {
         ESP_LOGI(TAG, "書き込みモードで再起動する(esptool がつながる)");
         enter_download_mode();
+    } else if (c == 'm') {
+        /* PC に SD を見せる(MSC)⇄ nano を受ける(ホスト)の切り替え */
+        if (gbac_msc_active()) {
+            esp_err_t e = gbac_msc_stop();
+            ESP_LOGI(TAG, "MSC 解除(%s)", esp_err_to_name(e));
+            esp_err_t e2 = gbac_usb_start(on_packet, NULL);
+            ESP_LOGI(TAG, "USB ホスト復旧(%s)", esp_err_to_name(e2));
+        } else {
+            if (g_recording) {
+                stop_recording();
+            }
+            if (g_pipe_test) {
+                stop_pipe_test();
+            }
+            esp_err_t e = gbac_msc_start();
+            if (e == ESP_OK) {
+                ESP_LOGI(TAG, "MSC モード。PC の Explorer に SD が出るはず");
+            } else {
+                ESP_LOGE(TAG, "MSC に切り替えない(%s)", esp_err_to_name(e));
+            }
+        }
     }
 }
 
@@ -397,7 +419,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 d=書き込みモード");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 m=PC に SD を見せる/戻す d=書き込みモード");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);

@@ -19,6 +19,11 @@ typedef void (*gbac_pkt_cb)(const uint8_t *pkt, int len, void *arg);
 
 esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg);
 
+/* ホストを完全に畳んで USB コントローラ(OTG PHY)を空ける。
+ * 同じコントローラを TinyUSB のデバイス(MSC)に使い回すため、
+ * MSC へ切り替える前に必ず呼ぶこと。戻すときは gbac_usb_start をもう一度。 */
+esp_err_t gbac_usb_stop(void);
+
 /* nano が接続されて受信用の準備ができているか(1/0) */
 int gbac_usb_ready(void);
 

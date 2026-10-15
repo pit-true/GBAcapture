@@ -80,3 +80,11 @@ CONFIG_PARTITION_TABLE_OFFSET=0x10000
 #     完了まで約 2 分コンソールが塞がって実機テストの邪魔になる。
 #     必要ならコンソールの b(エンコーダ単体)で都度測る。
 CONFIG_GBAC_BENCH_FRAMES=0
+
+# 13) MSC デバイス(espressif/esp_tinyusb 1.x)。コンソールの 'm' で
+#     ホスト(nano 受信)⇄デバイス(PC から SD リーダ)を切り替える。
+#     MSC の入出力バッファは P4 既定の 8192B をそのまま使う。
+#     PC が抜いたときに TinyUSB が自動で FAT を載せ直す先は /sd(同じカード)。
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
+CONFIG_TINYUSB_MSC_MOUNT_PATH="/sd"
