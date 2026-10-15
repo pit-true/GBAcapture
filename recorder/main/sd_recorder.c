@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "audio_pipe.h"
 #include "board.h"
@@ -13,6 +15,7 @@
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "esp_audio_enc.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -62,6 +65,17 @@ static uint32_t g_vpkts;
 static uint32_t g_apkts;
 static uint32_t g_verr;
 static uint32_t g_aerr;
+/* 停止ログで mp4 の長さを実時間と比べるため、先頭と末尾の pts(ms)を控える */
+static uint32_t g_vpts_first, g_vpts_last;
+static uint32_t g_apts_first, g_apts_last;
+/* 音声が 1 パケットしか入らない問題を追うためのカウンタ */
+static uint32_t g_a_reads;      /* audio_pipe_read を呼んだ回数 */
+static uint32_t g_a_pairs;      /* リングから読み出したペア数 */
+static uint32_t g_a_enc;        /* AAC を呼んだ回数 */
+static uint32_t g_a_zero;       /* AAC が 0 バイトで返した回数 */
+static uint32_t g_a_drop;       /* リング溢れで捨てられた音声ペア数 */
+static int g_pts_dbg;           /* 先頭 20 本の pts をログする */
+static int g_last_num;          /* 前回使った REC_ の番号(stat が信用できないときも進める) */
 static volatile bool g_low_space;
 static volatile uint64_t g_last_free;   /* 最後に読んだ空きバイト数 */
 
@@ -295,11 +309,15 @@ esp_err_t gbac_sd_mount(void)
         /* 通信はできる。FAT のせいなので、フォーマットし直せば行けるはず */
         p = g_alive;
     } else {
-        p.slot = SDMMC_HOST_SLOT_1;
+        /* 実機で確定した結線(2026-10-15)。総当たりしなくてもこれで行ける。
+         *   slot0(IOMUX: CLK43/CMD44/D0-3=39〜42)・4bit・IO 電源はオンチップ LDO VO4
+         *   ・GPIO45 は駆動しない(LOW にしても構わないが触らないのが実測の勝ち筋)
+         *   ・40MHz(SDMMC_FREQ_HIGHSPEED) */
+        p.slot = SDMMC_HOST_SLOT_0;
         p.width = 4;
-        p.ldo = 0;
-        p.gate = GBAC_SD_PWR_GPIO;
-        p.gate_lvl = 1;
+        p.ldo = 4;
+        p.gate = GBAC_PIN_SD_PWR;
+        p.gate_lvl = 0;
         p.freq = SDMMC_FREQ_HIGHSPEED;
     }
     esp_err_t e = sd_try_mount(&p, &g_card);
@@ -541,18 +559,27 @@ static void encode_audio(int bytes)
     esp_audio_enc_in_frame_t in = { .buffer = (uint8_t *)g_pcm, .len = (uint32_t)bytes };
     esp_audio_enc_out_frame_t out = { .buffer = g_aacbuf, .len = (uint32_t)g_out_bytes };
     esp_audio_err_t e = esp_audio_enc_process(g_aac, &in, &out);
+    g_a_enc++;
+    if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes == 0) {
+        g_a_zero++;
+    }
     if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && g_muxer) {
+        uint32_t ms = (uint32_t)((uint64_t)1000 * g_audio_samples / AAC_RATE);
         esp_muxer_audio_packet_t ap = {
             .data = g_aacbuf,
             .len = (int)out.encoded_bytes,
-            .pts = (uint32_t)((uint64_t)1000 * g_audio_samples / AAC_RATE),
+            .pts = ms,
         };
         if (esp_muxer_add_audio_packet(g_muxer, g_aidx, &ap) == ESP_MUXER_ERR_OK) {
+            if (g_apkts == 0) {
+                g_apts_first = ms;
+            }
+            g_apts_last = ms;
             g_apkts++;
         } else {
             g_aerr++;
         }
-    } else {
+    } else if (e != ESP_AUDIO_ERR_OK) {
         g_aerr++;
     }
     g_audio_samples += (uint32_t)(bytes / 4);
@@ -564,13 +591,24 @@ static void encode_audio(int bytes)
 
 static void pump_audio(bool flush)
 {
-    while (g_pcm_fill < g_in_bytes) {
-        int room = g_in_bytes - g_pcm_fill;
-        int got = audio_pipe_read(g_pcm + g_pcm_fill / 2, room / 4);
-        if (got <= 0) {
+    /* mux_task のループは SD 書き込みで 1 回 200ms 止まることもある。
+     * 1 回につき AAC を 1 本しか作らないと 46.9 本/秒に足りず、
+     * mp4 の音声が数本しか入らない。読み出せるだけ読み出して符号化する。 */
+    for (;;) {
+        while (g_pcm_fill < g_in_bytes) {
+            int room = g_in_bytes - g_pcm_fill;
+            int got = audio_pipe_read(g_pcm + g_pcm_fill / 2, room / 4);
+            if (got <= 0) {
+                break;
+            }
+            g_a_reads++;
+            g_a_pairs += (uint32_t)got;
+            g_pcm_fill += got * 4;
+        }
+        if (g_pcm_fill < g_in_bytes) {
             break;
         }
-        g_pcm_fill += got * 4;
+        encode_audio(g_in_bytes);
     }
     while (g_pcm_fill >= g_in_bytes) {
         encode_audio(g_in_bytes);
@@ -582,21 +620,120 @@ static void pump_audio(bool flush)
     }
 }
 
+/* SD の実測の書き込み・読み出し速度。esp_muxer の ram_cache_size を決める材料と、
+ * mux が詰まる原因(SD が遅い / 止まる)を切り分けるために使う。
+ * 録画していないときだけ呼ぶこと(FAT を二重に触らない)。 */
+esp_err_t gbac_sd_speedtest(int mb)
+{
+    if (!g_card) {
+        ESP_LOGE(TAG, "SD がマウントされていない");
+        return ESP_FAIL;
+    }
+    if (mb < 1) {
+        mb = 1;
+    }
+    const int CH = 128 * 1024;
+    uint8_t *buf = heap_caps_malloc((size_t)CH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        ESP_LOGE(TAG, "速度テストの %dKB が確保できない", CH / 1024);
+        return ESP_ERR_NO_MEM;
+    }
+    memset(buf, 0x5a, (size_t)CH);
+
+    char path[64];
+    snprintf(path, sizeof(path), "%s/SPEED.BIN", SD_BASE);
+    unlink(path);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(buf);
+        ESP_LOGE(TAG, "%s を作れない", path);
+        return ESP_FAIL;
+    }
+
+    int64_t t0 = esp_timer_get_time();
+    int wrote = 0;
+    for (int i = 0; i < mb; i++) {
+        if (fwrite(buf, 1, (size_t)CH, f) != (size_t)CH) {
+            int64_t e = esp_timer_get_time();
+            ESP_LOGE(TAG, "書き込み失敗 %dMB目 %.1fMB/s", i,
+                     (double)wrote * CH / 1e6 / ((double)(e - t0) / 1e6));
+            fclose(f);
+            free(buf);
+            return ESP_FAIL;
+        }
+        wrote++;
+        if ((wrote & 3) == 0) {
+            int64_t e = esp_timer_get_time();
+            ESP_LOGI(TAG, "SD 書込 %dMB %.1fMB/s", wrote,
+                     (double)wrote * CH / 1e6 / ((double)(e - t0) / 1e6));
+        }
+    }
+    int64_t tw = esp_timer_get_time();
+    fclose(f);
+    int64_t tf = esp_timer_get_time();
+    ESP_LOGI(TAG, "SD 書込 %dMB %.1fMB/s  fclose に %.0fms", wrote,
+             (double)wrote * CH / 1e6 / ((double)(tw - t0) / 1e6),
+             (double)(tf - tw) / 1000.0);
+
+    /* 読み戻し。マウントの読み側と FAT の状態も見る */
+    f = fopen(path, "rb");
+    if (!f) {
+        free(buf);
+        return ESP_FAIL;
+    }
+    int64_t r0 = esp_timer_get_time();
+    size_t got = fread(buf, 1, (size_t)CH, f);
+    int64_t r1 = esp_timer_get_time();
+    fclose(f);
+    ESP_LOGI(TAG, "SD 先頭 %dKB 読み %.1fMB/s", (int)got / 1024,
+             (double)got / 1e6 / ((double)(r1 - r0) / 1e6));
+    free(buf);
+    return ESP_OK;
+}
+
+/* mux_task が今どの呼び出しにいるかを常に残しておく。
+ * NAL スロットが枯れたとき、エンコード側から「mux がどこで止まっているか」
+ * を見るため。esp_muxer の mp4 はプリビルドなので中を読めない。 */
+static const char *volatile g_mux_where = "待機";
+static volatile int64_t g_mux_where_us;
+
+static void mux_mark(const char *w)
+{
+    g_mux_where = w;
+    g_mux_where_us = esp_timer_get_time();
+}
+
+const char *gbac_rec_mux_where(void)
+{
+    return g_mux_where;
+}
+
+int64_t gbac_rec_mux_age_us(void)
+{
+    return g_mux_where_us ? esp_timer_get_time() - g_mux_where_us : 0;
+}
+
 /* NAL を 1 本 muxer に入れる。まだ muxer がなければ SPS/PPS を拾ってから開く。 */
 static void write_video(const gbac_nal_t *n)
 {
     if (!g_muxer) {
+        mux_mark("SPS/PPS 抽出");
         extract_sps_pps(n->buf, n->len);
         if (!g_avcc) {
             ESP_LOGE(TAG, "SPS/PPS が見つからない NAL(%d バイト)", n->len);
             return;
         }
+        mux_mark("muxer open");
         if (open_muxer() != ESP_OK) {
             g_run = false;
             return;
         }
     }
     uint32_t ms = (uint32_t)(n->pts_us / 1000);
+    if (g_pts_dbg < 20) {
+        ESP_LOGI(TAG, "mux %d/20 ms=%u len=%d key=%d", g_pts_dbg + 1, ms, n->len, n->key);
+        g_pts_dbg++;
+    }
     esp_muxer_video_packet_t vp = {
         .data = n->buf,
         .len = n->len,
@@ -604,11 +741,17 @@ static void write_video(const gbac_nal_t *n)
         .dts = ms,
         .key_frame = n->key,
     };
-    if (esp_muxer_add_video_packet(g_muxer, g_vidx, &vp) == ESP_MUXER_ERR_OK) {
+    mux_mark("add_video_packet");
+    esp_muxer_err_t me = esp_muxer_add_video_packet(g_muxer, g_vidx, &vp);
+    if (me == ESP_MUXER_ERR_OK) {
+        if (g_vpkts == 0) {
+            g_vpts_first = ms;
+        }
+        g_vpts_last = ms;
         g_vpkts++;
     } else {
         g_verr++;
-        ESP_LOGE(TAG, "video packet 追加失敗");
+        ESP_LOGE(TAG, "video packet 追加失敗(%d)", (int)me);
     }
 }
 
@@ -618,11 +761,14 @@ static void mux_task(void *arg)
     int64_t last_space = esp_timer_get_time();
     while (true) {
         gbac_nal_t n;
+        mux_mark("NAL 待ち");
         if (gbac_enc_pop(&n, pdMS_TO_TICKS(10))) {
             write_video(&n);
+            mux_mark("slot 返却");
             gbac_enc_free(&n);
         }
         if (g_muxer) {
+            mux_mark("pump_audio");
             pump_audio(false);
         }
         /* 5 秒に 1 回、空き容量を見る。250MB は 16Mbps で約 100 秒分。
@@ -662,21 +808,52 @@ static void mux_task(void *arg)
     ESP_LOGI(TAG, "muxer 終了 video=%u audio=%u err=%u/%u stack 残り=%uB",
              (unsigned)g_vpkts, (unsigned)g_apkts, (unsigned)g_verr, (unsigned)g_aerr,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    ESP_LOGI(TAG, "音声内訳 read=%u pairs=%u aac=%u zero=%u ringovf=%u",
+             (unsigned)g_a_reads, (unsigned)g_a_pairs, (unsigned)g_a_enc, (unsigned)g_a_zero,
+             (unsigned)audio_pipe_overruns());
     g_task = NULL;
     vTaskDelete(NULL);
 }
 
+/* SD の中にある REC_NNNN の最大番号。再起動しても番号が前に進むように使う。
+ * stat() だけでは、まだ mp4 が閉じられていない回とぶつかって
+ * 同じ番号を割り当てて上書きした(REC_0006 が毎回上書きされた)。 */
+static int scan_max_num(void)
+{
+    DIR *d = opendir(SD_BASE);
+    if (d == NULL) {
+        return 0;
+    }
+    int max = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        int n = 0;
+        if (sscanf(e->d_name, "REC_%d.mp4", &n) == 1 && n > max && n <= 9999) {
+            max = n;
+        }
+    }
+    closedir(d);
+    return max;
+}
+
 static void next_base(void)
 {
-    for (int i = 1; i <= 9999; i++) {
+    int ondisk = scan_max_num();
+    if (ondisk > g_last_num) {
+        g_last_num = ondisk;
+    }
+    for (int i = g_last_num + 1; i <= 9999; i++) {
         char p[64];
         snprintf(p, sizeof(p), "%s/REC_%04d.mp4", SD_BASE, i);
         struct stat st;
         if (stat(p, &st) != 0) {
+            g_last_num = i;
             snprintf(g_base, sizeof(g_base), "REC_%04d", i);
+            ESP_LOGI(TAG, "ファイル名 %s.mp4(SD 内の最大=%d)", g_base, ondisk);
             return;
         }
     }
+    g_last_num = 9999;
     snprintf(g_base, sizeof(g_base), "REC_9999");
 }
 
@@ -765,6 +942,9 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
     g_pcm_fill = 0;
     g_audio_samples = 0;
     g_vpkts = g_apkts = g_verr = g_aerr = 0;
+    g_vpts_first = g_vpts_last = g_apts_first = g_apts_last = 0;
+    g_a_reads = g_a_pairs = g_a_enc = g_a_zero = g_a_drop = 0;
+    g_pts_dbg = 0;
     if (aac_open() != ESP_OK) {
         rec_free();
         return ESP_FAIL;
@@ -775,8 +955,10 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
         return e;
     }
     g_run = true;
-    /* AAC 符号化 + muxer + FATFS でスタックを使う。enc と同じく 12KB にしておく */
-    xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 4, &g_task, 0);
+    /* AAC 符号化 + muxer + FATFS でスタックを使う。enc と同じく 12KB にしておく。
+     * SD 書き込みで core0(USB 受信)を止めないよう、mux は core1 の低優先度。
+     * enc(5) > rx(6) > mux(3) の順で、SD が遅くても受信は落ちない。 */
+    xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 3, &g_task, 1);
     return ESP_OK;
 }
 
@@ -800,6 +982,13 @@ void gbac_rec_stop(void)
     rec_free();
     ESP_LOGI(TAG, "録画停止 %s.mp4 video=%u audio=%u", g_base,
              (unsigned)g_vpkts, (unsigned)g_apkts);
+    /* mp4 の長さが実時間と合っているかを見る。映像フレーム数と pts の幅、
+     * 音声フレーム数と pts の幅を並べて出す(1 フレーム = 16.74ms)。 */
+    ESP_LOGI(TAG, "停止ログ %s.mp4 映像=%u 先頭pts=%.2fs 末尾pts=%.2fs | 音声=%u 先頭pts=%.2fs 末尾pts=%.2fs",
+             g_base, (unsigned)g_vpkts,
+             (double)g_vpts_first / 1000.0, (double)g_vpts_last / 1000.0,
+             (unsigned)g_apkts,
+             (double)g_apts_first / 1000.0, (double)g_apts_last / 1000.0);
 }
 
 bool gbac_rec_low_space(void)

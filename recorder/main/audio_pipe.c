@@ -57,7 +57,7 @@ void audio_pipe_reset(void)
 void audio_pipe_push(const uint8_t *pkt, int len)
 {
     gbac_audio_t a;
-    if (gbac_audio_parse(pkt, len, &a) != 0) {
+    if (!gbac_audio_parse(pkt, len, &a)) {
         return;
     }
 

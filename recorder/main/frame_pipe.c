@@ -22,6 +22,7 @@ static int g_held = -1;      /* 読み手が持っている slot */
 static SemaphoreHandle_t g_sig;
 static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 static gbac_pts_t g_pts;
+static int g_pts_dbg;   /* 先頭 20 フレームの PTS をログに出す回数 */
 
 esp_err_t frame_pipe_init(void)
 {
@@ -43,29 +44,28 @@ esp_err_t frame_pipe_init(void)
     return ESP_OK;
 }
 
-void frame_pipe_push(const uint8_t *pkt, int len)
+/* slot を完成扱いで読み待ちへ回す。読み手が 1 枚も空けていなければ
+ * 枠が取れないので同じ slot にそのまま残す(= dropped_frames)。
+ * PTS を進められないフレーム(同じ/後戻りのフレーム番号)も完成扱いにしない。
+ * mp4 の尺が実時間と合わなくなるため(2026-10-16 実測)。
+ * 戻り値 = 次に埋める slot */
+static int finish_frame(int cur, uint8_t frame_no)
 {
-    gbac_line_t ln;
-    if (gbac_line_parse(pkt, len, &ln) != 0) {
-        return;
+    uint64_t pts_us = 0;
+    if (!gbac_pts_push(&g_pts, frame_no, &pts_us)) {
+        g_asm[cur]->dropped_frames++;
+        if (g_pts_dbg < 20) {
+            ESP_LOGW(TAG, "pts 拒否 %d/20 frame_no=%u(last=%u) → 捨てる",
+                     g_pts_dbg + 1, (unsigned)frame_no, (unsigned)g_pts.last);
+            g_pts_dbg++;
+        }
+        return cur;
     }
-
-    int cur;
-    portENTER_CRITICAL(&g_mux);
-    cur = g_cur;
-    portEXIT_CRITICAL(&g_mux);
-
-    int r = gbac_asm_push(g_asm[cur], &ln);
-    if (r < 0) {
-        return;
+    if (g_pts_dbg < 20) {
+        ESP_LOGI(TAG, "pts %d/20 frame_no=%u pts_us=%llu (%.1fms)", g_pts_dbg + 1,
+                 (unsigned)frame_no, (unsigned long long)pts_us, (double)pts_us / 1000.0);
+        g_pts_dbg++;
     }
-    if (r == 0) {
-        return;
-    }
-
-    /* フレーム完成 */
-    uint64_t pts_us;
-    gbac_pts_push(&g_pts, ln.frame_no, &pts_us);
 
     bool swapped = false;
     portENTER_CRITICAL(&g_mux);
@@ -80,11 +80,35 @@ void frame_pipe_push(const uint8_t *pkt, int len)
 
     if (swapped) {
         xSemaphoreGive(g_sig);
-    } else {
-        /* 読み手が 1 枚も空けていない。このフレームは同じバッファに
-         * 上書きされるので、欠落として数えておく。 */
-        g_asm[cur]->dropped_frames++;
+        return other;
     }
+    g_asm[cur]->dropped_frames++;
+    return cur;
+}
+
+void frame_pipe_push(const uint8_t *pkt, int len)
+{
+    gbac_line_t ln;
+    if (!gbac_line_parse(pkt, len, &ln)) {
+        return;
+    }
+
+    int cur = g_cur;
+    int r = gbac_asm_push(g_asm[cur], &ln);
+
+    if (r == 2) {
+        /* より新しいフレーム番号のラインが来た。
+         * 今のフレームは行が欠けていてもここで完成扱いにする
+         * (欠けた行は前フレームの内容が残っている)。 */
+        cur = finish_frame(cur, g_asm[cur]->frame_no);
+        gbac_asm_start(g_asm[cur], ln.frame_no);
+        gbac_asm_push(g_asm[cur], &ln);
+        return;
+    }
+    if (r != 1) {
+        return;   /* 0=まだ未完、-1=範囲外、-2=古いフレームのライン */
+    }
+    finish_frame(cur, ln.frame_no);
 }
 
 const uint16_t *frame_pipe_take(uint64_t *pts_us, TickType_t wait_ticks)
@@ -138,12 +162,28 @@ uint32_t frame_pipe_dropped(void)
     return n;
 }
 
+uint32_t frame_pipe_dropped_lines(void)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < NSLOT; i++) {
+        if (g_asm[i]) {
+            n += g_asm[i]->dropped_lines;
+        }
+    }
+    return n;
+}
+
 void frame_pipe_stats_reset(void)
 {
     for (int i = 0; i < NSLOT; i++) {
         if (g_asm[i]) {
             g_asm[i]->completed_frames = 0;
             g_asm[i]->dropped_frames = 0;
+            g_asm[i]->dropped_lines = 0;
         }
     }
+    /* PTS は録画・テストのたびに 0 から。前回の続きだと mp4 の pts が
+     * 0 開始でなくなり、尺の実測と比べにくくなる。 */
+    gbac_pts_init(&g_pts);
+    g_pts_dbg = 0;
 }

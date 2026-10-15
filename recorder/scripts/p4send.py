@@ -13,6 +13,10 @@ cmd = sys.argv[2] if len(sys.argv) > 2 else 'd'
 secs = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
 
 s = serial.Serial(port, 115200, timeout=0.2)
+# ポートを開いた瞬間に CH343 が DTR/RTS の過渡で破線(break)を吐くことがあり、
+# 直後に送ると 1 文字目が文字化けして基板に無視される(実測)。
+# 落ち着くまで待ってから送信する。
+time.sleep(0.3)
 s.reset_input_buffer()
 s.write((cmd + '\r').encode())
 s.flush()

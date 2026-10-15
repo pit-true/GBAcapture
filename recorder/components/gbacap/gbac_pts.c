@@ -13,16 +13,34 @@ void gbac_pts_init(gbac_pts_t *p) {
 }
 
 /* PTS はフレーム番号の進行度から決める(実時間ではない)。
- * 1フレーム = 1/59.7275 秒 = 16742.72µs。整数で切り捨てる。 */
+ * 1フレーム = 1/59.7275 秒 = 16742.72µs。整数で切り捨てる。
+ *
+ * 映像は EP4/EP1 の 2 本へ分散されるためフレーム番号が 1 つ戻ることがある。
+ * 差を (uint8_t)(now-prev) で取ると 1 戻りが 255 になり、そのまま進めると
+ * PTS が 4.3 秒飛ぶ(実機 REC_0006.mp4 で 21.3 秒の録画の尺が 535 秒になった。
+ * muxer は末尾−先頭の PTS をフレーム数で割って並すので全フレーム間隔が
+ * 0.944 秒になった)。なので
+ *   差 1..16    = 正常な進行
+ *   差 17..128  = フレームごと飛んだ。欠落として受け入れる
+ *   差 0        = 同じ番号。進めない
+ *   差 129..255 = 後戻り(EP の到着順の前後)。古いフレームなので進めない
+ * 進めないときは *pts_us を書かず 0 を返す。呼び出し側は 0 のフレームを
+ * 完成扱いにしないこと。 */
 int gbac_pts_push(gbac_pts_t *p, uint8_t frame_no, uint64_t *pts_us) {
-  if (p->have && p->last == frame_no) return 0;
-
   if (!p->have) {
     p->have = 1;
     p->frame_index = 0;
-  } else {
-    p->frame_index += (uint64_t)gbac_frame_delta(p->last, frame_no);
+    p->last = frame_no;
+    *pts_us = 0;
+    return 1;
   }
+
+  int d = gbac_frame_delta(p->last, frame_no); /* 0..255 */
+  if (d == 0 || d >= 129) {
+    return 0;
+  }
+
+  p->frame_index += (uint64_t)d;
   p->last = frame_no;
 
   *pts_us = p->frame_index * 1000000ULL * GBAC_FPS_DEN / GBAC_FPS_NUM;

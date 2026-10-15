@@ -29,6 +29,16 @@ bool gbac_rec_low_space(void);
 /* 最後に読んだ SD の空き(MB)。状態ログ用。0 なら不明。 */
 uint64_t gbac_rec_sd_free_mb(void);
 
+/* mux_task が今どこの呼び出しにいるかと、そこに留まってから経過した us。
+ * NAL スロットが枯れたとき mux が詰まっているか切り分ける。 */
+const char *gbac_rec_mux_where(void);
+int64_t gbac_rec_mux_age_us(void);
+
 /* 合成映像で bench_frames 枚だけ録画して HW エンコーダの実測を出す。
  * 完了するまで阻塞する。 */
 esp_err_t gbac_rec_bench(const gbac_cfg_t *cfg, int bench_frames);
+
+/* SD に mb MB 書き込んで実測 MB/s を出す。esp_muxer の ram_cache_size を
+ * 決める材料と、mux が詰まる原因(SD 側か muxer 側か)の切り分け用。
+ * 録画していないときだけ呼ぶこと。完了まで阻塞する。 */
+esp_err_t gbac_sd_speedtest(int mb);

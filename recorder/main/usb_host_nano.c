@@ -4,12 +4,13 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"
-#include "soc/usb_dwc_struct.h"
+#include "gbacap.h"        /* GBAC_PACKET_SIZE / マジック / 行数 */
 
 static const char *TAG = "usbnano";
 
@@ -17,7 +18,9 @@ static const char *TAG = "usbnano";
 #define PID_GBAC     0xC001
 #define EP_CMD_OUT   0x05
 #define XFER_BYTES   512          /* bulk IN の MPS。484B は短_packets で完了する */
-#define RX_PER_EP    8            /* EP 1 本あたりに積み続ける転送数 */
+#define RX_PER_EP    32           /* EP 1 本あたりに積み続ける転送数。
+                                   * 8 の実測で毎秒 2.0MB(60fps に必要は 6.9MB)だったので
+                                   * インフライトを増してバスを空けないようにする */
 #define MAX_RX_EP    3
 
 static gbac_pkt_cb g_cb;
@@ -27,6 +30,14 @@ static usb_device_handle_t g_dev;
 static volatile bool g_ready;
 static uint32_t g_pkts;
 static uint32_t g_errs;
+static uint32_t g_bytes;      /* 転送で受け取ったバイト数の合計 */
+static uint32_t g_ep_pkts[MAX_RX_EP];   /* EP ごとの完了転送数(どれが黙っているか見る) */
+static int g_xfer_dbg;        /* 最初の 4 転送の中身をログに出す */
+
+/* rx タスクがパケットを処理した時間(µs 累計)。1 パケットの原価を測るため。
+ * esp_timer_get_time は mtime レジスタ読みで軽いので毎パケット測る。 */
+static volatile int64_t g_prof_v_us, g_prof_a_us;
+static volatile uint32_t g_prof_v_n, g_prof_a_n;
 
 static usb_transfer_t *g_rx[MAX_RX_EP][RX_PER_EP];
 static int g_rx_ep[MAX_RX_EP];    /* 実際の EP アドレス(0x84 など) */
@@ -38,17 +49,107 @@ static int g_reply_len;
 static volatile bool g_reply_wait;
 static SemaphoreHandle_t g_reply_sem;
 
+/* nano はパケットを USB の 512B 境界に揃えず、連続したバイト列として流す。
+ * なので 1 転送 = 1 パケットでは扱えない(PC 版 ViewerForm.cs の RxLoop と
+ * 同じ再組み立てをする)。EP ごとに独立したバッファへ追記し、
+ *   [0xA5][frame][line<160][0] → 484B のライン
+ *   [0xA6][seq][n 1..120][0]   → 484B の音声
+ * に一致する位置から 484B ずつ切り出して上に渡す。違えば 1 バイトずらして
+ * 再同期し、端数は先頭へ詰める。転送の完了順は EP 内では保たれる。 */
+#define REASM_BYTES (GBAC_PACKET_SIZE * 12)
+static uint8_t g_reasm[MAX_RX_EP][REASM_BYTES];
+static int g_reasm_len[MAX_RX_EP];
+static uint32_t g_reasm_lost;   /* バッファ溢れで捨てたバイト数 */
+
+/* 切り出した 484B パケットを渡すリング(SPSC)。
+ * rx_cb(=usbh タスク、core0)はここへコピーするだけにして、ピクセル復号や
+ * フレーム書き込みといった重い仕事は core1 の rx タスクでやる。
+ * そうしないと usbh が IDLE0 を飢えさせて task_wdt が発火した(実測)。
+ * 内部 RAM で 128 枠 = 62KB。14,500 パケット/秒なら約 9 ミリ秒ぶん。 */
+#define RXRING_SLOTS 128
+#define RXRING_MASK  (RXRING_SLOTS - 1)
+static uint8_t g_ring[RXRING_SLOTS][GBAC_PACKET_SIZE] __attribute__((aligned(32)));
+static volatile uint32_t g_wr;
+static volatile uint32_t g_rd;
+static uint32_t g_ring_drop;   /* リングが満杯で捨てたパケット */
+static SemaphoreHandle_t g_ring_sem;
+
+static void ring_put(const uint8_t *p)
+{
+    uint32_t wr = g_wr;   /* 書き手は usbh タスクだけ */
+    if (wr - __atomic_load_n(&g_rd, __ATOMIC_ACQUIRE) >= RXRING_SLOTS) {
+        g_ring_drop++;
+        return;
+    }
+    memcpy(g_ring[wr & RXRING_MASK], p, GBAC_PACKET_SIZE);
+    __atomic_store_n(&g_wr, wr + 1, __ATOMIC_RELEASE);
+    xSemaphoreGive(g_ring_sem);
+}
+
+static void reasm_feed(int ep, const uint8_t *src, int len)
+{
+    if (ep < 0 || ep >= MAX_RX_EP || len <= 0) {
+        return;
+    }
+    uint8_t *b = g_reasm[ep];
+    int n = g_reasm_len[ep];
+
+    if (len > REASM_BYTES - n) {
+        /* 埋まるほど溜まるのは同期が壊れている証拠。捨ててやり直す */
+        g_reasm_lost += (uint32_t)n;
+        n = 0;
+        if (len > REASM_BYTES) {
+            src += len - REASM_BYTES;
+            len = REASM_BYTES;
+        }
+    }
+    memcpy(b + n, src, (size_t)len);
+    n += len;
+
+    int pos = 0;
+    while (n - pos >= GBAC_PACKET_SIZE) {
+        const uint8_t *p = b + pos;
+        if ((p[0] == GBAC_LINE_MAGIC && p[3] == 0 && p[2] < GBAC_LINES_PER_FRAME) ||
+            (p[0] == GBAC_AUDIO_MAGIC && p[3] == 0 && p[2] > 0 && p[2] <= 120)) {
+            ring_put(p);
+            pos += GBAC_PACKET_SIZE;
+        } else {
+            pos++;    /* マジック再同期 */
+        }
+    }
+    if (pos > 0) {
+        memmove(b, b + pos, (size_t)(n - pos));
+    }
+    g_reasm_len[ep] = n - pos;
+}
+
 static void rx_cb(usb_transfer_t *t)
 {
     if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
         int len = t->actual_num_bytes;
+        g_bytes += (uint32_t)(len > 0 ? len : 0);
+        for (int i = 0; i < g_rx_n; i++) {
+            if (g_rx_ep[i] == t->bEndpointAddress) {
+                g_ep_pkts[i]++;
+                break;
+            }
+        }
+        if (g_xfer_dbg < 4) {
+            g_xfer_dbg++;
+            ESP_LOGW(TAG, "xfer %d/4 ep=%02x st=%d len=%d %02x %02x %02x %02x %02x %02x %02x %02x",
+                     g_xfer_dbg, t->bEndpointAddress, (int)t->status, len,
+                     len > 0 ? t->data_buffer[0] : 0, len > 1 ? t->data_buffer[1] : 0,
+                     len > 2 ? t->data_buffer[2] : 0, len > 3 ? t->data_buffer[3] : 0,
+                     len > 4 ? t->data_buffer[4] : 0, len > 5 ? t->data_buffer[5] : 0,
+                     len > 6 ? t->data_buffer[6] : 0, len > 7 ? t->data_buffer[7] : 0);
+        }
         if (g_reply_wait && len >= 8 && t->data_buffer[0] == 'G') {
             g_reply_len = len <= (int)sizeof(g_reply) ? len : (int)sizeof(g_reply);
             memcpy(g_reply, t->data_buffer, g_reply_len);
             g_reply_wait = false;
             xSemaphoreGive(g_reply_sem);
         } else if (g_cb && len > 0) {
-            g_cb(t->data_buffer, len, g_cb_arg);
+            reasm_feed((int)(intptr_t)t->context, t->data_buffer, len);
         }
         g_pkts++;
     } else if (t->status == USB_TRANSFER_STATUS_NO_DEVICE ||
@@ -131,6 +232,10 @@ static void attach(uint8_t addr)
     if (g_rx_n == 0) {
         return;
     }
+    /* 再接続時は前回の取りこぼしを継がない */
+    for (int i = 0; i < g_rx_n; i++) {
+        g_reasm_len[i] = 0;
+    }
 
     /* 転送の確保(初回だけ) */
     for (int i = 0; i < g_rx_n; i++) {
@@ -145,7 +250,7 @@ static void attach(uint8_t addr)
             t->device_handle = g_dev;
             t->bEndpointAddress = g_rx_ep[i];
             t->callback = rx_cb;
-            t->context = NULL;
+            t->context = (void *)(intptr_t)i;   /* reasm_feed の EP 番号 */
             t->num_bytes = XFER_BYTES;
             t->timeout_ms = 0;
             if (usb_host_transfer_submit(t) != ESP_OK) {
@@ -179,11 +284,72 @@ static void client_task(void *arg)
     }
 }
 
+/* リングからパケットを取り出して映像・音声のパイプへ流すタスク。
+ * ピクセル復号(1 ライン 240 語)やフレームバッファへの書き込みは重いので、
+ * USB 側のタスクではなく core1 でやる(enc と同じ側)。 */
+static void rx_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(g_ring_sem, portMAX_DELAY);
+        while (g_rd != __atomic_load_n(&g_wr, __ATOMIC_ACQUIRE)) {
+            const uint8_t *p = g_ring[g_rd & RXRING_MASK];
+            if (g_cb) {
+                int64_t t0 = esp_timer_get_time();
+                g_cb(p, GBAC_PACKET_SIZE, g_cb_arg);
+                int64_t d = esp_timer_get_time() - t0;
+                if (p[0] == GBAC_LINE_MAGIC) {
+                    g_prof_v_us += d;
+                    g_prof_v_n++;
+                } else {
+                    g_prof_a_us += d;
+                    g_prof_a_n++;
+                }
+            }
+            __atomic_store_n(&g_rd, g_rd + 1, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+/* ホストライブラリ本体のイベントループ。これが無いと HCD のポート状態変化
+ * (接続/切断)が処理されず、列挙も client へのイベントも一切起きない。
+ * IDF の例でいう usb_lib_task。client より高い優先度で回す。 */
+static void usb_lib_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint32_t flags = 0;
+        esp_err_t e = usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        if (e != ESP_OK && e != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "lib_handle_events %s", esp_err_to_name(e));
+        }
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            /* client が全滅したらデバイスを閉じる(IDF の例と同じ) */
+            usb_host_device_free_all();
+        }
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+            ESP_LOGI(TAG, "全デバイス解放済み");
+        }
+    }
+}
+
 esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
 {
     g_cb = cb;
     g_cb_arg = arg;
     g_reply_sem = xSemaphoreCreateBinary();
+    g_ring_sem = xSemaphoreCreateCounting(RXRING_SLOTS, 0);
+    if (g_ring_sem == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    /* 重い仕事(復号・フレーム書き込み)は core1 の rx でやる。
+     * 優先度は enc(5) より下にする: rx(6) のときは rx が core1 を占有して
+     * enc が動かず IDLE1 まで飢えて task_wdt が出た(2026-10-16 実測)。
+     * リングが 128 枠(約 9ms 分)あるので抜かれた分は次のチャンスにまとめて処理する。 */
+    if (xTaskCreatePinnedToCore(rx_task, "rx", 8192, NULL, 4, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "rx タスク作成失敗");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* ESP32-P4 では peripheral_map=0 が HighSpeed 側(UTMI)。
      * FullSpeed(GPIO26/27)は peripheral 1 なので、ここでは触らない。 */
@@ -192,11 +358,30 @@ esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
         .root_port_unpowered = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
     };
+
+    /* DWC2 の FIFO バイアスは sdkconfig で BALANCED にしてある。
+     * HS(hsphy_type!=0)だと otg_dfifo_depth=1024 で nptx=256 行(1024B)、
+     * rx = fifo_size-384 行になり、nano の EP(全部 512B)を扱える。
+     * 既定の BIAS_IN だと nptx=64 行=256B で "EP MPS (512) exceeds supported
+     * limit (256)" となり interface_claim が失敗した(実機で確認)。
+     * fifo_settings_custom は使わない(総行数のレジスタは install 前に読めない)。 */
     esp_err_t e = usb_host_install(&hcfg);
     if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "usb_host_install %s", esp_err_to_name(e));
         return e;
     }
+
+    /* インストールできたら、まずライブラリ自身のイベントループを動かす。
+     * これが無いとポートの接続イベントが誰も処理しない。 */
+    /* ホストライブラリのイベントループは最優先級(core0)。
+     * mux(SD 書き込み)は core1 へ逃がしてあるので、ここでバスを空けない。
+     * esp_timer タスクが 22 なので、usb_lib は同じ 22(実質張り付き)、
+     * client(転送完了コールバック)は 21。 */
+    if (xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, 22, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "usb_lib タスク作成失敗");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "USB ホスト開始(HS/UTMI)");
 
     usb_host_client_config_t cl = {
         .is_synchronous = false,
@@ -211,7 +396,7 @@ esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg)
         ESP_LOGE(TAG, "client_register %s", esp_err_to_name(e));
         return e;
     }
-    xTaskCreatePinnedToCore(client_task, "usbh", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(client_task, "usbh", 4096, NULL, 21, NULL, 0);
     return ESP_OK;
 }
 
@@ -220,24 +405,11 @@ int gbac_usb_ready(void)
     return g_ready ? 1 : 0;
 }
 
-/* DWC2(HS, 0x50000000)のレジスタを直接読む。ホストライブラリの内部なので
- * ポート状態を見る公開 API がない。読み取りだけなので起動中も安全。 */
-void gbac_usb_dump_port(void)
+static void cmd_done_cb(usb_transfer_t *t)
 {
-    usb_dwc_hprt_reg_t h = USB_DWC_HS.hprt_reg;
-    usb_dwc_gusbcfg_reg_t g = USB_DWC_HS.gusbcfg_reg;
-    usb_dwc_gotgctl_reg_t o = USB_DWC_HS.gotgctl_reg;
-
-    ESP_LOGI(TAG, "HPRT0=%08x CS=%d ENA=%d PWR=%d LNSTS=%d SPD=%d OVC=%d SUSP=%d RST=%d",
-             h.val, h.prtconnsts, h.prtena, h.prtpwr, h.prtlnsts, h.prtspd,
-             h.prtovrcurract, h.prtsusp, h.prtrst);
-    ESP_LOGI(TAG, "GUSBCFG=%08x phyif=%d ulpiutmisel=%d physel=%d forcehst=%d forcedev=%d",
-             g.val, g.phyif, g.ulpiutmisel, g.physel, g.forcehstmode, g.forcedevmode);
-    ESP_LOGI(TAG, "GOTGCTL=%08x asesvld=%d bsesvld=%d curmod=%d",
-             o.val, o.asesvld, o.bsesvld, o.curmod);
-    ESP_LOGI(TAG, "GSNPSID=%08x HFNUM=%08x GINTSTS=%08x GINTMSK=%08x",
-             USB_DWC_HS.gsnpsid_reg.val, USB_DWC_HS.hfnum_reg.val,
-             USB_DWC_HS.gintsts_reg.val, USB_DWC_HS.gintmsk_reg.val);
+    if (t->status != USB_TRANSFER_STATUS_COMPLETED) {
+        ESP_LOGW(TAG, "コマンド送信失敗 status=%d", (int)t->status);
+    }
 }
 
 /* EP5 OUT に "GBAC"+コマンドを送る */
@@ -257,7 +429,7 @@ static esp_err_t send_cmd(const uint8_t *buf, int len)
     xfer->bEndpointAddress = EP_CMD_OUT;
     xfer->num_bytes = len;
     xfer->timeout_ms = 500;
-    xfer->callback = NULL;
+    xfer->callback = cmd_done_cb;
     xfer->context = NULL;
     return usb_host_transfer_submit(xfer);
 }
@@ -300,6 +472,26 @@ esp_err_t gbac_usb_ping(int *fw_ver)
     return ESP_OK;
 }
 
+uint32_t gbac_usb_bytes(void)
+{
+    return g_bytes;
+}
+
+uint32_t gbac_usb_ep_packets(int idx)
+{
+    return (idx >= 0 && idx < MAX_RX_EP) ? g_ep_pkts[idx] : 0;
+}
+
+int gbac_usb_ep_addr(int idx)
+{
+    return (idx >= 0 && idx < g_rx_n) ? g_rx_ep[idx] : 0;
+}
+
+int gbac_usb_ep_count(void)
+{
+    return g_rx_n;
+}
+
 uint32_t gbac_usb_packets(void)
 {
     return g_pkts;
@@ -308,4 +500,26 @@ uint32_t gbac_usb_packets(void)
 uint32_t gbac_usb_errors(void)
 {
     return g_errs;
+}
+
+uint32_t gbac_usb_ring_dropped(void)
+{
+    return g_ring_drop;
+}
+
+uint32_t gbac_usb_reasm_lost(void)
+{
+    return g_reasm_lost;
+}
+
+/* rx タスクがパケット処理に使った時間(µs 累計)と処理個数。
+ * 1 パケットの原価(=時間/個数)を出して、6.9MB/s に必要な 14.5k pkt/s を
+ * 1 コアでさばけるか判断するため */
+void gbac_usb_rx_prof(int64_t *video_us, int64_t *audio_us,
+                      uint32_t *video_n, uint32_t *audio_n)
+{
+    if (video_us) *video_us = g_prof_v_us;
+    if (audio_us) *audio_us = g_prof_a_us;
+    if (video_n) *video_n = g_prof_v_n;
+    if (audio_n) *audio_n = g_prof_a_n;
 }

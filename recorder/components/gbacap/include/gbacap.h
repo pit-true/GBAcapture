@@ -48,26 +48,45 @@ int gbac_audio_parse(const uint8_t *pkt, size_t len, gbac_audio_t *out);
  * サンプルの bit2=赤bit0(LDR1), bit6=赤bit1(LDR2)。bit7 は未使用。 */
 uint16_t gbac_decode_rgb565(uint16_t sample);
 void gbac_decode_rgb888(uint16_t sample, uint8_t *rgb /* [3] */);
+/* 高速版。RGB565 出力は入力ビットの OR 合成(線形)なので、下位8bit/上位8bit
+ * ずつの寄与を表(計1KB)にしておいて 2 参照 + OR で求められる。
+ * 全 65536 入力で gbac_decode_rgb565 と一致することをテストで保証する。
+ * 使う前に gbac_decode_tables_init() を呼ぶこと(gbac_asm_init が呼ぶ)。*/
+void gbac_decode_tables_init(void);
+uint16_t gbac_decode_rgb565_fast(uint16_t sample);
 /* 復号済みの RGB565 を 8bit へ(緑は6bit→8bit) */
 void gbac_rgb565_to888(uint16_t c, uint8_t *rgb /* [3] */);
 
-/* ---- フレーム組立 (host/gbacap/FrameAssembler.cs と同一) ----
- * ラインは frameNo/lineNo を持つので到着順に依存しない。
- * 160ライン揃った時点でフレーム完成。途中で見掛けた frameNo が変わったら
- * 未完成フレームを破棄して dropped_frames に数える。 */
+/* ---- フレーム組立 ----
+ * ラインは frameNo/lineNo を持つが、映像は EP4/EP1 の 2 本へ分散されるため
+ * 到着順は前後する(EP4 のフレーム N と EP1 のフレーム N+1 が交互に来る)。
+ * フレーム番号で整列させる:
+ *   - 160ライン揃ったら完成
+ *   - 今のフレームより新しい番号のラインが来たら、今のフレームは欠けが
+ *     あっても完成扱いにして打ち切る(欠けた行は lines の前内容が残る)
+ *   - 今のフレームより古い番号のラインは捨てて dropped_lines に数える */
 typedef struct {
   uint16_t lines[GBAC_LINES_PER_FRAME][GBAC_SAMPLES_PER_LINE]; /* RGB565 */
   uint8_t present[GBAC_LINES_PER_FRAME];
   int present_count;
   int have_frame;
   uint8_t frame_no;
-  uint32_t dropped_frames;
+  uint32_t dropped_frames;   /* 枠が足りなくて出せなかったフレーム */
+  uint32_t dropped_lines;    /* 古いフレーム番号だったので捨てたライン */
   uint32_t completed_frames;
 } gbac_asm_t;
 
 void gbac_asm_init(gbac_asm_t *a);
-/* 戻り値: 1=フレーム完成(lines に格納済み), 0=まだ未完, -1=lineNo が範囲外 */
+/* 戻り値:
+ *   1 = 160ライン揃ってフレーム完成(lines に格納済み)
+ *   0 = まだ未完(このラインは今のフレームへ入った)
+ *   2 = このラインは今のフレームより新しい番号。今のフレームはここで
+ *       打ち切り(lines を読み出してよい)。このラインはまだ入れていない
+ *  -1 = lineNo が範囲外
+ *  -2 = このラインは今のフレームより古い。捨てた */
 int gbac_asm_push(gbac_asm_t *a, const gbac_line_t *line);
+/* 次のフレームへ進む(frame_no だけ合わせ、lines の中身は消さない) */
+void gbac_asm_start(gbac_asm_t *a, uint8_t frame_no);
 
 /* ---- 整数倍 nearest neighbor 拡大 + O_UYY_E_VYY 変換 ----
  * src: w x h の RGB565。out は W=w*scale x H=h*scale の packed YUV420。
@@ -130,7 +149,11 @@ typedef struct {
 } gbac_pts_t;
 
 void gbac_pts_init(gbac_pts_t *p);
-/* 戻り値: 1=新しいフレーム(pts_us に µs), 0=同じフレーム番号(無視) */
+/* 戻り値:
+ *   1 = PTS を進めた(*pts_us に µs を書く)
+ *   0 = 同じ番号、または後戻り(EP の到着順の前後)。*pts_us は触らない。
+ *       呼び出し側はこのフレームを完成扱いにせず捨てること。
+ * 差 1..16 は正常、17..128 は欠落として受け入れ、0 と 129..255 は進めない。*/
 int gbac_pts_push(gbac_pts_t *p, uint8_t frame_no, uint64_t *pts_us);
 
 /* ---- ファイル分割 ---- */

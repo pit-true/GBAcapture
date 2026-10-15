@@ -13,6 +13,8 @@ idf_component_register(
     PRIV_REQUIRES
         gbacap
         usb
+        hal
+        soc
         fatfs
         sdmmc
         esp_driver_sdmmc

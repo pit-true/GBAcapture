@@ -40,3 +40,30 @@ void gbac_rgb565_to888(uint16_t c, uint8_t *rgb) {
   rgb[1] = (uint8_t)((g << 2) | (g >> 4));
   rgb[2] = (uint8_t)((b << 3) | (b >> 2));
 }
+
+/* ---- 高速版: 8bit ずつの寄与表 ----
+ * 上記の展開は「各入力ビットが固定の出力ビット群へ OR で配線される」形
+ * (緑だけ bit15 が 2 か所に配線されるが重ならない)なので、
+ * 下位8bit と上位8bit の寄与を別表にして OR すれば参照実装と完全一致する。
+ * 表は .bss(内部 RAM)1KB。初期化は 512 回の参照呼び出しだけ。*/
+static uint16_t s_lut_lo[256];
+static uint16_t s_lut_hi[256];
+
+void gbac_decode_tables_init(void) {
+  for (int x = 0; x < 256; x++) {
+    uint16_t acc = 0;
+    for (int b = 0; b < 8; b++)
+      if (x & (1 << b)) acc |= gbac_decode_rgb565((uint16_t)(1u << b));
+    s_lut_lo[x] = acc;
+  }
+  for (int y = 0; y < 256; y++) {
+    uint16_t acc = 0;
+    for (int b = 0; b < 8; b++)
+      if (y & (1 << b)) acc |= gbac_decode_rgb565((uint16_t)(1u << (b + 8)));
+    s_lut_hi[y] = acc;
+  }
+}
+
+uint16_t gbac_decode_rgb565_fast(uint16_t sample) {
+  return s_lut_lo[sample & 0xFF] | s_lut_hi[sample >> 8];
+}

@@ -106,6 +106,19 @@ static void test_decode(void) {
   OK_EQ(rgb[0], 0);
   OK_EQ(rgb[1], 0);
   OK_EQ(rgb[2], 0);
+
+  /* テーブル版 (gbac_decode_rgb565_fast) が参照実装と全入力で一致すること。
+   * 16bit サンプルは出力ビットへ線形(OR)に配線されるので 8bit ずつの表で作れる。*/
+  gbac_decode_tables_init();
+  int diff = 0;
+  for (uint32_t v = 0; v < 0x10000u; v++) {
+    if (gbac_decode_rgb565_fast((uint16_t)v) != gbac_decode_rgb565((uint16_t)v)) diff++;
+  }
+  OK_EQ(diff, 0);
+  OK_EQ(gbac_decode_rgb565_fast(0xFF7F), 0xFFFF);
+  OK_EQ(gbac_decode_rgb565_fast(0x0447), 0xF800);
+  OK_EQ(gbac_decode_rgb565_fast(0xF800), 0x07E0);
+  OK_EQ(gbac_decode_rgb565_fast(0x0338), 0x001F);
 }
 
 /* ---------- 4. フレーム組立 (FrameAssembler.cs と同一) ---------- */
@@ -128,10 +141,11 @@ static void test_asm(void) {
   }
   OK_EQ(completed, 1);
   OK_EQ(a.completed_frames, 1);
-  OK_EQ(a.present_count, 0); /* 完成でクリア */
+  OK_EQ(a.dropped_lines, 0);
   OK_EQ(a.lines[5][7], 0xFFFF);
 
-  /* frame 4 を 10ラインだけ受けてから frame 5 へ → 未完成を破棄 */
+  /* frame 4 を 10ラインだけ受けてから frame 5 のラインが来た
+   * → frame 4 は「欠けありで完成」扱い(gbac_asm_push は 2 を返す) */
   for (int i = 0; i < 10; i++) {
     ln.frame_no = 4;
     ln.line_no = (uint16_t)i;
@@ -139,11 +153,23 @@ static void test_asm(void) {
   }
   ln.frame_no = 5;
   ln.line_no = 0;
+  OK_EQ(gbac_asm_push(&a, &ln), 2);
+  OK_EQ(a.completed_frames, 2);
+  /* 呼び出し側は gbac_asm_start で次のフレームへ進む */
+  gbac_asm_start(&a, 5);
+  OK_EQ(a.present_count, 0);
   OK_EQ(gbac_asm_push(&a, &ln), 0);
-  OK_EQ(a.dropped_frames, 1);
+  OK_EQ(a.present_count, 1);
+
+  /* 古いフレーム番号のラインは捨てて数えるだけ */
+  ln.frame_no = 4;
+  ln.line_no = 20;
+  OK_EQ(gbac_asm_push(&a, &ln), -2);
+  OK_EQ(a.dropped_lines, 1);
   OK_EQ(a.present_count, 1);
 
   /* 範囲外 lineNo */
+  ln.frame_no = 5;
   ln.line_no = GBAC_LINES_PER_FRAME;
   OK_EQ(gbac_asm_push(&a, &ln), -1);
   ln.line_no = 65535;
@@ -154,23 +180,45 @@ static void test_asm(void) {
   for (int j = 0; j < GBAC_SAMPLES_PER_LINE; j++) s2[j] = 0x0000;
   for (int rep = 0; rep < 2; rep++) {
     for (int i = 0; i < 10; i++) {
-      ln.frame_no = 6;
+      ln.frame_no = 5;
       ln.line_no = (uint16_t)i;
       ln.samples = (rep == 0) ? s : s2;
       OK_EQ(gbac_asm_push(&a, &ln), 0);
     }
   }
   OK_EQ(a.present_count, 10);
-  OK_EQ(a.completed_frames, 1);
-  OK_EQ(a.dropped_frames, 2); /* frame 5 が未完成のまま破棄された */
+  OK_EQ(a.completed_frames, 2);
   OK_EQ(a.lines[5][7], 0x0000);
 
-  /* frame 6 未完成のまま frame 7 へ → 破棄がもう1増える */
+  /* 欠けたラインは前のフレームの内容が残っている(frame 5 の 30 行目は
+   * 0xFFFF のまま。0x0000 で埋め直していないことを見る) */
   ln.samples = s;
-  ln.frame_no = 7;
-  ln.line_no = 0;
+  OK_EQ(a.lines[30][7], 0xFFFF);
+
+  /* EP が前後して frame 6 のラインが frame 5 の残りに先んじても大丈夫。
+   * 6 側が来たら 5 は完成扱い(2 が返る)。5 の残りは古いので捨てられる */
+  ln.frame_no = 6;
+  ln.line_no = 1;
+  OK_EQ(gbac_asm_push(&a, &ln), 2);
+  OK_EQ(a.completed_frames, 3);
+  gbac_asm_start(&a, 6);
+  ln.frame_no = 5;
+  ln.line_no = 2;
+  OK_EQ(gbac_asm_push(&a, &ln), -2);
+  OK_EQ(a.dropped_lines, 2);
+
+  /* フレーム番号は u8。255 → 0 は「新しい」側、0 → 255 は古い側 */
+  gbac_asm_start(&a, 255);
+  ln.frame_no = 255;
+  ln.line_no = 3;
   OK_EQ(gbac_asm_push(&a, &ln), 0);
-  OK_EQ(a.dropped_frames, 3);
+  ln.frame_no = 0;
+  ln.line_no = 4;
+  OK_EQ(gbac_asm_push(&a, &ln), 2);
+  gbac_asm_start(&a, 0);
+  ln.frame_no = 255;
+  ln.line_no = 5;
+  OK_EQ(gbac_asm_push(&a, &ln), -2);
 }
 
 /* ---------- 5. 拡大 + O_UYY_E_VYY(HW エンコーダの原生形式) ---------- */
@@ -334,6 +382,61 @@ static void test_pts(void) {
   OK_EQ(us, 16742);
 }
 
+/* 8b. PTS の後戻り防止。
+ * 映像は EP4/EP1 の 2 本へ分散されるのでフレーム番号が 1 つ戻ることがある。
+ * 差を (uint8_t)(now-prev) で取ると 1 戻りが 255 になり、frame_index が
+ * 255 進んで PTS が 4.3 秒飛ぶ。実機 REC_0006.mp4 で 21.3 秒の録画の尺が
+ * 535 秒になった原因(2026-10-16)。
+ * 規則: 差 1..128 は進める(17 以上は欠落として受け入れる)、
+ *       差 0 と 129..255(後戻り)は 0 を返し *pts_us を触らない。 */
+static void test_pts_back(void) {
+  const uint64_t sentinel = 0xDEADBEEFULL;
+  gbac_pts_t p;
+  uint64_t us;
+
+  for (int d = 1; d <= 255; d++) {
+    gbac_pts_init(&p);
+    OK_EQ(gbac_pts_push(&p, 7, &us), 1);
+    OK_EQ(us, 0);
+    us = sentinel;
+    int r = gbac_pts_push(&p, (uint8_t)(7 + d), &us);
+    uint64_t want = (uint64_t)d * 1000000ULL * GBAC_FPS_DEN / GBAC_FPS_NUM;
+    if (d <= 128) {
+      OK_EQ(r, 1);
+      OK_EQ(us, want);
+    } else {
+      OK_EQ(r, 0);
+      OK_EQ(us, sentinel); /* 後戻りのときは PTS を書かない */
+    }
+  }
+
+  /* 差 0(同じ番号)も書かない */
+  gbac_pts_init(&p);
+  OK_EQ(gbac_pts_push(&p, 7, &us), 1);
+  us = sentinel;
+  OK_EQ(gbac_pts_push(&p, 7, &us), 0);
+  OK_EQ(us, sentinel);
+
+  /* 後戻りのあとで正常な進行が復活する */
+  gbac_pts_init(&p);
+  OK_EQ(gbac_pts_push(&p, 100, &us), 1);
+  OK_EQ(us, 0);
+  OK_EQ(gbac_pts_push(&p, 99, &us), 0); /* 1 戻り = 差 255 */
+  OK_EQ(gbac_pts_push(&p, 101, &us), 1);
+  OK_EQ(us, 16742);
+  /* 境界: 差 16 は正常、差 17 は欠落(gap)として受け入れる。
+   * 受け入れたらフレーム番号が進んだ分だけ PTS も進む(100→117 は 17 段)。
+   * 前の push(101) で frame_index は 1 なので、117 では 1+16=17 段。 */
+  OK_EQ(gbac_pts_push(&p, 117, &us), 1);
+  OK_EQ(us, 17ULL * 1000000ULL * GBAC_FPS_DEN / GBAC_FPS_NUM);
+  OK_EQ(gbac_pts_push(&p, 134, &us), 1);
+  OK_EQ(us, 34ULL * 1000000ULL * GBAC_FPS_DEN / GBAC_FPS_NUM);
+  /* 21 秒分のフレーム番号が進んだとして、PTS は約 21 秒になる */
+  OK_EQ(gbac_pts_push(&p, (uint8_t)(134 + 120), &us), 1);
+  OK_EQ(us, 154ULL * 1000000ULL * GBAC_FPS_DEN / GBAC_FPS_NUM);
+  OK(us < 22 * 1000000ULL);
+}
+
 /* ---------- 9. ファイル分割 ---------- */
 static void test_split(void) {
   gbac_split_t s;
@@ -477,6 +580,7 @@ int main(void) {
   RUN(test_audio_fx);
   RUN(test_resamp);
   RUN(test_pts);
+  RUN(test_pts_back);
   RUN(test_split);
   RUN(test_scale_real);
   RUN(test_pts_ms);

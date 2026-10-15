@@ -13,7 +13,8 @@
 
 /* 484B パケット 1 個を受け取るたびに呼ばれる。
  * EP4/EP1/EP3 のどれから来たかは分からない(先頭の magic で判別する)。
- * usb_host_nano.c のクライアントタスクの文脈で呼ばれる。長く止めること。 */
+ * USB 側のタスクではなく、core1 で動く専用の rx タスクの文脈で呼ばれる
+ * (rx_cb はリングへコピーするだけにしている)。 */
 typedef void (*gbac_pkt_cb)(const uint8_t *pkt, int len, void *arg);
 
 esp_err_t gbac_usb_start(gbac_pkt_cb cb, void *arg);
@@ -29,10 +30,16 @@ esp_err_t gbac_usb_stream_stop(void);
  * 応答は EP4 IN に 8 バイトで返る(先頭が 'G','B','A','C')。 */
 esp_err_t gbac_usb_ping(int *fw_ver);
 
-uint32_t gbac_usb_packets(void);   /* 受信したパケット総数 */
+uint32_t gbac_usb_packets(void);   /* 完了した転送の数 */
+uint32_t gbac_usb_bytes(void);     /* 転送で受け取ったバイト数の合計 */
+/* EP ごとの内訳。受信 EP の並び順で idx を渡す(addr は 0x84 のような値) */
+int gbac_usb_ep_count(void);
+uint32_t gbac_usb_ep_packets(int idx);
+int gbac_usb_ep_addr(int idx);
 uint32_t gbac_usb_errors(void);    /* 転送エラー数 */
-
-/* HS コントローラのポート状態レジスタを出す。
- * CS(port connect status)=0 なら D+ のプルアップを物理的に見ていない
- * = ケーブル / PHY / 給電側。CS=1 なのに列挙しなければプロトコル側。 */
-void gbac_usb_dump_port(void);
+uint32_t gbac_usb_ring_dropped(void);  /* リング満杯で捨てたパケット */
+uint32_t gbac_usb_reasm_lost(void);    /* 再組み立てが壊れて捨てたバイト */
+/* rx タスクがパケット処理に使った µs 累計と個数(NULL で省略可)。
+ * 割ることで 1 パケットの原価が出る */
+void gbac_usb_rx_prof(int64_t *video_us, int64_t *audio_us,
+                      uint32_t *video_n, uint32_t *audio_n);

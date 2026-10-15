@@ -29,6 +29,9 @@ static const char *TAG = "main";
 static gbac_cfg_t g_cfg;
 static bool g_recording;
 
+static uint32_t g_pkt_unk;   /* マジバがどちらでもないパケット */
+static int g_pkt_dbg;        /* 中身を一度だけログに出す回数 */
+
 static void on_packet(const uint8_t *pkt, int len, void *arg)
 {
     (void)arg;
@@ -36,7 +39,80 @@ static void on_packet(const uint8_t *pkt, int len, void *arg)
         frame_pipe_push(pkt, len);
     } else if (len > 0 && pkt[0] == GBAC_AUDIO_MAGIC) {
         audio_pipe_push(pkt, len);
+    } else {
+        g_pkt_unk++;
+        if (g_pkt_dbg < 4) {
+            g_pkt_dbg++;
+            ESP_LOGW(TAG, "未知 pkt %d/4 len=%d %02x %02x %02x %02x %02x %02x %02x %02x",
+                     g_pkt_dbg, len, pkt[0], len > 1 ? pkt[1] : 0, len > 2 ? pkt[2] : 0,
+                     len > 3 ? pkt[3] : 0, len > 4 ? pkt[4] : 0, len > 5 ? pkt[5] : 0,
+                     len > 6 ? pkt[6] : 0, len > 7 ? pkt[7] : 0);
+        }
     }
+}
+
+/* 1 秒ごとの受信速度。録画・テストの「経過秒」と「直近 1 秒の bytes/s」を
+ * ログに残して、速さを推定ではなく実測で示すため(監督 2026-10-16 指示)。
+ * サンプルはメインループの 1 秒周期で取る(追加タスクは作らない)。 */
+static int64_t g_run_us;        /* 録画/テスト開始時刻。0 = 止まっている */
+static uint32_t g_run_bytes;    /* 開始時の受信バイト累計 */
+static int64_t g_smp_us;        /* 前回サンプル時刻 */
+static uint32_t g_smp_bytes, g_smp_pkts, g_smp_ring, g_smp_fok, g_smp_fdrop;
+static double g_rate_mbs;       /* 直近 1 秒の MB/s */
+
+static void run_begin(void)
+{
+    g_run_us = esp_timer_get_time();
+    g_run_bytes = gbac_usb_bytes();
+    g_smp_us = g_run_us;
+    g_smp_bytes = g_run_bytes;
+    g_smp_pkts = gbac_usb_packets();
+    g_smp_ring = gbac_usb_ring_dropped();
+    g_smp_fok = frame_pipe_completed();
+    g_smp_fdrop = frame_pipe_dropped();
+    g_rate_mbs = 0;
+}
+
+static void run_end(const char *what)
+{
+    if (g_run_us == 0) {
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    double dur = (double)(now - g_run_us) / 1e6;
+    uint32_t bytes = gbac_usb_bytes() - g_run_bytes;   /* 32bit 差なので折返し-safe */
+    ESP_LOGI(TAG, "%s 経過 %.1fs 受信 %lluKB 平均 %.2fMB/s", what, dur,
+             (unsigned long long)(bytes / 1024),
+             dur > 0 ? (double)bytes / dur / 1e6 : 0.0);
+    g_run_us = 0;
+}
+
+static void sample_1s(void)
+{
+    if (g_run_us == 0) {
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    double dt = (double)(now - g_smp_us) / 1e6;
+    if (dt < 0.5) {
+        return;
+    }
+    uint32_t b = gbac_usb_bytes(), p = gbac_usb_packets();
+    uint32_t ring = gbac_usb_ring_dropped();
+    uint32_t fok = frame_pipe_completed(), fdrop = frame_pipe_dropped();
+    g_rate_mbs = (double)(b - g_smp_bytes) / dt / 1e6;
+    ESP_LOGI(TAG, "1s rx=%.2fMB/s t=%.1fs pkt+=%llu ring+=%llu frame+=%llu drop+=%llu",
+             g_rate_mbs, (double)(now - g_run_us) / 1e6,
+             (unsigned long long)(p - g_smp_pkts),
+             (unsigned long long)(ring - g_smp_ring),
+             (unsigned long long)(fok - g_smp_fok),
+             (unsigned long long)(fdrop - g_smp_fdrop));
+    g_smp_us = now;
+    g_smp_bytes = b;
+    g_smp_pkts = p;
+    g_smp_ring = ring;
+    g_smp_fok = fok;
+    g_smp_fdrop = fdrop;
 }
 
 /* 起動時にチップとヒープを出す。rev1_3 プロファイルが実機(v1.3)と
@@ -54,16 +130,74 @@ static void show_board(void)
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 }
 
+/* EP ごとの受信数。nano は映像を EP4/EP1、音声を EP3 に分けて送るので、
+ * どれか 1 本が黙っているとフレームが組立たない。切り分け用に常時出す。 */
+static const char *usb_ep_stats(void)
+{
+    static char buf[96];
+    int n = gbac_usb_ep_count();
+    int off = 0;
+    for (int i = 0; i < n && off < (int)sizeof(buf) - 20; i++) {
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%02x=%llu ",
+                        gbac_usb_ep_addr(i),
+                        (unsigned long long)gbac_usb_ep_packets(i));
+    }
+    if (off >= (int)sizeof(buf)) {
+        off = (int)sizeof(buf) - 1;
+    }
+    buf[off] = '\0';
+    return buf;
+}
+
 static void show_status(void)
 {
-    ESP_LOGI(TAG, "sd=%d rec=%d free=%lluMB | usb pkts=%llu err=%llu | frame ok=%llu drop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus",
+    int64_t vus = 0, aus = 0;
+    uint32_t vn = 0, an = 0;
+    gbac_usb_rx_prof(&vus, &aus, &vn, &an);
+    double t_run = g_run_us ? (double)(esp_timer_get_time() - g_run_us) / 1e6 : 0.0;
+    ESP_LOGI(TAG, "sd=%d rec=%d free=%lluMB | usb pkts=%llu bytes=%lluKB err=%llu unk=%llu ring=%llu lost=%llu ep[%s] | frame ok=%llu drop=%llu ldrop=%llu | aud gap=%llu ovf=%llu | enc f=%llu e=%llu scale<=%uus enc<=%uus | mux=%s %.1fs",
              gbac_sd_ready(), g_recording ? 1 : 0,
              (unsigned long long)gbac_rec_sd_free_mb(),
-             (unsigned long long)gbac_usb_packets(), (unsigned long long)gbac_usb_errors(),
+             (unsigned long long)gbac_usb_packets(),
+             (unsigned long long)(gbac_usb_bytes() / 1024),
+             (unsigned long long)gbac_usb_errors(),
+             (unsigned long long)g_pkt_unk,
+             (unsigned long long)gbac_usb_ring_dropped(),
+             (unsigned long long)gbac_usb_reasm_lost(),
+             usb_ep_stats(),
              (unsigned long long)frame_pipe_completed(), (unsigned long long)frame_pipe_dropped(),
+             (unsigned long long)frame_pipe_dropped_lines(),
              (unsigned long long)audio_pipe_gaps(), (unsigned long long)audio_pipe_overruns(),
              (unsigned long long)gbac_enc_frames(), (unsigned long long)gbac_enc_errors(),
-             (unsigned)gbac_enc_scale_us_max(), (unsigned)gbac_enc_enc_us_max());
+             (unsigned)gbac_enc_scale_us_max(), (unsigned)gbac_enc_enc_us_max(),
+             gbac_rec_mux_where(), (double)gbac_rec_mux_age_us() / 1e6);
+    /* 経過秒と直近 1 秒の実測速度、rx タスクの 1 パケット原価 */
+    ESP_LOGI(TAG, "t=%.1fs rx1s=%.2fMB/s | rx v=%lldus/%llu(=%lldus/pkt) a=%lldus/%llu(=%lldus/pkt)",
+             t_run, g_rate_mbs,
+             (long long)vus, (unsigned long long)vn,
+             vn ? (long long)(vus / (int64_t)vn) : 0,
+             (long long)aus, (unsigned long long)an,
+             an ? (long long)(aus / (int64_t)an) : 0);
+}
+
+/* どのタスクが CPU を食っているか。core0 が飽和しているかを見るために、
+ * 録画・パイプラインテストの終わる直前に 'p' で出す。
+ * RunTime は esp_timer のマイクロ秒、Percentage は全タスク合計に対する割合。 */
+static void show_task_stats(void)
+{
+    char *buf = malloc(2048);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "統計用のバッファが確保できない");
+        return;
+    }
+    /* 2 コア別々には出ないので、合計の CPU 時間と、コアの空きは i のログで見る */
+    vTaskGetRunTimeStats(buf);
+    ESP_LOGI(TAG, "タスク統計(起動からの累計)");
+    ESP_LOGI(TAG, "%s", buf);
+    free(buf);
+    ESP_LOGI(TAG, "heap internal=%uKB psram=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 }
 
 static void start_recording(void)
@@ -81,6 +215,7 @@ static void start_recording(void)
         return;
     }
     gbac_usb_stream_start();
+    run_begin();
     gbac_led_rec(true);
     g_recording = true;
     ESP_LOGI(TAG, "録画開始 scale=%dx %dkbps split=%dmin vol=%d%%",
@@ -93,6 +228,7 @@ static void stop_recording(void)
     gbac_rec_stop();
     gbac_led_rec(false);
     g_recording = false;
+    run_end("録画");
     show_status();
 }
 
@@ -114,6 +250,7 @@ static void start_pipe_test(void)
         return;
     }
     gbac_usb_stream_start();
+    run_begin();
     gbac_led_rec(true);
     g_pipe_test = true;
     ESP_LOGI(TAG, "パイプラインテスト開始(mp4 には書かない)");
@@ -125,6 +262,7 @@ static void stop_pipe_test(void)
     gbac_enc_stop();
     gbac_led_rec(false);
     g_pipe_test = false;
+    run_end("パイプラインテスト");
     show_status();
 }
 
@@ -189,14 +327,20 @@ static void uart_cmd_handle(char c)
         } else {
             start_pipe_test();
         }
+    } else if (c == 'p') {
+        show_task_stats();
     } else if (c == 's') {
         if (gbac_sd_ready()) {
             ESP_LOGI(TAG, "SD はすでにマウント済み");
         } else {
             gbac_sd_probe();
         }
-    } else if (c == 'u') {
-        gbac_usb_dump_port();
+    } else if (c == 'w') {
+        if (g_recording) {
+            ESP_LOGW(TAG, "録画中なので速度テストは使えない");
+        } else {
+            gbac_sd_speedtest(16);
+        }
     } else if (c == 'd') {
         ESP_LOGI(TAG, "書き込みモードで再起動する(esptool がつながる)");
         enter_download_mode();
@@ -222,7 +366,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 総当たり u=USB ポート d=書き込みモード");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 d=書き込みモード");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
@@ -245,12 +389,9 @@ void app_main(void)
     gbac_button_init();
     gbac_usb_start(on_packet, NULL);
     if (gbac_sd_mount() != ESP_OK) {
-        /* 結線(スロット番号 / IO 電源の LDO / 電源ゲート)が回路図で読み切れない。
-         * 総当たりで生やすので、カードを挿していればここで復旧する。 */
-        ESP_LOGW(TAG, "SD が見えない。結線を総当たりする");
-        if (gbac_sd_probe() != ESP_OK) {
-            ESP_LOGE(TAG, "SD 未挿入。挿してからボタンを押してね");
-        }
+        /* 結線は確定済み(slot0/LDO VO4/40MHz)なので総当たりはしない。
+         * ここで見えないときはカードの接触か未挿入。`s` で再確認できる。 */
+        ESP_LOGE(TAG, "SD が見えない。カードを挿し直すか、's' で結線を確かめてね");
     }
 
 #if CONFIG_GBAC_BENCH_FRAMES > 0
@@ -284,6 +425,7 @@ void app_main(void)
             gbac_led_blink(4, 100);
         }
         uart_cmd_poll();
+        sample_1s();
         if (esp_timer_get_time() - last_log > 10 * 1000 * 1000) {
             last_log = esp_timer_get_time();
             show_status();
