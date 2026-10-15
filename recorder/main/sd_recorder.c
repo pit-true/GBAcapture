@@ -45,6 +45,9 @@ static const char *TAG = "rec";
 
 static sdmmc_card_t *g_card;
 static bool g_mounted;
+/* PC に SD を見せて(MSC)いて、こちらの FATFS 登録だけ外れている状態。
+ * カードは初期化済みのまま PC 側が読むので、ここで SD を触ると二重アクセスになる。 */
+static bool g_detached;
 static bool g_registered;
 static esp_muxer_handle_t g_muxer;
 static int g_vidx = -1;
@@ -306,6 +309,10 @@ esp_err_t gbac_sd_mount(void)
     if (g_mounted) {
         return ESP_OK;
     }
+    if (g_detached) {
+        ESP_LOGE(TAG, "PC に SD を見せている最中。SD を再初期化しない('m' で戻す)");
+        return ESP_ERR_INVALID_STATE;
+    }
     sd_probe_t p;
     if (g_win_ok) {
         p = g_win;
@@ -351,6 +358,10 @@ esp_err_t gbac_sd_probe(void)
 {
     if (g_mounted) {
         return ESP_OK;
+    }
+    if (g_detached) {
+        ESP_LOGE(TAG, "PC に SD を見せている最中。SD を再初期化しない('m' で戻す)");
+        return ESP_ERR_INVALID_STATE;
     }
     /* 前に通信できた設定を知っていれば(FAT が読めないだけだった)、それを最初に試す。
      * FAT32 にフォーマットし直してもらえれば、ここでそのまま生える。 */
@@ -431,6 +442,7 @@ esp_err_t gbac_sd_fat_detach(void)
     f_mount(NULL, drv, 0);
     ff_diskio_unregister(pdrv);
     g_mounted = false;
+    g_detached = true;
     ESP_LOGI(TAG, "SD: FATFS の登録だけ外した(カードは初期化済みのまま pdrv=%c)", drv[0]);
     return ESP_OK;
 }
@@ -467,6 +479,7 @@ esp_err_t gbac_sd_fat_attach(void)
         return ESP_FAIL;
     }
     g_mounted = true;
+    g_detached = false;
     sd_log_card();
     return ESP_OK;
 }
@@ -700,6 +713,10 @@ esp_err_t gbac_sd_speedtest(int mb)
     if (!g_card) {
         ESP_LOGE(TAG, "SD がマウントされていない");
         return ESP_FAIL;
+    }
+    if (g_detached) {
+        ESP_LOGE(TAG, "PC に SD を見せている最中。速度テストはできない('m' で戻す)");
+        return ESP_ERR_INVALID_STATE;
     }
     if (mb < 1) {
         mb = 1;
