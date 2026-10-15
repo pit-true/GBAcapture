@@ -43,7 +43,7 @@ while time.time() < end:
             if not booted and re.search(rb"boot: ESP-IDF", buf):
                 booted = True
                 emit("%s 起動バナーを検出。この後のログを集めます" % stamp())
-        if booted and (time.time() - last > 6 or len(buf) > 12000):
+        if booted and (time.time() - last > 6 or len(buf) > 200000):
             break
     try:
         s.close()

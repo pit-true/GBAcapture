@@ -82,6 +82,12 @@ int gbac_asm_push(gbac_asm_t *a, const gbac_line_t *line);
 void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
                      uint8_t *out);
 
+/* gbac_scale_ouyy の内訳の実測(マイクロ秒、加算)。
+ *   0 = RGB565 展開  1 = Y 行作り  2 = 彩度+パック  3 = 行コピー
+ * 呼び出しをまたいで増え続ける。ベンチで枚数を割って 1 枚あたりを出す。
+ * ホスト(gcc)では計測しないので常に 0。 */
+extern int64_t gbac_scale_prof[4];
+
 /* ---- 音声加工 (host/GbaCap.Viewer/ViewerForm.cs と同じ連鎖) ----
  * DCオフセット追従(係数0.0005) → 2次バターワースLPF(fc 13kHz@32.768kHz)
  * → ゲイン(2 * volume) → int16。入力 [右,左] → 出力 [左,右]。 */
