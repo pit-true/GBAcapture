@@ -21,6 +21,17 @@
 #include "gbacap.h"
 #include <string.h>
 
+/* 内訳の実測。ESP_IDF でのだけ計測する(ホストテストは 0 のまま)。
+ * 1 フレームで 4 回読むだけなのでオーバーヘッドは無視できる。 */
+#ifdef ESP_PLATFORM
+#include "esp_timer.h"
+#define PROF_NOW() esp_timer_get_time()
+#else
+#define PROF_NOW() (int64_t)0
+#endif
+
+int64_t gbac_scale_prof[4];
+
 #define GBAC_CW_MAX (GBAC_WIDTH * GBAC_MAX_SCALE / 2) /* 480 */
 #define GBAC_YW_MAX (GBAC_WIDTH * GBAC_MAX_SCALE)     /* 960 */
 #define GBAC_YH_MAX (GBAC_HEIGHT * GBAC_MAX_SCALE)    /* 640 */
@@ -60,6 +71,7 @@ static int row_slot(row_cache_t *c, const uint16_t *src, int w, int row) {
     if (c->idx[i] < c->idx[oldest]) oldest = i;
   }
   const uint16_t *s = src + (size_t)row * w;
+  int64_t t0 = PROF_NOW();
   for (int x = 0; x < w; x++) {
     uint8_t rgb[3];
     gbac_rgb565_to888(s[x], rgb);
@@ -67,6 +79,7 @@ static int row_slot(row_cache_t *c, const uint16_t *src, int w, int row) {
     c->g[oldest][x] = rgb[1];
     c->b[oldest][x] = rgb[2];
   }
+  gbac_scale_prof[0] += PROF_NOW() - t0;
   c->idx[oldest] = row;
   return oldest;
 }
@@ -217,12 +230,18 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
       const int sb = row_slot(&s_cache, src, w, b);
       if (sy != cur_sy) {
         const int slot = row_slot(&s_cache, src, w, sy);
+        int64_t t1 = PROF_NOW();
         build_yrow(&s_cache, slot, w, scale, s_yrow);
+        gbac_scale_prof[1] += PROF_NOW() - t1;
         cur_sy = sy;
       }
-      build_uv_rows(s_urow, s_vrow, s_yrow, s_xmap, cw, even,
-                    s_cache.r[sa], s_cache.g[sa], s_cache.b[sa], s_cache.r[sb],
-                    s_cache.g[sb], s_cache.b[sb]);
+      {
+        int64_t t2 = PROF_NOW();
+        build_uv_rows(s_urow, s_vrow, s_yrow, s_xmap, cw, even,
+                      s_cache.r[sa], s_cache.g[sa], s_cache.b[sa], s_cache.r[sb],
+                      s_cache.g[sb], s_cache.b[sb]);
+        gbac_scale_prof[2] += PROF_NOW() - t2;
+      }
       cur_a = a;
       cur_b = b;
     }
@@ -233,9 +252,13 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
            (2 * ((r + nrow) / 2)) / scale == a &&
            (2 * ((r + nrow) / 2) + 1) / scale == b)
       nrow++;
-    for (int k = 0; k < nrow; k++)
-      memcpy(out + (size_t)(r + k) * stride, ((r + k) & 1) ? s_vrow : s_urow,
-             stride);
+    {
+      int64_t t3 = PROF_NOW();
+      for (int k = 0; k < nrow; k++)
+        memcpy(out + (size_t)(r + k) * stride, ((r + k) & 1) ? s_vrow : s_urow,
+               stride);
+      gbac_scale_prof[3] += PROF_NOW() - t3;
+    }
     r += nrow;
   }
 }

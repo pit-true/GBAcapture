@@ -116,6 +116,9 @@ static const sd_probe_t k_sd_probe[] = {
     { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
     { SDMMC_HOST_SLOT_0, 4, 3, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
     { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+    /* 信号品質が怪しいときの確認。遅くして読めるなら配線・耐量の問題 */
+    { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, 4000 },
+    { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, 1000 },
 };
 #define K_SD_PROBE_N ((int)(sizeof(k_sd_probe) / sizeof(k_sd_probe[0])))
 
@@ -206,12 +209,44 @@ static void sd_log_card(void)
 
 /* カードと通信できたのに FAT が読めないときに、カードの正体を直接出す。
  * esp_vfs_fat_sdmmc_mount は失敗すると host を deinit するので、ここで組み直す。 */
+
+/* セクタを 1 個読んで、先頭 16 バイトの hex と署名を出す。
+ * 信号が怪しければ中身はランダム、exFAT/NTFS/GPT なら署名がちゃんと見える。
+ * 戻り値は MBR の第 1 分区の開始 LBA(分区がなければ 0)。 */
+static unsigned sd_dump_sect(sdmmc_card_t *card, unsigned lba)
+{
+    uint8_t b[512];
+    if (sdmmc_read_sectors(card, b, lba, 1) != ESP_OK) {
+        ESP_LOGE(TAG, "SD 診断: LBA%u が読めない", lba);
+        return 0;
+    }
+    char hex[3 * 16 + 1];
+    int k = 0;
+    for (int i = 0; i < 16; i++) k += snprintf(hex + k, sizeof(hex) - k, "%02x ", b[i]);
+    ESP_LOGI(TAG, "SD診断 LBA%u 先16B: %s", lba, hex);
+    /* 署名らしき文字列を拾う */
+    static const char *kSig[] = { "EXFAT   ", "NTFS    ", "FAT32   ", "FAT16   ",
+                                  "FAT12   ", "EFI PART", "MBR     " };
+    for (unsigned i = 0; i < sizeof(kSig) / sizeof(kSig[0]); i++) {
+        for (int off = 0; off + 8 <= 512; off++) {
+            if (memcmp(b + off, kSig[i], 8) == 0) {
+                ESP_LOGI(TAG, "SD診断 LBA%u: \"%s\" を offset 0x%x で発見", lba, kSig[i], off);
+                break;
+            }
+        }
+    }
+    const unsigned start = b[0x1c6] | (b[0x1c7] << 8) | (b[0x1c8] << 16) | (b[0x1c9] << 24);
+    ESP_LOGI(TAG, "SD診断 LBA%u: 末尾=0x%02x%02x 分区種別(0x1c2)=0x%02x 開始LBA(0x1c6)=%u",
+             lba, b[510], b[511], b[0x1c2], start);
+    return (b[510] == 0x55 && b[511] == 0xaa) ? start : 0;
+}
+
 static void sd_diag_card(const sd_probe_t *p)
 {
     sd_apply_power(p);
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = p->slot;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;   /* 情報読みだけなので遅くてよい */
+    host.max_freq_khz = 4000;               /* 情報読みは低速で確実に */
     host.pwr_ctrl_handle = g_pwr;
     sdmmc_slot_config_t slot;
     sd_slot_setup(p, &slot, 1);               /* 情報読みは 1bit で十分 */
@@ -226,13 +261,20 @@ static void sd_diag_card(const sd_probe_t *p)
         return;
     }
     sdmmc_card_t card;
-    memset(&card, 0, sizeof(card));
-    esp_err_t e = sdmmc_card_init(&host, &card);
+    esp_err_t e = ESP_FAIL;
+    for (int attempt = 0; attempt < 4 && e != ESP_OK; attempt++) {
+        memset(&card, 0, sizeof(card));
+        e = sdmmc_card_init(&host, &card);
+    }
     if (e == ESP_OK) {
         unsigned long long mb = (unsigned long long)card.csd.capacity *
                                 (unsigned long long)card.csd.sector_size / (1024ULL * 1024ULL);
         ESP_LOGI(TAG, "SD 診断: カードは応答した 名前=%.8s 容量=%lluMB OCR=0x%08x",
                  card.cid.name, mb, (unsigned)card.ocr);
+        /* FAT がない原因を切り分ける。MBR → 分区の開始セクタの順に読む。 */
+        unsigned p1 = sd_dump_sect(&card, 0);
+        sd_dump_sect(&card, 1);
+        if (p1 > 1 && p1 < 0x100000u) sd_dump_sect(&card, p1);
         ESP_LOGE(TAG, "SD 診断: FAT が見つからない。PC で FAT32 にフォーマットしてね(exFAT/NTFS/未フォーマットは読めない)");
     } else {
         ESP_LOGW(TAG, "SD 診断: sdmmc_card_init=%s", esp_err_to_name(e));

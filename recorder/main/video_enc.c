@@ -150,6 +150,12 @@ static void enc_task(void *arg)
              (unsigned)g_frames, (unsigned)g_errs,
              (unsigned)g_scale_us_max, (unsigned)g_enc_us_max,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    if (g_bench) {
+        const int n = done > 0 ? (int)done : 1;
+        ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f",
+                 (double)gbac_scale_prof[0] / n, (double)gbac_scale_prof[1] / n,
+                 (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n);
+    }
     g_task = NULL;
     vTaskDelete(NULL);
 }
@@ -301,6 +307,7 @@ int gbac_enc_queued(void)
 
 void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames)
 {
+    for (int i = 0; i < 4; i++) gbac_scale_prof[i] = 0;
     int64_t t0 = esp_timer_get_time();
     if (gbac_enc_start(cfg, bench_frames) != ESP_OK) {
         return;
