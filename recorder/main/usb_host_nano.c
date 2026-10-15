@@ -49,6 +49,7 @@ static volatile uint32_t g_prof_v_n, g_prof_a_n;
 static usb_transfer_t *g_rx[MAX_RX_EP][RX_PER_EP];
 static int g_rx_ep[MAX_RX_EP];    /* 実際の EP アドレス(0x84 など) */
 static int g_rx_n;
+static int g_ep_out;              /* コマンド用の OUT EP(0x05)。後始末で止める */
 
 /* --- ping 応答(EP4 IN に返ってくる 8 バイト)を横取りする --- */
 static uint8_t g_reply[16];
@@ -243,7 +244,7 @@ static void attach(uint8_t addr)
                         g_rx_ep[g_rx_n++] = ep->bEndpointAddress;
                     }
                 } else {
-                    ep_out = ep->bEndpointAddress;
+                    ep_out = g_ep_out = ep->bEndpointAddress;
                 }
             }
         }
@@ -299,6 +300,22 @@ static void client_cb(const usb_host_client_event_msg_t *msg, void *arg)
     }
 }
 
+/* EP に積んだままの転送を降ろす。
+ * usb_host_interface_release は EP に in-flight URB が 1 本でもあると
+ * ESP_ERR_INVALID_STATE(usb_host.c:1397)、usb_host_client_deregister は
+ * client の idle_ep_tailq が空だと同じく弾く(同 872)。
+ * つまり IN 転送を 3 本×3 EP に積んだままでは後始末に進めない。
+ * HALT → FLUSH でパイプを空にすると、積んでいた URB は
+ * status=CANCELED でコールバックへ返る(hcd_dwc.c:1820)。 */
+static void flush_ep(usb_device_handle_t dev, uint8_t ep)
+{
+    esp_err_t e1 = usb_host_endpoint_halt(dev, ep);
+    esp_err_t e2 = usb_host_endpoint_flush(dev, ep);
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        ESP_LOGW(TAG, "EP %02x halt=%s flush=%s", ep, esp_err_to_name(e1), esp_err_to_name(e2));
+    }
+}
+
 static void client_task(void *arg)
 {
     (void)arg;
@@ -307,18 +324,31 @@ static void client_task(void *arg)
         if (!g_stop_tasks) {
             continue;
         }
-        /* 抜ける合図が来た。デバイスを閉じるのは「抜かれた時」と同じ
-         * 自分のコンテキストでやる(転送の取り消しコールバックは
-         * handle_events の中でしか呼ばれないので、ここで拾い切る)。 */
+        /* 抜ける合図が来た。転送の完了コールバックは handle_events の中で
+         * しか呼ばれないので、流した URB はここで拾い切る。 */
         if (g_dev != NULL) {
-            usb_host_interface_release(g_client, g_dev, 0);
-            usb_host_device_close(g_client, g_dev);
-            g_dev = NULL;
+            for (int i = 0; i < g_rx_n; i++) {
+                flush_ep(g_dev, (uint8_t)g_rx_ep[i]);
+            }
+            if (g_ep_out) {
+                flush_ep(g_dev, (uint8_t)g_ep_out);
+            }
         }
-        g_ready = false;
         for (int i = 0; i < 10; i++) {
             usb_host_client_handle_events(g_client, pdMS_TO_TICKS(20));
         }
+        if (g_dev != NULL) {
+            esp_err_t e = usb_host_interface_release(g_client, g_dev, 0);
+            if (e != ESP_OK) {
+                ESP_LOGW(TAG, "interface_release %s", esp_err_to_name(e));
+            }
+            e = usb_host_device_close(g_client, g_dev);
+            if (e != ESP_OK) {
+                ESP_LOGW(TAG, "device_close %s", esp_err_to_name(e));
+            }
+            g_dev = NULL;
+        }
+        g_ready = false;
         /* client の登録解除も自分のタスクから行うのが IDF の流儀
          * (handle_events の途中でないと handling_events フラグが下りない) */
         esp_err_t e = usb_host_client_deregister(g_client);
@@ -379,15 +409,27 @@ static void usb_lib_task(void *arg)
         }
         if (g_stop_tasks) {
             /* uninstall は process_pending_flags / lib_event_flags / flags が
-             * 全部 0 でないと弾かれる。残イベントをここで消化してから抜ける。 */
-            for (int i = 0; i < 6; i++) {
+             * 全部 0 でないと弾かれる。残イベントをここで消化してから抜ける。
+             * さらに usb_host_uninstall の中の usbh_uninstall() はデバイスが
+             * 1 つでも残っていると ESP_ERROR_CHECK で止まる。
+             * なので NO_CLIENTS → device_free_all → ALL_FREE までを
+             * 見届けてから消える(待っている間も自分がイベントを処理する)。 */
+            bool all_free = false;
+            for (int i = 0; i < 20; i++) {
                 uint32_t f2 = 0;
-                if (usb_host_lib_handle_events(pdMS_TO_TICKS(30), &f2) == ESP_ERR_TIMEOUT) {
-                    break;
-                }
+                esp_err_t e2 = usb_host_lib_handle_events(pdMS_TO_TICKS(30), &f2);
                 if (f2 & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
                     usb_host_device_free_all();
                 }
+                if (f2 & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+                    all_free = true;
+                }
+                if (e2 == ESP_ERR_TIMEOUT && all_free) {
+                    break;      /* 取りこぼしなし */
+                }
+            }
+            if (!all_free) {
+                ESP_LOGW(TAG, "デバイス解放の完了が見えなかった");
             }
             g_lib_dead = true;
             vTaskDelete(NULL);
