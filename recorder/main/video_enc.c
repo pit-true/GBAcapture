@@ -16,16 +16,34 @@ static const char *TAG = "enc";
 #define NAL_SLOTS      8
 #define NAL_SLOT_BYTES (256 * 1024)
 
+/* 拡大済みの YUV は 2 枚持つ(2026-10-17)。
+ * esp_h264_enc_process は HW の frame_done ミューテックスでブロックする
+ * (components/esp_h264/esp_h264_enc_single_hw.c:154)。つまりエンコード中に
+ * このタスクは CPU を使わないので、拡大とエンコードを別タスクにできる。
+ * 直列だと 拡大 26ms + エンコード 10ms = 36ms/枚だが、
+ * 重ねれば max(拡大, エンコード) まで縮む。
+ * 2 枚で足りるのは、拡大が次の枚を書き始める頃には前の枚がエンコード済み
+ * になれるから。3 枚目はいらない(増やしても pipe の深さで決まる枚数が減らない)。 */
+#define YUV_SLOTS 2
+
+typedef struct {
+    int      slot;      /* g_yuv[slot] */
+    uint64_t pts_us;
+} yuv_item_t;
+
 static QueueHandle_t g_free_q;    /* 空いている NAL スロット index */
 static QueueHandle_t g_out_q;     /* 完成した gbac_nal_t */
+static QueueHandle_t g_yuv_free_q; /* 空いている YUV スロット index */
+static QueueHandle_t g_yuv_q;      /* 拡大済み yuv_item_t */
 static uint8_t *g_pool[NAL_SLOTS];
-static uint8_t *g_yuv;
+static uint8_t *g_yuv[YUV_SLOTS];
 static uint8_t *g_encout;
 static uint32_t g_yuv_len;
 static uint32_t g_encout_len;
 static esp_h264_enc_handle_t g_enc;
 static esp_h264_enc_param_hw_handle_t g_param;
-static TaskHandle_t g_task;
+static TaskHandle_t g_task;        /* enc_task */
+static TaskHandle_t g_scale_task;  /* scale_task */
 static volatile bool g_run;
 static bool g_bench;
 static volatile int g_bench_left;
@@ -56,10 +74,11 @@ static void bench_fill(uint16_t *dst, int n)
     }
 }
 
-static void enc_task(void *arg)
+/* ---- 前段: RGB565 -> OUYY 拡大 ---- */
+static void scale_task(void *arg)
 {
     (void)arg;
-    int done = 0;
+    uint32_t made = 0;
 
     while (g_run) {
         if (g_bench) {
@@ -76,7 +95,7 @@ static void enc_task(void *arg)
         if (g_bench) {
             bench_fill(g_bench_src, GBAC_WIDTH * GBAC_HEIGHT);
             px = g_bench_src;
-            pts_us = (uint64_t)done * 1000000ULL / 60;
+            pts_us = (uint64_t)made * 1000000ULL / 60;
         } else {
             px = frame_pipe_take(&pts_us, pdMS_TO_TICKS(100));
             if (px == NULL) {
@@ -84,8 +103,18 @@ static void enc_task(void *arg)
             }
         }
 
+        int slot = -1;
+        if (xQueueReceive(g_yuv_free_q, &slot, pdMS_TO_TICKS(200)) != pdTRUE) {
+            g_errs++;
+            ESP_LOGW(TAG, "YUV バッファが空かない(enc が遅い)");
+            if (!g_bench) {
+                frame_pipe_release();
+            }
+            continue;
+        }
+
         int64_t t0 = esp_timer_get_time();
-        gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, g_yuv);
+        gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, g_yuv[slot]);
         int64_t t1 = esp_timer_get_time();
         if (!g_bench) {
             frame_pipe_release();
@@ -94,15 +123,47 @@ static void enc_task(void *arg)
             g_scale_us_max = (uint32_t)(t1 - t0);
         }
 
-        int slot = -1;
-        if (xQueueReceive(g_free_q, &slot, pdMS_TO_TICKS(200)) != pdTRUE) {
+        yuv_item_t it = { .slot = slot, .pts_us = pts_us };
+        if (!xQueueSend(g_yuv_q, &it, 0)) {
             g_errs++;
+            xQueueSend(g_yuv_free_q, &slot, 0);
+            continue;
+        }
+        made++;
+    }
+
+    ESP_LOGI(TAG, "スケール終了 枚=%u stack 残り=%uB",
+             (unsigned)made, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    g_scale_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ---- 後段: H.264 HW エンコード ---- */
+static void enc_task(void *arg)
+{
+    (void)arg;
+    int done = 0;
+
+    /* 前段が止まったあとも、並んでいる分はエンコードしきる。
+     * そうしないと録画停止の直前 2 枚が mp4 から消える。 */
+    while (g_run || uxQueueMessagesWaiting(g_yuv_q) > 0) {
+        yuv_item_t it;
+        if (xQueueReceive(g_yuv_q, &it, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+        const int slot = it.slot;
+        const uint64_t pts_us = it.pts_us;
+
+        int nslot = -1;
+        if (xQueueReceive(g_free_q, &nslot, pdMS_TO_TICKS(200)) != pdTRUE) {
+            g_errs++;
+            xQueueSend(g_yuv_free_q, &slot, 0);
             ESP_LOGW(TAG, "NAL スロットが空かない(mux が遅い)");
             continue;
         }
 
         esp_h264_enc_in_frame_t in = { 0 };
-        in.raw_data.buffer = g_yuv;
+        in.raw_data.buffer = g_yuv[slot];
         in.raw_data.len = g_yuv_len;
         in.pts = (uint32_t)(pts_us / 1000);
 
@@ -110,28 +171,32 @@ static void enc_task(void *arg)
         out.raw_data.buffer = g_encout;
         out.raw_data.len = g_encout_len;
 
+        int64_t t1 = esp_timer_get_time();
         esp_h264_err_t e = esp_h264_enc_process(g_enc, &in, &out);
         int64_t t2 = esp_timer_get_time();
         if ((uint32_t)(t2 - t1) > g_enc_us_max) {
             g_enc_us_max = (uint32_t)(t2 - t1);
         }
+        /* 入力の YUV はここで読み終わり。HW が cache の書き戻しまで済ませている
+         * (esp_h264_enc_single_hw.c:231 で esp_h264_cache_check_and_writeback)。 */
+        xQueueSend(g_yuv_free_q, &slot, 0);
 
         if (e != ESP_H264_ERR_OK) {
             g_errs++;
-            xQueueSend(g_free_q, &slot, 0);
+            xQueueSend(g_free_q, &nslot, 0);
             ESP_LOGW(TAG, "encode 失敗(%d)", (int)e);
             continue;
         }
         if ((int)out.length > NAL_SLOT_BYTES) {
             g_errs++;
-            xQueueSend(g_free_q, &slot, 0);
+            xQueueSend(g_free_q, &nslot, 0);
             ESP_LOGE(TAG, "NAL が %d バイトありスロットを超える", (int)out.length);
             continue;
         }
 
-        memcpy(g_pool[slot], out.raw_data.buffer, out.length);
+        memcpy(g_pool[nslot], out.raw_data.buffer, out.length);
         gbac_nal_t n = {
-            .buf = g_pool[slot],
+            .buf = g_pool[nslot],
             .len = (int)out.length,
             .pts_us = pts_us,
             .key = (out.frame_type == ESP_H264_FRAME_TYPE_IDR ||
@@ -139,7 +204,7 @@ static void enc_task(void *arg)
         };
         if (!xQueueSend(g_out_q, &n, 0)) {
             g_errs++;
-            xQueueSend(g_free_q, &slot, 0);
+            xQueueSend(g_free_q, &nslot, 0);
             continue;
         }
         g_frames++;
@@ -171,9 +236,7 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_yuv_len = GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, g_scale);
     g_encout_len = g_yuv_len;
 
-    /* YUV は 1 枚で足りる。esp_h264_enc_process は同期なので、
-     * エンコード中に次のフレームを書き換えることがない。 */
-    if (g_yuv == NULL) {
+    if (g_yuv[0] == NULL) {
         /* esp_h264 はエンコード後に出力バッファを
          * esp_cache_msync(..., DIR_M2C) で無効化する。この方向は
          * UNALIGNED フラグを使えず、アドレスとサイズがキャッシュラインの
@@ -182,10 +245,17 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
          * P4 の既定ラインは 64B だが Espressif の P4 テスト設定は 128B を
          * 選ぶので、どちらでも安全な 128 に揃える。
          * サイズ側は 960*640*3/2 = 921600 で 128 の倍数。 */
-        g_yuv = heap_caps_aligned_alloc(128, g_yuv_len, MALLOC_CAP_SPIRAM);
+        for (int i = 0; i < YUV_SLOTS; i++) {
+            g_yuv[i] = heap_caps_aligned_alloc(128, g_yuv_len, MALLOC_CAP_SPIRAM);
+            if (g_yuv[i] == NULL) {
+                ESP_LOGE(TAG, "PSRAM に %u バイト x%d が確保できない",
+                         (unsigned)g_yuv_len, YUV_SLOTS);
+                return ESP_ERR_NO_MEM;
+            }
+        }
         g_encout = heap_caps_aligned_alloc(128, g_encout_len, MALLOC_CAP_SPIRAM);
-        if (g_yuv == NULL || g_encout == NULL) {
-            ESP_LOGE(TAG, "PSRAM に %u バイト x2 が確保できない", (unsigned)g_yuv_len);
+        if (g_encout == NULL) {
+            ESP_LOGE(TAG, "PSRAM に %u バイトが確保できない", (unsigned)g_encout_len);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -201,11 +271,21 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
         g_free_q = xQueueCreate(NAL_SLOTS, sizeof(int));
         g_out_q = xQueueCreate(NAL_SLOTS, sizeof(gbac_nal_t));
     }
+    if (g_yuv_free_q == NULL) {
+        g_yuv_free_q = xQueueCreate(YUV_SLOTS, sizeof(int));
+        g_yuv_q = xQueueCreate(YUV_SLOTS, sizeof(yuv_item_t));
+    }
     xQueueReset(g_free_q);
     xQueueReset(g_out_q);
+    xQueueReset(g_yuv_free_q);
+    xQueueReset(g_yuv_q);
     for (int i = 0; i < NAL_SLOTS; i++) {
         int idx = i;
         xQueueSend(g_free_q, &idx, 0);
+    }
+    for (int i = 0; i < YUV_SLOTS; i++) {
+        int idx = i;
+        xQueueSend(g_yuv_free_q, &idx, 0);
     }
 
     if (bench_frames > 0) {
@@ -263,24 +343,30 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_run = true;
     ESP_LOGI(TAG, "エンコード開始 %dx%d scale=%d %dkbps bench=%d",
              g_W, g_H, g_scale, (int)cfg->bitrate_kbps, bench_frames);
-    /* gbac_scale_ouyy だけで約 4.2KB のスタックを使う。実機(2026-10-14)で
-     * 4096 バイトだと "Stack protection fault" で落ちたので 12KB にした。
-     * 終了時に high water mark を出すので、それで実際の必要量が分かる。
+    /* 前段(拡大)。gbac_scale_ouyy だけで約 4.2KB のスタックを使う。
+     * 実機(2026-10-14)で 4096 バイトだと "Stack protection fault" で落ちたので
+     * 12KB にした。終了時に high water mark を出すので実測はそれで分かる。
      *
-     * コアは 0 へ移した(2026-10-16 r9/r10 実測)。core1 に置くと enc(prio5)が
-     * 1 フレーム 40〜113ms 走り続けて rx(prio4)を starvationさせ、USB rx リング
-     * (128 枠=9ms)が溢れて r9 では 61,763 パケット、うち音声約 4,100 パケット
-     * (6 秒分)が捨てられていた。rx は 1 パケット 26µs で CPU 26% なので、
-     * 同一コアに重い enc を置くこと自体が問題。
-     * core0 の上位(usb_lib=22, usbh=21)は enc(prio5)より上なので USB 受信は邪魔されない。 */
-    xTaskCreatePinnedToCore(enc_task, "enc", 12288, NULL, 5, &g_task, 0);
+     * コアは 0 のまま(2026-10-16 r9/r10 実測)。core1 に置くと prio5 が
+     * rx(prio4)を starvation させ、USB rx リング(128 枠=9ms)が溢れて
+     * r9 では 61,763 パケット(音声 6 秒分)が捨てられた。
+     * core0 の上位(usb_lib=22, usbh=21)は prio5 より上なので USB 受信は邪魔されない。
+     * 拡大が USB 受信に割り込まれて 85ms/枚になったのは、割り込みで止まる
+     * 見かけ上の値なので、後段と重ねることで実効スループットを上げる。 */
+    xTaskCreatePinnedToCore(scale_task, "scale", 12288, NULL, 5, &g_scale_task, 0);
+    /* 後段(エンコード)。esp_h264_enc_process は HW 待ちでブロックするので
+     * CPU はあまり使わない。core1 の rx(prio4)/mux(prio3)より下において、
+     * 受信と SD 書き込みを邪魔しないようにする。 */
+    xTaskCreatePinnedToCore(enc_task, "enc", 8192, NULL, 2, &g_task, 1);
     return ESP_OK;
 }
 
 void gbac_enc_stop(void)
 {
     g_run = false;
-    for (int i = 0; i < 200 && g_task != NULL; i++) {
+    /* 前段は frame_pipe_take のタイムアウト(100ms)で一度ループを見て抜ける。
+     * 後段は g_yuv_q を空にしてから抜ける。 */
+    for (int i = 0; i < 200 && (g_task != NULL || g_scale_task != NULL); i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (g_enc) {
@@ -318,7 +404,9 @@ int gbac_enc_queued(void)
 /* 録画停止時にスケールの内訳を出す。gbac_scale_prof は gbac_enc_start で
  * ゼロにしているので、今回の録画の 1 枚あたりになる。
  * USB 受信と同時だとどこが膨らむのかを見る(2026-10-17 実測:
- * 実録画 85ms/枚、ベンチ 26ms/枚)。 */
+ * 実録画 85ms/枚、ベンチ 26ms/枚)。
+ * scale=4 の専用経路では rgb 欄が変換+luma+彩度、copy 欄が PSRAM への
+ * 書き込みで、y と uv は 0 のまま。 */
 void gbac_enc_prof_report(void)
 {
     double n = g_frames > 0 ? (double)g_frames : 1.0;
