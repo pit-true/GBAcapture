@@ -189,6 +189,96 @@ static void build_uv_rows(uint8_t *urow, uint8_t *vrow, const uint8_t *yrow,
   }
 }
 
+/* ---- scale=4 専用の最速経路(2026-10-17) ----
+ * scale=4 では
+ *   - 彩度の 2x2 ブロックは 1 個の元画素に潰れる(偶数スケールの性質)
+ *   - 彩度行 a, b も Y 行 sy も r/4 の元行に一致する(4 行ぶんまったく同じ)
+ *   - 元画素 x は出力の画素ペア 2x と 2x+1 を両方埋める
+ *     → 1 元画素ぶん 1 行に 6 バイト [C Y Y C Y Y]
+ * なので元行 1 本から 4 出力行 [U V U V] を internal RAM のブロックに組み、
+ * PSRAM へは 5760 バイト 1 回の memcpy で書く(汎用経路は 1440 バイト×640 回
+ * だった)。memcpy の実効帯域は internal→PSRAM で 4KiB chunk なら 183MB/s、
+ * 1.4KiB だと 88MB/s(ch32-riscv-ug/wch-protocols E020 実測)。
+ * 彩度も 1 元画素ぶんだけ計算する(汎用経路は画素ペアごとに計算し、
+ * 同じ元画素の彩度を 2 回計算していた)。
+ * 出力は汎用経路とバイト単位で一致。test_scale_ref4 で 921,600 バイト全部を
+ * 参照実装と突き合わせて担保している。
+ * 内訳カウンタは変換+luma+彩度が prof[0](rgb 欄)、書き込みが prof[3](copy 欄)。
+ * prof[1](y)と prof[2](uv)は 0 のまま。 */
+static uint8_t s_block[4 * GBAC_YW_MAX * 3 / 2] __attribute__((aligned(16)));
+
+/* gbac_rgb565_to888 と同じ式。呼び出しと rgb[3] の受け渡しを消すためここで展開する。 */
+static void rgb565_of(int c, int *r, int *g, int *b) {
+  int r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
+  *r = (r5 << 3) | (r5 >> 2);
+  *g = (g6 << 2) | (g6 >> 4);
+  *b = (b5 << 3) | (b5 >> 2);
+}
+
+/* 彩度のクランプは上でよい。8bit 全範囲で chroma_u/chroma_v の生値は
+ * 1..256 に収まる(最小は r=g=255 の 1、最大は b=255 や r=255 の 256)。
+ * なので下側の比較はいらない。clamp8 と結果は同じ。 */
+static int chroma_u8(int r, int g, int b) {
+  int v = 128 + ((-43 * r - 85 * g + 128 * b + 128) >> 8);
+  return v > 255 ? 255 : v;
+}
+static int chroma_v8(int r, int g, int b) {
+  int v = 128 + ((128 * r - 107 * g - 21 * b + 128) >> 8);
+  return v > 255 ? 255 : v;
+}
+
+static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
+  const int stride = w * 6; /* w * 4 * 3 / 2 */
+  uint8_t *rowu = s_block;
+  uint8_t *rowv = s_block + stride;
+
+  for (int sy = 0; sy < h; sy++) {
+    const uint16_t *s = src + (size_t)sy * w;
+    int64_t t0 = PROF_NOW();
+    uint32_t *wu = (uint32_t *)rowu;
+    uint32_t *wv = (uint32_t *)rowv;
+    int x = 0;
+    for (; x + 2 <= w; x += 2) {
+      int r, g, b;
+      rgb565_of(s[x], &r, &g, &b);
+      int y0 = luma(r, g, b);
+      int u0 = chroma_u8(r, g, b);
+      int v0 = chroma_v8(r, g, b);
+      rgb565_of(s[x + 1], &r, &g, &b);
+      int y1 = luma(r, g, b);
+      int u1 = chroma_u8(r, g, b);
+      int v1 = chroma_v8(r, g, b);
+      /* 2 画素で 12 バイト = 語 3 個。x が偶数のとき語境界に揃う。
+       * [C Y Y C Y Y | C Y Y C Y Y] */
+      *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u0 << 24));
+      *wu++ = (uint32_t)(y0 | (y0 << 8) | (u1 << 16) | (y1 << 24));
+      *wu++ = (uint32_t)(y1 | (u1 << 8) | (y1 << 16) | (y1 << 24));
+      *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v0 << 24));
+      *wv++ = (uint32_t)(y0 | (y0 << 8) | (v1 << 16) | (y1 << 24));
+      *wv++ = (uint32_t)(y1 | (v1 << 8) | (y1 << 16) | (y1 << 24));
+    }
+    if (x < w) { /* 奇数幅のとき最後の 1 画素(実運用では来ない) */
+      int r, g, b;
+      rgb565_of(s[x], &r, &g, &b);
+      int y = luma(r, g, b);
+      int u = chroma_u8(r, g, b);
+      int v = chroma_v8(r, g, b);
+      uint8_t *p = rowu + x * 6;
+      p[0] = (uint8_t)u; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
+      p[3] = (uint8_t)u; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
+      p = rowv + x * 6;
+      p[0] = (uint8_t)v; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
+      p[3] = (uint8_t)v; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
+    }
+    gbac_scale_prof[0] += PROF_NOW() - t0;
+
+    int64_t t1 = PROF_NOW();
+    memcpy(s_block + 2 * stride, s_block, 2 * stride); /* [U V] を [U V U V] に */
+    memcpy(out + (size_t)sy * 4 * stride, s_block, 4 * stride);
+    gbac_scale_prof[3] += PROF_NOW() - t1;
+  }
+}
+
 void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
                      uint8_t *out) {
   if (!src || !out || w <= 0 || h <= 0) return;
@@ -198,6 +288,11 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
   const int W = w * scale;
   const int H = h * scale;
   if (W > GBAC_YW_MAX || H > GBAC_YH_MAX) return; /* バッファ越えは守る */
+  if (scale == 4 && (w & 1) == 0) {
+    /* scale=4 は専用経路(上のコメント参照)。w が偶数のときだけ語が揃う */
+    scale_ouyy_x4(src, w, h, out);
+    return;
+  }
 
   const int stride = W * 3 / 2;
   const int cw = W / 2;

@@ -684,6 +684,70 @@ static void test_scale_real(void) {
   OK_EQ(left, 0);
 }
 
+/* ---------- 10b. scale=4 の全面突き合わせ(参照実装との差分 0) ----------
+ * gbac_scale.c のヘッダコメントに書いた仕様(2x2 ブロックの RGB 平均から彩度、
+ * Y は最近傍)を素直に実装した参照値と 921,600 バイト全部を突き合わせる。
+ * scale=4 専用の速い経路を入れたとき、1 バイトも変わっていないことをこれで担保する。 */
+static int ref_clamp(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+static int ref_luma(int r, int g, int b) { return (77 * r + 150 * g + 29 * b) >> 8; }
+static int ref_cu(int r, int g, int b) {
+  return ref_clamp(128 + ((-43 * r - 85 * g + 128 * b + 128) >> 8));
+}
+static int ref_cv(int r, int g, int b) {
+  return ref_clamp(128 + ((128 * r - 107 * g - 21 * b + 128) >> 8));
+}
+
+static void test_scale_ref4(void) {
+  const int scale = 4, w = GBAC_WIDTH, h = GBAC_HEIGHT;
+  const int W = w * scale, H = h * scale, stride = W * 3 / 2;
+  static uint8_t ref[GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 4)];
+
+  /* 元画像は擬似ランダム。彩度のクランプ(0/255)も踏ませる */
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      uint16_t c = (uint16_t)((((x * 5 + y * 3) & 31) << 11) |
+                              (((x * 7 + y * 11) & 63) << 5) |
+                              ((x * 13 + y * 2) & 31));
+      if (((x + y) % 17) == 0) c = 0xFFFF;
+      if (((x * 3 + y * 7) % 23) == 0) c = 0x0000;
+      if (((x * 5 + y * 11) % 29) == 0) c = 0x001F; /* 青一色。U が 256 を超えて 255 へ */
+      g_src[y * w + x] = c;
+    }
+  }
+
+  for (int r = 0; r < H; r++) {
+    uint8_t *row = ref + (size_t)r * stride;
+    const int cy = r / 2;
+    for (int cx = 0; cx < W / 2; cx++) {
+      int R = 0, G = 0, B = 0;
+      for (int k = 0; k < 4; k++) {
+        int ox = 2 * cx + (k & 1), oy = 2 * cy + (k >> 1);
+        uint8_t rgb[3];
+        gbac_rgb565_to888(g_src[(oy / scale) * w + (ox / scale)], rgb);
+        R += rgb[0];
+        G += rgb[1];
+        B += rgb[2];
+      }
+      int ar = (R + 2) >> 2, ag = (G + 2) >> 2, ab = (B + 2) >> 2;
+      uint8_t *p = row + cx * 3;
+      p[0] = (uint8_t)((r & 1) ? ref_cv(ar, ag, ab) : ref_cu(ar, ag, ab));
+      for (int k = 0; k < 2; k++) {
+        uint8_t rgb[3];
+        gbac_rgb565_to888(g_src[(r / scale) * w + ((2 * cx + k) / scale)], rgb);
+        p[1 + k] = (uint8_t)ref_luma(rgb[0], rgb[1], rgb[2]);
+      }
+    }
+  }
+
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, w, h, scale, g_ouyy);
+  int diff = 0;
+  for (int i = 0; i < (int)sizeof(ref); i++)
+    if (ref[i] != g_ouyy[i]) diff++;
+  if (diff) printf("  scale=4 が参照実装と %d バイト違う\n", diff);
+  OK_EQ(diff, 0);
+}
+
 /* ---------- 11. mp4 へ渡す pts が ms である前提 ---------- */
 /* esp_muxer のヘッダには pts の単位が書かれていない(min_packet_duration だけ
  * が明示的に ms)。公式例は上位の esp_capture 経由で生の API を示さない。
@@ -758,6 +822,7 @@ int main(void) {
   RUN(test_pts_back);
   RUN(test_split);
   RUN(test_scale_real);
+  RUN(test_scale_ref4);
   RUN(test_seq_gap);
   RUN(test_pts_ms);
   printf("%d checks, %d failures\n", g_checks, g_fails);
