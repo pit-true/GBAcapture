@@ -104,20 +104,22 @@ int gbac_msc_active(void)
     return s_on;
 }
 
-/* MSC を畳む。uninstall の前に unmount して TinyUSB 側の FAT を返す。 */
+/* MSC を畳む。順番は uninstall → unmount → deinit。
+ *
+ * esp_tinyusb の tud_umount_cb() は s_storage_handle->base_path を読む。
+ * TinyUSB を畳むと tud_deinit() は「PC に認識されていた」(cfg_num > 0) ときだけ
+ * このコールバックを呼ぶ。だからストレージを先に畳んで handle を NULL にすると、
+ * PC につないでいたときだけ NULL を読んで Load access fault で落ちる
+ * (実測 2026-10-16、MEPC = tud_umount_cb、MTVAL = 0x2010)。
+ * handle が生きているうちに uninstall する。
+ *
+ * uninstall の中で tud_umount_cb が /sd へ FAT を自動で再マウントするので、
+ * そのあと unmount でそれを返す(同じカードに FATFS を 2 個載せない)。
+ * unmount は未マウントなら ESP_OK を返すので、PC をつないでいなかったときは
+ * 何も起きない。 */
 static esp_err_t msc_teardown(void)
 {
     esp_err_t e = ESP_OK;
-    if (s_storage) {
-        /* PC が抜いたときに TinyUSB が自動で FAT を再マウントしていることがある。
-         * ここへ戻す前に必ず外しておかないと、同じカードに FATFS が 2 個になる。 */
-        esp_err_t e1 = tinyusb_msc_storage_unmount();
-        if (e1 != ESP_OK) {
-            ESP_LOGW(TAG, "MSC storage unmount %s", esp_err_to_name(e1));
-        }
-        tinyusb_msc_storage_deinit();
-        s_storage = 0;
-    }
     esp_err_t e2 = tinyusb_driver_uninstall();
     if (e2 != ESP_OK) {
         /* esp_tinyusb 1.7.x は tusb_teardown()(= tusb_deinit(0))を呼ぶが、
@@ -126,6 +128,14 @@ static esp_err_t msc_teardown(void)
         ESP_LOGE(TAG, "tinyusb_driver_uninstall %s (patch_esp_tinyusb.ps1 は当たっている?)",
                  esp_err_to_name(e2));
         e = e2;
+    }
+    if (s_storage) {
+        esp_err_t e1 = tinyusb_msc_storage_unmount();
+        if (e1 != ESP_OK) {
+            ESP_LOGW(TAG, "MSC storage unmount %s", esp_err_to_name(e1));
+        }
+        tinyusb_msc_storage_deinit();
+        s_storage = 0;
     }
     return e;
 }
