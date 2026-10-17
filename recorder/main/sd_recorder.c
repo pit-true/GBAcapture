@@ -331,10 +331,24 @@ esp_err_t gbac_sd_mount(void)
         p.gate_lvl = 0;
         p.freq = SDMMC_FREQ_HIGHSPEED;
     }
-    esp_err_t e = sd_try_mount(&p, &g_card);
+    /* 起動直後はカードの電源が立ち上がりかけで、1 回目だけ FAT が読めない
+     * ことがある(実測 2026-10-17: 起動時は f_mount=FR_NO_FILESYSTEM、
+     * 's' の再試行では同じ設定で読めた)。電源を入れ直して 3 回まで試す。 */
+    esp_err_t e = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        e = sd_try_mount(&p, &g_card);
+        if (e == ESP_OK) {
+            break;
+        }
+        g_card = NULL;
+        ESP_LOGW(TAG, "SD マウント失敗(%s) %d/3 回。電源を入れ直して再試行",
+                 esp_err_to_name(e), attempt);
+        sd_pwr_release();
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "SD マウント失敗(%s)", esp_err_to_name(e));
-        return e;
+        ESP_LOGW(TAG, "既定の結線で生えないので総当たりする");
+        return gbac_sd_probe();
     }
     g_mounted = true;
     sd_log_card();
