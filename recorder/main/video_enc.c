@@ -257,6 +257,9 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_errs = 0;
     g_scale_us_max = 0;
     g_enc_us_max = 0;
+    for (int i = 0; i < 4; i++) {
+        gbac_scale_prof[i] = 0;
+    }
     g_run = true;
     ESP_LOGI(TAG, "エンコード開始 %dx%d scale=%d %dkbps bench=%d",
              g_W, g_H, g_scale, (int)cfg->bitrate_kbps, bench_frames);
@@ -310,6 +313,19 @@ int gbac_enc_running(void)
 int gbac_enc_queued(void)
 {
     return g_out_q ? (int)uxQueueMessagesWaiting(g_out_q) : 0;
+}
+
+/* 録画停止時にスケールの内訳を出す。gbac_scale_prof は gbac_enc_start で
+ * ゼロにしているので、今回の録画の 1 枚あたりになる。
+ * USB 受信と同時だとどこが膨らむのかを見る(2026-10-17 実測:
+ * 実録画 85ms/枚、ベンチ 26ms/枚)。 */
+void gbac_enc_prof_report(void)
+{
+    double n = g_frames > 0 ? (double)g_frames : 1.0;
+    ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f | 枚=%u scale<=%uus enc<=%uus",
+             (double)gbac_scale_prof[0] / n, (double)gbac_scale_prof[1] / n,
+             (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n,
+             (unsigned)g_frames, (unsigned)g_scale_us_max, (unsigned)g_enc_us_max);
 }
 
 void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames)

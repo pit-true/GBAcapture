@@ -23,6 +23,8 @@ void gbac_enc_stop(void);
 int gbac_enc_running(void);
 /* まだ muxer に入れていない NAL の数。ベンチの終了判定に使う */
 int gbac_enc_queued(void);
+/* 直前の録画のスケール内訳をログに出す(1 枚あたり µs)。停止ログの続きで使う */
+void gbac_enc_prof_report(void);
 
 /* 次のフレームを IDR にする。mp4 のスライスが変わった直後に呼ぶと、
  * 新しいファイルの先頭が IDR になり再生側が迷わない。 */

@@ -1095,6 +1095,8 @@ void gbac_rec_stop(void)
              (double)g_vpts_first / 1000.0, (double)g_vpts_last / 1000.0,
              (unsigned)g_apkts,
              (double)g_apts_first / 1000.0, (double)g_apts_last / 1000.0);
+    /* スケールが 1 枚どれくらいだったか。USB 受信と同時だとどこが膨らむかを見る */
+    gbac_enc_prof_report();
 }
 
 bool gbac_rec_low_space(void)
