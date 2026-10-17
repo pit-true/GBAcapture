@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -81,6 +82,13 @@ static uint32_t g_a_pairs;      /* リングから読み出したペア数 */
 static uint32_t g_a_enc;        /* AAC を呼んだ回数 */
 static uint32_t g_a_zero;       /* AAC が 0 バイトで返した回数 */
 static uint32_t g_a_drop;       /* リング溢れで捨てられた音声ペア数 */
+/* mux タスクがどこで回っているか切り分けるため、esp_muxer と AAC の
+ * 呼び出しごとの回数・最大・合計(us)を数える。停止ログに出す。 */
+static uint32_t g_add_v_n, g_add_v_max, g_add_v_sum;
+static uint32_t g_add_a_n, g_add_a_max, g_add_a_sum;
+static uint32_t g_aac_n, g_aac_max, g_aac_sum;
+static uint32_t g_flush_us, g_close_us;
+static uint32_t g_nal_dbg;        /* muxer へ渡す NAL の中身を実測ログに出す回数 */
 static int g_pts_dbg;           /* 先頭 20 本の pts をログする */
 static int g_last_num;          /* 前回使った REC_ の番号(stat が信用できないときも進める) */
 static volatile bool g_low_space;
@@ -126,17 +134,20 @@ typedef struct {
     int freq;       /* kHz */
 } sd_probe_t;
 
+/* SD のクロックは 20MHz で固定して試す。40MHz では録画中(USB 受信と
+ * エンコーダが同時に動いているとき)に書き込みへ EIO が出た。
+ * 速度テストだけ通っても録画中に死ぬので、余裕を見る。 */
 static const sd_probe_t k_sd_probe[] = {
-    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 0, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_0, 4, 4, -1,              -1, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_0, 4, 0, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_0, 4, 0, -1,              -1, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_1, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_1, 4, 0, -1,              -1, SDMMC_FREQ_HIGHSPEED },  /* 今の構成 */
-    { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
-    { SDMMC_HOST_SLOT_0, 4, 3, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
     { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 0, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_0, 4, 4, -1,              -1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_0, 4, 0, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_0, 4, 0, -1,              -1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_1, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_1, 4, 0, -1,              -1, SDMMC_FREQ_DEFAULT },  /* 今の構成 */
+    { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_0, 4, 3, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_DEFAULT },
+    { SDMMC_HOST_SLOT_0, 4, 4, GBAC_PIN_SD_PWR, 1, SDMMC_FREQ_HIGHSPEED },
     /* 信号品質が怪しいときの確認。遅くして読めるなら配線・耐量の問題 */
     { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, 4000 },
     { SDMMC_HOST_SLOT_0, 1, 4, GBAC_PIN_SD_PWR, 1, 1000 },
@@ -323,13 +334,14 @@ esp_err_t gbac_sd_mount(void)
         /* 実機で確定した結線(2026-10-15)。総当たりしなくてもこれで行ける。
          *   slot0(IOMUX: CLK43/CMD44/D0-3=39〜42)・4bit・IO 電源はオンチップ LDO VO4
          *   ・GPIO45 は駆動しない(LOW にしても構わないが触らないのが実測の勝ち筋)
-         *   ・40MHz(SDMMC_FREQ_HIGHSPEED) */
+         *   ・20MHz(SDMMC_FREQ_DEFAULT。40MHz だと録画中に SD 書き込みが EIO になった
+         *     実測 2026-10-18。必要なのは約 2MB/s で 20MHz・4bit で十分) */
         p.slot = SDMMC_HOST_SLOT_0;
         p.width = 4;
         p.ldo = 4;
         p.gate = GBAC_PIN_SD_PWR;
         p.gate_lvl = 0;
-        p.freq = SDMMC_FREQ_HIGHSPEED;
+        p.freq = SDMMC_FREQ_DEFAULT;
     }
     /* 起動直後はカードの電源が立ち上がりかけで、1 回目だけ FAT が読めない
      * ことがある(実測 2026-10-17: 起動時は f_mount=FR_NO_FILESYSTEM、
@@ -574,6 +586,99 @@ static int slice_path(esp_muxer_slice_info_t *info, void *ctx)
     return (n > 0 && n < info->len) ? 0 : -1;
 }
 
+/* esp_muxer の既定のファイル書き込みはプリビルドで中を読めない。
+ * 自前の writer に差し替えて、何回・何バイト・どこへ(seek)・何 ms かけたかを数える。
+ * mux が add_video_packet の中で回っている疑いを、SD 書き込みの実測で切り分ける。 */
+static uint32_t g_fw_n, g_fw_max, g_fw_sum;
+static uint64_t g_fw_bytes;
+static uint32_t g_fw_maxlen;      /* 1 回の on_write で頼まれたバイト数の最大 */
+static uint32_t g_fw_err;         /* fwrite が頼まれた分だけ書けなかった回数 */
+static bool g_sd_fail;            /* SD 書き込みが壊れた。真なら録画を止める */
+static uint32_t g_fw_dbg;         /* 先頭何回を実測ログに出すか */
+static uint64_t g_seek_n;
+static uint64_t g_seek_last;
+
+static void *mux_w_open(char *path)
+{
+    ESP_LOGI(TAG, "mux writer open %s", path);
+    return fopen(path, "wb");
+}
+
+/* SD へは内部 RAM の小さなバッファ経由で書く。
+ * muxer のキャッシュは PSRAM にある。録画中は拡大とエンコーダが PSRAM を
+ * 使い尽くしているので、SDMMC の DMA が PSRAM から読むと間に合わず
+ * EIO になる疑いをここで切る。 */
+#define MUX_BOUNCE 16384
+static uint8_t g_bounce[MUX_BOUNCE] __attribute__((aligned(64)));
+
+static int mux_w_write(void *w, void *buf, int len)
+{
+    FILE *f = (FILE *)w;
+    int64_t t0 = esp_timer_get_time();
+    int done = 0;
+    bool bad = false;
+    while (done < len) {
+        int chunk = len - done;
+        if (chunk > MUX_BOUNCE) {
+            chunk = MUX_BOUNCE;
+        }
+        memcpy(g_bounce, (const uint8_t *)buf + done, (size_t)chunk);
+        int64_t tw = esp_timer_get_time();
+        size_t n = fwrite(g_bounce, 1, (size_t)chunk, f);
+        uint32_t d = (uint32_t)(esp_timer_get_time() - tw);
+        g_fw_n++;
+        g_fw_sum += d;
+        g_fw_bytes += (uint64_t)chunk;
+        if (d > g_fw_max) {
+            g_fw_max = d;
+        }
+        if ((size_t)chunk != n) {
+            bad = true;
+            break;
+        }
+        done += (int)n;
+    }
+    uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+    if ((uint32_t)len > g_fw_maxlen) {
+        g_fw_maxlen = (uint32_t)len;
+    }
+    if (bad) {
+        g_fw_err++;
+        g_sd_fail = true;         /* 何度やっても書けない。muxer にエラーを返して
+                                   * 無限リトライさせず、録画を止める */
+        if (g_fw_err <= 3) {
+            /* カードとバスが生きているか、その場で直接確かめる。
+             * ここが成功するなら SD のhardwareではなく FatFs の状態がおかしい。 */
+            esp_err_t st = g_card ? sdmmc_get_status(g_card) : ESP_ERR_INVALID_STATE;
+            esp_err_t rd = g_card ? sdmmc_read_sectors(g_card, g_bounce, 0, 1)
+                                  : ESP_ERR_INVALID_STATE;
+            ESP_LOGE(TAG, "mux writer 書き込み失敗 len=%d wrote=%d pos=%lld errno=%d。録画を止める",
+                     len, done, (long long)ftell(f), errno);
+            ESP_LOGE(TAG, "その場の SD 直接検査 status=%s read_sector0=%s",
+                     esp_err_to_name(st), esp_err_to_name(rd));
+        }
+        return -1;
+    }
+    if (g_fw_dbg < 8) {
+        ESP_LOGI(TAG, "mux write %u len=%d wrote=%d pos=%lld %uus",
+                 (unsigned)g_fw_dbg + 1, len, done, (long long)ftell(f), dt);
+        g_fw_dbg++;
+    }
+    return done;
+}
+
+static int mux_w_seek(void *w, uint64_t pos)
+{
+    g_seek_n++;
+    g_seek_last = pos;
+    return fseek((FILE *)w, (long)pos, SEEK_SET) == 0 ? 0 : -1;
+}
+
+static int mux_w_close(void *w)
+{
+    return fclose((FILE *)w) == 0 ? 0 : -1;
+}
+
 static esp_err_t open_muxer(void)
 {
     if (!g_registered) {
@@ -592,6 +697,16 @@ static esp_err_t open_muxer(void)
     if (!g_muxer) {
         ESP_LOGE(TAG, "muxer open 失敗");
         return ESP_FAIL;
+    }
+    static esp_muxer_file_writer_t fw = {
+        .on_open = mux_w_open,
+        .on_write = mux_w_write,
+        .on_seek = mux_w_seek,
+        .on_close = mux_w_close,
+    };
+    esp_muxer_err_t we = esp_muxer_set_file_writer(g_muxer, &fw);
+    if (we != ESP_MUXER_ERR_OK) {
+        ESP_LOGW(TAG, "file writer の差し替えに失敗(%d)。既定の書き込みで進む", (int)we);
     }
     esp_muxer_video_stream_info_t vi = {
         .codec = ESP_MUXER_VDEC_H264,
@@ -654,7 +769,14 @@ static void encode_audio(int bytes)
 {
     esp_audio_enc_in_frame_t in = { .buffer = (uint8_t *)g_pcm, .len = (uint32_t)bytes };
     esp_audio_enc_out_frame_t out = { .buffer = g_aacbuf, .len = (uint32_t)g_out_bytes };
+    int64_t ta = esp_timer_get_time();
     esp_audio_err_t e = esp_audio_enc_process(g_aac, &in, &out);
+    uint32_t da = (uint32_t)(esp_timer_get_time() - ta);
+    g_aac_n++;
+    g_aac_sum += da;
+    if (da > g_aac_max) {
+        g_aac_max = da;
+    }
     g_a_enc++;
     if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes == 0) {
         g_a_zero++;
@@ -669,7 +791,15 @@ static void encode_audio(int bytes)
             .len = (int)out.encoded_bytes,
             .pts = ms,
         };
-        if (esp_muxer_add_audio_packet(g_muxer, g_aidx, &ap) == ESP_MUXER_ERR_OK) {
+        int64_t tb = esp_timer_get_time();
+        esp_muxer_err_t ae = esp_muxer_add_audio_packet(g_muxer, g_aidx, &ap);
+        uint32_t db = (uint32_t)(esp_timer_get_time() - tb);
+        g_add_a_n++;
+        g_add_a_sum += db;
+        if (db > g_add_a_max) {
+            g_add_a_max = db;
+        }
+        if (ae == ESP_MUXER_ERR_OK) {
             if (g_apkts == 0) {
                 g_apts_first = ms;
             }
@@ -758,8 +888,9 @@ esp_err_t gbac_sd_speedtest(int mb)
     for (int i = 0; i < mb; i++) {
         if (fwrite(buf, 1, (size_t)CH, f) != (size_t)CH) {
             int64_t e = esp_timer_get_time();
-            ESP_LOGE(TAG, "書き込み失敗 %dMB目 %.1fMB/s", i,
-                     (double)wrote * CH / 1e6 / ((double)(e - t0) / 1e6));
+            ESP_LOGE(TAG, "書き込み失敗 %dMB目 %.1fMB/s errno=%d pos=%lld", i,
+                     (double)wrote * CH / 1e6 / ((double)(e - t0) / 1e6),
+                     errno, (long long)ftell(f));
             fclose(f);
             free(buf);
             return ESP_FAIL;
@@ -816,9 +947,31 @@ int64_t gbac_rec_mux_age_us(void)
     return g_mux_where_us ? esp_timer_get_time() - g_mux_where_us : 0;
 }
 
+/* mux タスクがどこでどれだけ回っているか。mux が esp_muxer の中で止まると
+ * 停止ログにたどり着けないので、定期表示の 1 行として読めるようにする。 */
+void gbac_rec_mux_stats(char *out, int out_sz)
+{
+    snprintf(out, (size_t)out_sz,
+             "addV n=%u max=%u avg=%u | addA n=%u max=%u avg=%u | aac n=%u max=%u avg=%u"
+             " | file n=%u max=%u avg=%u bytes=%lluMB maxlen=%u werr=%u sdfail=%d",
+             (unsigned)g_add_v_n, (unsigned)g_add_v_max,
+             (unsigned)(g_add_v_n ? g_add_v_sum / g_add_v_n : 0),
+             (unsigned)g_add_a_n, (unsigned)g_add_a_max,
+             (unsigned)(g_add_a_n ? g_add_a_sum / g_add_a_n : 0),
+             (unsigned)g_aac_n, (unsigned)g_aac_max,
+             (unsigned)(g_aac_n ? g_aac_sum / g_aac_n : 0),
+             (unsigned)g_fw_n, (unsigned)g_fw_max,
+             (unsigned)(g_fw_n ? g_fw_sum / g_fw_n : 0),
+             (unsigned long long)(g_fw_bytes / (1024 * 1024)),
+             (unsigned)g_fw_maxlen, (unsigned)g_fw_err, (int)g_sd_fail);
+}
+
 /* NAL を 1 本 muxer に入れる。まだ muxer がなければ SPS/PPS を拾ってから開く。 */
 static void write_video(const gbac_nal_t *n)
 {
+    if (g_sd_fail) {
+        return;                   /* SD が壊れたあと書き足しても意味がない */
+    }
     if (!g_muxer) {
         mux_mark("SPS/PPS 抽出");
         extract_sps_pps(n->buf, n->len);
@@ -833,6 +986,19 @@ static void write_video(const gbac_nal_t *n)
         }
     }
     uint32_t ms = (uint32_t)(n->pts_us / 1000);
+    /* muxer に渡す NAL の中身が壊れている疑いを、渡す直前で確かめる */
+    if (g_nal_dbg < 10) {
+        ESP_LOGI(TAG, "NAL %d/10 len=%d key=%d pts=%uus head=%02x %02x %02x %02x %02x",
+                 g_nal_dbg + 1, n->len, n->key, (unsigned)ms,
+                 n->buf[0], n->buf[1], n->buf[2], n->buf[3], n->buf[4]);
+        g_nal_dbg++;
+    }
+    if (n->len <= 0 || n->len > 512 * 1024) {
+        g_verr++;
+        ESP_LOGE(TAG, "NAL の len が不正(%d)。捨てて続ける pts=%uus",
+                 n->len, (unsigned)ms);
+        return;
+    }
     if (g_pts_dbg < 20) {
         ESP_LOGI(TAG, "mux %d/20 ms=%u len=%d key=%d", g_pts_dbg + 1, ms, n->len, n->key);
         g_pts_dbg++;
@@ -845,7 +1011,14 @@ static void write_video(const gbac_nal_t *n)
         .key_frame = n->key,
     };
     mux_mark("add_video_packet");
+    int64_t tc = esp_timer_get_time();
     esp_muxer_err_t me = esp_muxer_add_video_packet(g_muxer, g_vidx, &vp);
+    uint32_t dc = (uint32_t)(esp_timer_get_time() - tc);
+    g_add_v_n++;
+    g_add_v_sum += dc;
+    if (dc > g_add_v_max) {
+        g_add_v_max = dc;
+    }
     if (me == ESP_MUXER_ERR_OK) {
         if (g_vpkts == 0) {
             g_vpts_first = ms;
@@ -885,7 +1058,7 @@ static void mux_task(void *arg)
                          (unsigned long long)(f / (1024 * 1024)));
             }
         }
-        if (!g_run) {
+        if (!g_run || g_sd_fail) {
             /* 停止指示。エンコード済みでキューに残った NAL を書き切ってから閉じる。
              * これをしないと mp4 の末尾が 0.1 秒分だけ欠ける。 */
             while (gbac_enc_pop(&n, 0)) {
@@ -901,8 +1074,12 @@ static void mux_task(void *arg)
         }
     }
     if (g_muxer) {
+        int64_t tf = esp_timer_get_time();
         pump_audio(true);
+        g_flush_us = (uint32_t)(esp_timer_get_time() - tf);
+        int64_t tg = esp_timer_get_time();
         esp_muxer_err_t me = esp_muxer_close(g_muxer);
+        g_close_us = (uint32_t)(esp_timer_get_time() - tg);
         if (me != ESP_MUXER_ERR_OK) {
             ESP_LOGE(TAG, "muxer close 失敗(%d)", (int)me);
         }
@@ -911,6 +1088,14 @@ static void mux_task(void *arg)
     ESP_LOGI(TAG, "muxer 終了 video=%u audio=%u err=%u/%u stack 残り=%uB",
              (unsigned)g_vpkts, (unsigned)g_apkts, (unsigned)g_verr, (unsigned)g_aerr,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    ESP_LOGI(TAG, "mux 呼び出し us: video n=%u max=%u avg=%u | audio n=%u max=%u avg=%u | aac n=%u max=%u avg=%u | flush=%u close=%u",
+             (unsigned)g_add_v_n, (unsigned)g_add_v_max,
+             (unsigned)(g_add_v_n ? g_add_v_sum / g_add_v_n : 0),
+             (unsigned)g_add_a_n, (unsigned)g_add_a_max,
+             (unsigned)(g_add_a_n ? g_add_a_sum / g_add_a_n : 0),
+             (unsigned)g_aac_n, (unsigned)g_aac_max,
+             (unsigned)(g_aac_n ? g_aac_sum / g_aac_n : 0),
+             (unsigned)g_flush_us, (unsigned)g_close_us);
     ESP_LOGI(TAG, "音声内訳 read=%u pairs=%u aac=%u zero=%u ringovf=%u",
              (unsigned)g_a_reads, (unsigned)g_a_pairs, (unsigned)g_a_enc, (unsigned)g_a_zero,
              (unsigned)audio_pipe_overruns());
@@ -1050,6 +1235,18 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
     g_vpkts = g_apkts = g_verr = g_aerr = 0;
     g_vpts_first = g_vpts_last = g_apts_first = g_apts_last = 0;
     g_a_reads = g_a_pairs = g_a_enc = g_a_zero = g_a_drop = 0;
+    g_add_v_n = g_add_v_max = g_add_v_sum = 0;
+    g_add_a_n = g_add_a_max = g_add_a_sum = 0;
+    g_aac_n = g_aac_max = g_aac_sum = 0;
+    g_flush_us = g_close_us = 0;
+    g_fw_n = g_fw_max = g_fw_sum = 0;
+    g_fw_bytes = 0;
+    g_fw_maxlen = 0;
+    g_fw_err = 0;
+    g_sd_fail = false;
+    g_seek_n = 0;
+    g_seek_last = 0;
+    g_nal_dbg = 0;
     g_pts_dbg = 0;
     if (aac_open() != ESP_OK) {
         rec_free();

@@ -203,8 +203,8 @@ static void build_uv_rows(uint8_t *urow, uint8_t *vrow, const uint8_t *yrow,
  * 同じ元画素の彩度を 2 回計算していた)。
  * 出力は汎用経路とバイト単位で一致。test_scale_ref4 で 921,600 バイト全部を
  * 参照実装と突き合わせて担保している。
- * 内訳カウンタは変換+luma+彩度が prof[0](rgb 欄)、書き込みが prof[3](copy 欄)。
- * prof[1](y)と prof[2](uv)は 0 のまま。 */
+ * 内訳カウンタは変換+luma+彩度が prof[0](rgb 欄)、internal RAM 内の複製が
+ * prof[1](y 欄)、PSRAM への書き込みが prof[2](uv 欄)。prof[3](copy 欄)は 0 のまま。 */
 static uint8_t s_block[4 * GBAC_YW_MAX * 3 / 2] __attribute__((aligned(16)));
 
 /* gbac_rgb565_to888 と同じ式。呼び出しと rgb[3] の受け渡しを消すためここで展開する。 */
@@ -274,8 +274,12 @@ static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
 
     int64_t t1 = PROF_NOW();
     memcpy(s_block + 2 * stride, s_block, 2 * stride); /* [U V] を [U V U V] に */
+    int64_t t2 = PROF_NOW();
     memcpy(out + (size_t)sy * 4 * stride, s_block, 4 * stride);
-    gbac_scale_prof[3] += PROF_NOW() - t1;
+    /* 専用経路では prof[1] が internal RAM 内の複製(460,800B/枚)、
+     * prof[2] が PSRAM への書き込み(921,600B/枚)。どちらが壁かを見る。 */
+    gbac_scale_prof[1] += t2 - t1;
+    gbac_scale_prof[2] += PROF_NOW() - t2;
   }
 }
 

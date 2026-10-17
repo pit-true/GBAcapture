@@ -203,6 +203,12 @@ static void show_status(void)
              (unsigned long long)gbac_enc_frames(), (unsigned long long)gbac_enc_errors(),
              (unsigned)gbac_enc_scale_us_max(), (unsigned)gbac_enc_enc_us_max(),
              gbac_rec_mux_where(), (double)gbac_rec_mux_age_us() / 1e6);
+    if (g_recording) {
+        /* mux が esp_muxer の中で止まっても読めるように、毎回の状態として出す */
+        char ms[256];
+        gbac_rec_mux_stats(ms, (int)sizeof(ms));
+        ESP_LOGI(TAG, "mux %s", ms);
+    }
     /* 経過秒と直近 1 秒の実測速度、rx タスクの 1 パケット原価 */
     ESP_LOGI(TAG, "t=%.1fs rx1s=%.2fMB/s | rx v=%lldus/%llu(=%lldus/pkt) a=%lldus/%llu(=%lldus/pkt)",
              t_run, g_rate_mbs,

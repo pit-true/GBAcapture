@@ -44,6 +44,8 @@ uint64_t gbac_rec_sd_free_mb(void);
  * NAL スロットが枯れたとき mux が詰まっているか切り分ける。 */
 const char *gbac_rec_mux_where(void);
 int64_t gbac_rec_mux_age_us(void);
+/* mux タスクの呼び出しと SD 書き込みの統計を 1 行に。hang 中でも読む */
+void gbac_rec_mux_stats(char *out, int out_sz);
 
 /* 合成映像で bench_frames 枚だけ録画して HW エンコーダの実測を出す。
  * 完了するまで阻塞する。 */

@@ -405,8 +405,8 @@ int gbac_enc_queued(void)
  * ゼロにしているので、今回の録画の 1 枚あたりになる。
  * USB 受信と同時だとどこが膨らむのかを見る(2026-10-17 実測:
  * 実録画 85ms/枚、ベンチ 26ms/枚)。
- * scale=4 の専用経路では rgb 欄が変換+luma+彩度、copy 欄が PSRAM への
- * 書き込みで、y と uv は 0 のまま。 */
+ * scale=4 の専用経路では rgb 欄が変換+luma+彩度、y 欄が internal RAM 内の複製、
+ * uv 欄が PSRAM への書き込みで、copy 欄は 0 のまま。 */
 void gbac_enc_prof_report(void)
 {
     double n = g_frames > 0 ? (double)g_frames : 1.0;
