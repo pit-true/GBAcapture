@@ -849,6 +849,41 @@ static void pump_audio(bool flush)
     }
 }
 
+/* SD を FAT32 で作り直す。FAT の空きクラスタの鎖が壊れて、書き込みが
+ * errno=5(FatFs の内部エラー)になる事故への復旧手段。
+ * 実測(2026-10-18): 録画していない状態で新規ファイルに 32MB 書くと
+ * 16MB 目(17個目)で errno=5、pos=-1。同じ時にカードへ直接セクタ読みは
+ * ESP_OK で、sdmmc ドライバのエラーログもゼロ。なのでカードでなく FAT が壊れている。
+ * esp_vfs_fat_sdcard_format が unmount → f_mkfs → remount をやってくれる。
+ * 録画中と MSC 中は呼ばない。 */
+esp_err_t gbac_sd_format(void)
+{
+    if (!g_card) {
+        ESP_LOGE(TAG, "SD がマウントされていない");
+        return ESP_FAIL;
+    }
+    if (g_detached) {
+        ESP_LOGE(TAG, "PC に SD を見せている最中。フォーマットできない('m' で戻す)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_task) {
+        ESP_LOGE(TAG, "録画中。先に 't' で止める");
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGW(TAG, "SD を FAT32 で作り直す。中身は全部消える");
+    esp_err_t err = esp_vfs_fat_sdcard_format(SD_BASE, g_card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "フォーマット失敗 %s", esp_err_to_name(err));
+        return err;
+    }
+    uint64_t total = 0, freeb = 0;
+    if (esp_vfs_fat_info(SD_BASE, &total, &freeb) == ESP_OK) {
+        ESP_LOGI(TAG, "SD 作り直し完了 total=%lluMB free=%lluMB",
+                 (unsigned long long)(total >> 20), (unsigned long long)(freeb >> 20));
+    }
+    return ESP_OK;
+}
+
 /* SD の実測の書き込み・読み出し速度。esp_muxer の ram_cache_size を決める材料と、
  * mux が詰まる原因(SD が遅い / 止まる)を切り分けるために使う。
  * 録画していないときだけ呼ぶこと(FAT を二重に触らない)。 */

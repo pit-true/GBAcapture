@@ -55,3 +55,6 @@ esp_err_t gbac_rec_bench(const gbac_cfg_t *cfg, int bench_frames);
  * 決める材料と、mux が詰まる原因(SD 側か muxer 側か)の切り分け用。
  * 録画していないときだけ呼ぶこと。完了まで阻塞する。 */
 esp_err_t gbac_sd_speedtest(int mb);
+
+/* SD を FAT32 で作り直す(FAT 破損からの復旧)。録画中・MSC 中は断る */
+esp_err_t gbac_sd_format(void);

@@ -377,8 +377,10 @@ static void uart_cmd_handle(char c)
         if (g_recording) {
             ESP_LOGW(TAG, "録画中なので速度テストは使えない");
         } else {
-            gbac_sd_speedtest(16);
+            gbac_sd_speedtest(32);
         }
+    } else if (c == 'F') {
+        gbac_sd_format();
     } else if (c == 'd') {
         ESP_LOGI(TAG, "書き込みモードで再起動する(esptool がつながる)");
         enter_download_mode();
