@@ -68,3 +68,7 @@ esp_err_t gbac_sd_fatscan(void);
 esp_err_t gbac_sd_buf_battery(void);
 /* 生セクタ書き込みがどこへ行ったか探す検査 */
 esp_err_t gbac_sd_wrprobe(void);
+
+/* いちばん番号の大きい REC_NNNN.mp4 を UART0(1.5Mbps)で PC へ流す。
+ * 受け手は recorder/scripts/p4pull.py。録画中は断る。 */
+esp_err_t gbac_sd_dump_latest(void);

@@ -30,6 +30,8 @@
 #include "freertos/queue.h"
 #include "gbacap.h"
 #include "esp_aac_enc.h"
+#include "esp_rom_crc.h"
+#include "driver/uart.h"
 #include "impl/mp4_muxer.h"
 #include "sdmmc_cmd.h"
 #include "video_enc.h"
@@ -2068,3 +2070,74 @@ esp_err_t gbac_rec_bench(const gbac_cfg_t *cfg, int bench_frames)
     return ESP_OK;
 }
 
+/* いちばん番号の大きい REC_NNNN.mp4 を UART0 で PC へ流す(2026-10-18)。
+ * P4 の USB-OTG はホスト(nano)と MSC の一個取りで、MSC で読むにはケーブルを
+ * PC へ差し替える手作業が要る。開発中に手を借りずに mp4 を確かめるための経路。
+ *   1) 115200 で "DUMP <名前> <バイト数>" を 1 行出す
+ *   2) 300ms 待って 1,500,000 へ切り替える(PC 側 recorder/scripts/p4pull.py も切り替える)
+ *   3) 中身を流し、最後に CRC32(esp_rom_crc32_le、初期値 0)を LE 4 バイト
+ *   4) 115200 へ戻す
+ * 20MB で約 2 分半。録画中は断る。 */
+esp_err_t gbac_sd_dump_latest(void)
+{
+    if (!g_mounted || g_detached) {
+        ESP_LOGE(TAG, "SD が使えない状態(mounted=%d detached=%d)", (int)g_mounted, (int)g_detached);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_run) {
+        ESP_LOGE(TAG, "録画中は流せない");
+        return ESP_ERR_INVALID_STATE;
+    }
+    int num = scan_max_num();
+    if (num <= 0) {
+        ESP_LOGE(TAG, "REC_*.mp4 がない");
+        return ESP_ERR_NOT_FOUND;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "%s/REC_%04d.mp4", SD_BASE, num);
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        ESP_LOGE(TAG, "%s が読めない", path);
+        return ESP_FAIL;
+    }
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "%s を開けない", path);
+        return ESP_FAIL;
+    }
+    const size_t CH = 4096;
+    uint8_t *buf = heap_caps_malloc(CH, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (buf == NULL) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+    printf("\nDUMP REC_%04d.mp4 %u\n", num, (unsigned)st.st_size);
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(200));
+    uart_set_baudrate(UART_NUM_0, 1500000);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    uint32_t crc = 0;
+    size_t sent = 0;
+    int64_t t0 = esp_timer_get_time();
+    for (;;) {
+        size_t n = fread(buf, 1, CH, f);
+        if (n == 0) {
+            break;
+        }
+        crc = esp_rom_crc32_le(crc, buf, (uint32_t)n);
+        uart_write_bytes(UART_NUM_0, buf, n);
+        sent += n;
+    }
+    uint8_t tail[4] = { (uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24) };
+    uart_write_bytes(UART_NUM_0, tail, 4);
+    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uart_set_baudrate(UART_NUM_0, 115200);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    fclose(f);
+    heap_caps_free(buf);
+    ESP_LOGI(TAG, "DUMP 完了 %s %u バイト crc=%08x %.1f 秒", path, (unsigned)sent, (unsigned)crc,
+             (double)(esp_timer_get_time() - t0) / 1e6);
+    return ESP_OK;
+}

@@ -415,6 +415,14 @@ static void uart_cmd_handle(char c)
         }
     } else if (c == 'F') {
         gbac_sd_format();
+    } else if (c == 'D') {
+        /* いちばん新しい mp4 を UART で PC へ流す(scripts/p4pull.py)。MSC はケーブルの
+         * 差し替えが要るので、手を借りずに中身を確かめるときはこちら */
+        if (g_recording || g_pipe_test) {
+            ESP_LOGW(TAG, "録画中は流せない");
+        } else {
+            gbac_sd_dump_latest();
+        }
     } else if (c == 'd') {
         ESP_LOGI(TAG, "書き込みモードで再起動する(esptool がつながる)");
         enter_download_mode();
@@ -481,7 +489,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 m=PC に SD を見せる/戻す d=書き込みモード");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 m=PC に SD を見せる/戻す D=最新 mp4 を UART で送る d=書き込みモード");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
