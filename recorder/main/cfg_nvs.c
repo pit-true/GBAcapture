@@ -16,7 +16,7 @@ static const char *TAG = "cfg";
 #define KEY_SPLIT     "split_min"
 #define KEY_VOLUME    "volume"
 #define KEY_VER       "ver"
-/* 2026-10-19 の仕様変更(録画は 480x320。960x640 への 2 倍は PC の ffmpeg)で 2 へ。
+/* 2026-10-18 の仕様変更(録画は 480x320。960x640 への 2 倍は PC の ffmpeg)で 2 へ。
  * NVS に古い値(scale=4, 16000kbps)が入っていても 1 回だけ新しい既定値に寄せる。 */
 #define CFG_VER       2
 
@@ -85,7 +85,7 @@ void gbac_cfg_load(gbac_cfg_t *c)
 
     gbac_cfg_clamp(c);
     if (ver < CFG_VER) {
-        /* 4 が保存済みでもここでは 2 にする(2026-10-19 の仕様変更)。
+        /* 4 が保存済みでもここでは 2 にする(2026-10-18 の仕様変更)。
          * 960x640 を直接録画すると 1 枚 921,600 バイトで P4 では重すぎた。
          * 480x320(230,400 バイト)にすれば 1/4 で、彩度 1 個 = GBA 1 画素。
          * 960x640 への 2 倍は PC の ffmpeg(recorder/tools)でやる。 */
