@@ -34,6 +34,7 @@ static SemaphoreHandle_t g_sig;
 static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 static gbac_pts_t g_pts;
 static int g_pts_dbg;   /* 先頭 20 フレームの PTS をログに出す回数 */
+static int g_emitted;   /* この録画で出した枚数。0 のうちは欠けた枠を出さない */
 
 esp_err_t frame_pipe_init(void)
 {
@@ -45,6 +46,9 @@ esp_err_t frame_pipe_init(void)
             return ESP_ERR_NO_MEM;
         }
         gbac_asm_init(g_asm[i]);
+        /* 欠けたラインは前の内容が残る作り。初回は未初期化の PSRAM(縞ノイズ)が
+         * 映ったので黒(サンプル 0)で埋めておく(2026-10-18 REC_0018 の 0 秒目) */
+        memset(g_asm[i]->lines, 0, sizeof(g_asm[i]->lines));
         /* 復号は拡大側の直引き表に任せる(2026-10-18)。rx は 480B の
          * memcpy だけになり、core1 の rx が 1 ライン 19us → 数 us になる。
          * frame_pipe_take が返す枠は nano のサンプルそのまま。 */
@@ -103,8 +107,11 @@ static void emit_frame(int slot)
     xSemaphoreGive(g_sig);
 }
 
-/* 今の枠を出して、次の枠を今の枠に繰り上げる */
-static void close_cur(void)
+/* 今の枠を出して、次の枠を今の枠に繰り上げる。
+ * complete=0(欠けあり)で、まだこの録画で 1 枚も出していなければ捨てる。
+ * 録画はフレームの途中から始まるので、最初の枠は上側が前の内容(起動直後なら黒)
+ * になる。それを mp4 の 0 秒目に出さない。 */
+static void close_cur(int complete)
 {
     if (g_cur < 0) {
         return;
@@ -112,6 +119,11 @@ static void close_cur(void)
     int slot = g_cur;
     g_cur = g_next;
     g_next = -1;
+    if (!complete && g_emitted == 0) {
+        g_asm[slot]->dropped_frames++;
+        return;
+    }
+    g_emitted++;
     emit_frame(slot);   /* emit の中で g_ready が slot になる。g_cur からは外してある */
 }
 
@@ -137,7 +149,7 @@ void frame_pipe_push(const uint8_t *pkt, int len)
     while (d >= 2) {
         /* N+2 以降が来た。N は欠けていても閉じ、次の枠を繰り上げる */
         g_asm[g_cur]->completed_frames++;
-        close_cur();
+        close_cur(0);
         if (g_cur < 0) {
             g_cur = free_slot();
             gbac_asm_start(g_asm[g_cur], ln.frame_no);
@@ -162,12 +174,12 @@ void frame_pipe_push(const uint8_t *pkt, int len)
     if (r == 1) {
         /* 160 ライン揃った */
         if (target == g_cur) {
-            close_cur();
+            close_cur(1);
         } else {
             /* 次の枠が先に揃った。順番を守るため今の枠を欠けたまま先に出す */
             g_asm[g_cur]->completed_frames++;
-            close_cur();          /* g_cur = 揃った次の枠 */
-            close_cur();          /* それも出す */
+            close_cur(0);         /* g_cur = 揃った次の枠 */
+            close_cur(1);         /* それも出す */
         }
     }
 }
@@ -247,4 +259,5 @@ void frame_pipe_stats_reset(void)
      * 0 開始でなくなり、尺の実測と比べにくくなる。 */
     gbac_pts_init(&g_pts);
     g_pts_dbg = 0;
+    g_emitted = 0;
 }
