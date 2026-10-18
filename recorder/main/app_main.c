@@ -415,6 +415,19 @@ static void uart_cmd_handle(char c)
         }
     } else if (c == 'F') {
         gbac_sd_format();
+    } else if (c == '2' || c == '4') {
+        /* 拡大倍率の切り替え(2026-10-18)。2 = 480x320 8Mbps、4 = 960x640 16Mbps。
+         * NVS に保存して再起動する(エンコーダと GDMA の段は起動時の倍率で確保するため)。 */
+        if (g_recording || g_pipe_test) {
+            ESP_LOGW(TAG, "録画中は倍率を変えられない");
+        } else {
+            g_cfg.scale = (c == '4') ? 4 : 2;
+            g_cfg.bitrate_kbps = (c == '4') ? 16000 : 8000;
+            gbac_cfg_save(&g_cfg);
+            ESP_LOGI(TAG, "倍率を %dx(%dkbps)にして再起動する", (int)g_cfg.scale, (int)g_cfg.bitrate_kbps);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        }
     } else if (c == 'D') {
         /* いちばん新しい mp4 を UART で PC へ流す(scripts/p4pull.py)。MSC はケーブルの
          * 差し替えが要るので、手を借りずに中身を確かめるときはこちら */
@@ -489,7 +502,7 @@ void app_main(void)
     /* シリアルが出ない状況でも「起動した」と分かる合図。3回点滅。 */
     gbac_led_blink(3, 150);
     uart_cmd_init();
-    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 m=PC に SD を見せる/戻す D=最新 mp4 を UART で送る d=書き込みモード");
+    ESP_LOGI(TAG, "コンソールで r=再起動 i=状態 p=タスク統計 b=ベンチ t=録画 ON/OFF e=受信とエンコードのテスト s=SD 結線 w=SD 速度 m=PC に SD を見せる/戻す D=最新 mp4 を UART で送る 2/4=倍率を変えて再起動 d=書き込みモード");
     gbac_cfg_load(&g_cfg);
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
