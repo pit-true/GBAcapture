@@ -2,11 +2,14 @@
 
 #include <string.h>
 
+#include "esp_async_memcpy.h"
+#include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "frame_pipe.h"
 #include "gbacap.h"
@@ -74,6 +77,135 @@ static void bench_fill(uint16_t *dst, int n)
     }
 }
 
+/* ---- PSRAM への書き出しを GDMA に逃がす(2026-10-18) ----
+ * r91 実測: esp_async_memcpy(AXI-GDMA)で internal→PSRAM を 921,600B 送る時間は
+ *   5,760B 刻み ×160 = 19.91ms(46MB/s)  ← 1 個あたりのオーバーヘッドが大きい
+ *  11,520B 刻み ×80  = 10.40ms
+ *  23,040B 刻み ×40  =  5.71ms(161MB/s) ← ここから頭打ち
+ *  46,080B 刻み ×20  =  5.58ms
+ * で、CPU memcpy(10.48ms)より 23,040B 刻みが速い。46,080B は internal RAM が
+ * 46KB の塊を 2 個もたないので使えない。よって元行 4 本ぶん(23,040B)を
+ * internal RAM のステージに組み、それを DMA で PSRAM へ送る。
+ * ステージは 2 個交互。前回そのステージを使ったコピー(2 グループ前)が
+ * 終わるのを待ってから組み直す。ステージ 2 個で 46KB。
+ * ドライバは source のキャッシュ writeback(C2M)と、dst のキャッシュライン
+ * 境界外部分の退避を自分でやる(async_memcpy_gdma.c 374〜411 行)。 */
+#define STG_BYTES (GBAC_OUYY_STRIDE(GBAC_WIDTH, 4) * 4 * 4) /* 23040 */
+static uint8_t *g_stg[2];
+static async_memcpy_handle_t g_mcp;
+static SemaphoreHandle_t g_stg_sem;
+static volatile int g_dma_issue;
+static volatile int g_dma_done;
+
+static bool dma_done_cb(async_memcpy_handle_t h, async_memcpy_event_t *e, void *arg)
+{
+    (void)h;
+    (void)e;
+    g_dma_done++;
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR((SemaphoreHandle_t)arg, &hp);
+    return hp == pdTRUE;
+}
+
+/* gbac_scale_ouyy が 4 元行ぶんを組み終えるたびに呼ばれる */
+static void dma_flush(uint8_t *dst, const uint8_t *stage, size_t n)
+{
+    while (g_dma_issue - g_dma_done >= 2) {
+        if (xSemaphoreTake(g_stg_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+            g_errs++;
+            ESP_LOGW(TAG, "DMA 完了待ちが 200ms 超過");
+            break;
+        }
+    }
+    if (esp_async_memcpy(g_mcp, dst, (void *)stage, n, dma_done_cb, g_stg_sem) != ESP_OK) {
+        memcpy(dst, stage, n); /* 発行に失敗したらその場で CPU が書く */
+        g_errs++;
+    } else {
+        g_dma_issue++;
+    }
+}
+
+/* 1 枚ぶん全部が PSRAM に乗るまで待つ(enc が読み始める前に必要) */
+static void dma_finish(void)
+{
+    while (g_dma_done < g_dma_issue) {
+        if (xSemaphoreTake(g_stg_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+            g_errs++;
+            ESP_LOGE(TAG, "DMA 完了待ちが 200ms 超過。枚を捨てる");
+            break;
+        }
+    }
+}
+
+static void dma_stage_setup(void)
+{
+    if (g_mcp != NULL) {
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        g_stg[i] = heap_caps_aligned_alloc(64, STG_BYTES,
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (g_stg[i] == NULL) {
+            ESP_LOGW(TAG, "internal RAM に %dB x2 が確保できない。CPU で書く",
+                     (int)STG_BYTES);
+            g_stg[0] = g_stg[1] = NULL;
+            return;
+        }
+    }
+    g_stg_sem = xSemaphoreCreateCounting(16, 0);
+    async_memcpy_config_t ac = ASYNC_MEMCPY_DEFAULT_CONFIG();
+    ac.backlog = 4;
+    ac.dma_burst_size = 128;
+    esp_err_t e = esp_async_memcpy_install_gdma_axi(&ac, &g_mcp);
+    if (e != ESP_OK) {
+        e = esp_async_memcpy_install_gdma_ahb(&ac, &g_mcp);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "async memcpy が使えない(%s)。CPU で書く", esp_err_to_name(e));
+        g_mcp = NULL;
+        return;
+    }
+    g_dma_issue = g_dma_done = 0;
+    gbac_scale_set_stage(g_stg[0], g_stg[1], STG_BYTES, dma_flush, dma_finish);
+    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(ステージ %dB x2、internal free %uKB)",
+             (int)STG_BYTES,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+}
+
+/* DMA で PSRAM へ書いた枚と、CPU が直接書いた枚がバイト単位で同じかを確かめる。
+ * ベンチの 1 枚目だけ。違うときは拡大の組み替えか DMA のキャッシュ面倒が
+ * 壊れている証拠なので、映像を見る前に分かるようにする。 */
+static void dma_selfcheck(uint8_t *slot, const uint16_t *px)
+{
+    static uint8_t *ref;
+    if (ref == NULL) {
+        ref = heap_caps_aligned_alloc(128, g_yuv_len, MALLOC_CAP_SPIRAM);
+        if (ref == NULL) {
+            ESP_LOGW(TAG, "DMA 一致確認用の %u バイトが確保できない", (unsigned)g_yuv_len);
+            return;
+        }
+    }
+    gbac_scale_set_stage(NULL, NULL, 0, NULL, NULL);   /* CPU が直接書く経路 */
+    gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, ref);
+    gbac_scale_set_stage(g_stg[0], g_stg[1], STG_BYTES, dma_flush, dma_finish);
+    /* slot は CPU が一度も読んでいないのでキャッシュに無いはずだが、
+     * 念のため M2C で無効化してから読む(アドレス・サイズは 64B の倍数) */
+    esp_cache_msync(slot, g_yuv_len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    size_t bad = 0, first = 0;
+    for (size_t i = 0; i < g_yuv_len; i++) {
+        if (slot[i] != ref[i]) {
+            if (bad == 0) first = i;
+            bad++;
+        }
+    }
+    ESP_LOGI(TAG, "DMA 一致確認: %u/%u バイト不一致(最初の不一致=%u slot=%p ref=%p)",
+             (unsigned)bad, (unsigned)g_yuv_len, (unsigned)first,
+             (void *)slot, (void *)ref);
+    for (int i = 0; i < 4; i++) {
+        gbac_scale_prof[i] = 0;   /* 確認ぶんを内訳から除外する */
+    }
+}
+
 /* ---- 前段: RGB565 -> OUYY 拡大 ---- */
 static void scale_task(void *arg)
 {
@@ -118,6 +250,9 @@ static void scale_task(void *arg)
         int64_t t1 = esp_timer_get_time();
         if (!g_bench) {
             frame_pipe_release();
+        }
+        if (g_bench && g_mcp != NULL && g_scale == 4 && made == 0) {
+            dma_selfcheck(g_yuv[slot], px);
         }
         if ((uint32_t)(t1 - t0) > g_scale_us_max) {
             g_scale_us_max = (uint32_t)(t1 - t0);
@@ -339,6 +474,11 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_enc_us_max = 0;
     for (int i = 0; i < 4; i++) {
         gbac_scale_prof[i] = 0;
+    }
+    /* 前段の PSRAM 書き出しを DMA に切り替える(失敗しても従来経路で動く) */
+    dma_stage_setup();
+    if (g_mcp != NULL) {
+        g_dma_issue = g_dma_done = 0;
     }
     g_run = true;
     ESP_LOGI(TAG, "エンコード開始 %dx%d scale=%d %dkbps bench=%d",

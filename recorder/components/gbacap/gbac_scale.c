@@ -227,55 +227,101 @@ static int chroma_v8(int r, int g, int b) {
   return v > 255 ? 255 : v;
 }
 
+/* アプリが渡した internal RAM のステージ(scale=4 で 4 元行ぶん)。
+ * NULL のあいだは s_block + memcpy の従来経路。 */
+static uint8_t *s_stage[2];
+static size_t s_stage_bytes;
+static gbac_scale_flush_t s_flush;
+static gbac_scale_finish_t s_finish;
+
+void gbac_scale_set_stage(uint8_t *stage_a, uint8_t *stage_b, size_t stage_bytes,
+                          gbac_scale_flush_t flush, gbac_scale_finish_t finish) {
+  s_stage[0] = stage_a;
+  s_stage[1] = stage_b;
+  s_stage_bytes = stage_bytes;
+  s_flush = flush;
+  s_finish = finish;
+}
+
+/* 元行 1 本ぶんから出力行 2 本 [U 行] [V 行] を作る(1 元画素 6 バイト)。
+ * 呼び出しと rgb[3] の受け渡しを消すためここで展開する。 */
+static void build_row_x4(const uint16_t *s, int w, uint8_t *rowu, uint8_t *rowv) {
+  int64_t t0 = PROF_NOW();
+  uint32_t *wu = (uint32_t *)rowu;
+  uint32_t *wv = (uint32_t *)rowv;
+  int x = 0;
+  for (; x + 2 <= w; x += 2) {
+    int r, g, b;
+    rgb565_of(s[x], &r, &g, &b);
+    int y0 = luma(r, g, b);
+    int u0 = chroma_u8(r, g, b);
+    int v0 = chroma_v8(r, g, b);
+    rgb565_of(s[x + 1], &r, &g, &b);
+    int y1 = luma(r, g, b);
+    int u1 = chroma_u8(r, g, b);
+    int v1 = chroma_v8(r, g, b);
+    /* 2 画素で 12 バイト = 語 3 個。x が偶数のとき語境界に揃う。
+     * [C Y Y C Y Y | C Y Y C Y Y] */
+    *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u0 << 24));
+    *wu++ = (uint32_t)(y0 | (y0 << 8) | (u1 << 16) | (y1 << 24));
+    *wu++ = (uint32_t)(y1 | (u1 << 8) | (y1 << 16) | (y1 << 24));
+    *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v0 << 24));
+    *wv++ = (uint32_t)(y0 | (y0 << 8) | (v1 << 16) | (y1 << 24));
+    *wv++ = (uint32_t)(y1 | (v1 << 8) | (y1 << 16) | (y1 << 24));
+  }
+  if (x < w) { /* 奇数幅のとき最後の 1 画素(実運用では来ない) */
+    int r, g, b;
+    rgb565_of(s[x], &r, &g, &b);
+    int y = luma(r, g, b);
+    int u = chroma_u8(r, g, b);
+    int v = chroma_v8(r, g, b);
+    uint8_t *p = rowu + x * 6;
+    p[0] = (uint8_t)u; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
+    p[3] = (uint8_t)u; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
+    p = rowv + x * 6;
+    p[0] = (uint8_t)v; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
+    p[3] = (uint8_t)v; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
+  }
+  gbac_scale_prof[0] += PROF_NOW() - t0;
+}
+
 static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
   const int stride = w * 6; /* w * 4 * 3 / 2 */
+  const int blk = 4 * stride;  /* 元行 1 本 = 出力行 4 本 */
+  const int grp = 4 * blk;     /* 元行 4 本 = 出力行 16 本 */
+
+  /* ステージが渡されていれば 4 元行ぶんをそこに組み、flush でまとめて
+   * 書き出す(DMA 前提)。なければ s_block に 1 元行ずつ組み memcpy で書く。 */
+  if (s_stage[0] && s_stage[1] && s_flush && s_stage_bytes >= (size_t)grp &&
+      (h & 3) == 0) {
+    for (int g = 0; g < h; g += 4) {
+      uint8_t *stg = s_stage[(g >> 2) & 1];
+      for (int k = 0; k < 4; k++) {
+        uint8_t *b = stg + (size_t)k * blk;
+        build_row_x4(src + (size_t)(g + k) * w, w, b, b + stride);
+        int64_t t1 = PROF_NOW();
+        memcpy(b + 2 * stride, b, 2 * stride); /* [U V] を [U V U V] に */
+        gbac_scale_prof[1] += PROF_NOW() - t1;
+      }
+      int64_t t2 = PROF_NOW();
+      s_flush(out + (size_t)g * blk, stg, (size_t)grp);
+      gbac_scale_prof[2] += PROF_NOW() - t2;
+    }
+    if (s_finish) s_finish();
+    return;
+  }
+
   uint8_t *rowu = s_block;
   uint8_t *rowv = s_block + stride;
 
   for (int sy = 0; sy < h; sy++) {
     const uint16_t *s = src + (size_t)sy * w;
-    int64_t t0 = PROF_NOW();
-    uint32_t *wu = (uint32_t *)rowu;
-    uint32_t *wv = (uint32_t *)rowv;
-    int x = 0;
-    for (; x + 2 <= w; x += 2) {
-      int r, g, b;
-      rgb565_of(s[x], &r, &g, &b);
-      int y0 = luma(r, g, b);
-      int u0 = chroma_u8(r, g, b);
-      int v0 = chroma_v8(r, g, b);
-      rgb565_of(s[x + 1], &r, &g, &b);
-      int y1 = luma(r, g, b);
-      int u1 = chroma_u8(r, g, b);
-      int v1 = chroma_v8(r, g, b);
-      /* 2 画素で 12 バイト = 語 3 個。x が偶数のとき語境界に揃う。
-       * [C Y Y C Y Y | C Y Y C Y Y] */
-      *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u0 << 24));
-      *wu++ = (uint32_t)(y0 | (y0 << 8) | (u1 << 16) | (y1 << 24));
-      *wu++ = (uint32_t)(y1 | (u1 << 8) | (y1 << 16) | (y1 << 24));
-      *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v0 << 24));
-      *wv++ = (uint32_t)(y0 | (y0 << 8) | (v1 << 16) | (y1 << 24));
-      *wv++ = (uint32_t)(y1 | (v1 << 8) | (y1 << 16) | (y1 << 24));
-    }
-    if (x < w) { /* 奇数幅のとき最後の 1 画素(実運用では来ない) */
-      int r, g, b;
-      rgb565_of(s[x], &r, &g, &b);
-      int y = luma(r, g, b);
-      int u = chroma_u8(r, g, b);
-      int v = chroma_v8(r, g, b);
-      uint8_t *p = rowu + x * 6;
-      p[0] = (uint8_t)u; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
-      p[3] = (uint8_t)u; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
-      p = rowv + x * 6;
-      p[0] = (uint8_t)v; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
-      p[3] = (uint8_t)v; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
-    }
-    gbac_scale_prof[0] += PROF_NOW() - t0;
+    build_row_x4(s, w, rowu, rowv);
 
     int64_t t1 = PROF_NOW();
     memcpy(s_block + 2 * stride, s_block, 2 * stride); /* [U V] を [U V U V] に */
     int64_t t2 = PROF_NOW();
-    memcpy(out + (size_t)sy * 4 * stride, s_block, 4 * stride);
+    memcpy(out + (size_t)sy * blk, s_block, blk);
     /* 専用経路では prof[1] が internal RAM 内の複製(460,800B/枚)、
      * prof[2] が PSRAM への書き込み(921,600B/枚)。どちらが壁かを見る。 */
     gbac_scale_prof[1] += t2 - t1;

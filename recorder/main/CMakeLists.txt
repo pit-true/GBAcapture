@@ -26,6 +26,7 @@ idf_component_register(
         esp_driver_uart
         esp_timer
         esp_hw_support
+        esp_mm
         esp_h264
         esp_muxer
         esp_audio_codec

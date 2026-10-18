@@ -111,6 +111,19 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
  * ホスト(gcc)では計測しないので常に 0。 */
 extern int64_t gbac_scale_prof[4];
 
+/* ---- PSRAM へ書く手をアプリから差し込む(2026-10-18) ----
+ * stage_a / stage_b に internal RAM のステージ 2 個を渡すと、scale=4 の
+ * 専用経路は 4 元行ぶん(出力行 16 本 = GBAC_OUYY_STRIDE(w,4)*4*4 バイト)を
+ * そこへ組み立て、flush(その 4 行ぶんの出力先, stage, バイト数) を
+ * 1 グループ(元行 4 本)ごとに呼ぶ。全行組み終わったら finish() を呼ぶ。
+ * stage は交互に渡すので、アプリ側は 2 グループ前の書き出しが終わっていれば
+ * 待たずに済む。NULL を渡すと従来どおり 1 元行ずつ memcpy で PSRAM へ書く。
+ * stage_bytes が足りないときも従来経路。単一タスクからの呼び出し前提。 */
+typedef void (*gbac_scale_flush_t)(uint8_t *dst, const uint8_t *stage, size_t n);
+typedef void (*gbac_scale_finish_t)(void);
+void gbac_scale_set_stage(uint8_t *stage_a, uint8_t *stage_b, size_t stage_bytes,
+                          gbac_scale_flush_t flush, gbac_scale_finish_t finish);
+
 /* ---- 音声加工 (host/GbaCap.Viewer/ViewerForm.cs と同じ連鎖) ----
  * DCオフセット追従(係数0.0005) → 2次バターワースLPF(fc 13kHz@32.768kHz)
  * → ゲイン(2 * volume) → int16。入力 [右,左] → 出力 [左,右]。 */
