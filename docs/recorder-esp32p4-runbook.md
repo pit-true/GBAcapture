@@ -1,8 +1,8 @@
 # ESP32-P4-Pico レコーダ 通し手順(2026-10-18 改訂)
 
-nanoCH32V305 から映像と音声を受け取り、**480x320 の mp4(H.264 + AAC 32kHz)** を microSD に書く装置の、
-準備から検証までの通し手順。960x640 にするときは PC で `recorder/scripts/upscale_x2.bat` を使う
-(ドットをそのまま 2 倍にするだけなので画質は落ちない)。
+nanoCH32V305 から映像と音声を受け取り、**960x640 の mp4(H.264 16Mbps + AAC 32kHz)** を microSD に書く装置の、
+準備から検証までの通し手順。コンソールの `2` で 480x320(8Mbps)にもできる。そのときは PC の
+`recorder/scripts/upscale_x2.bat` でドットを 2 倍にすれば 960x640 になる。
 配線の詳細は `docs/recorder-wiring-esp32p4.md`、書き込みと復旧の詳細は `docs/esp32p4-flashing.md`。
 ここには手順と期待値だけを残す。
 
@@ -56,16 +56,16 @@ pwsh -NoProfile -Command 'Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue;
 ```
 I (xxx) main: chip rev v1.3 cores=2 features=0x0
 I (xxx) main: heap free internal=336KB psram=32765KB
-I (xxx) cfg: 設定 scale=2 bitrate=8000kbps split=15min vol=100%
-I (xxx) enc: エンコーダを開いた 480x320 8000kbps internal free=193KB 最大=62KB
-I (xxx) enc: PSRAM 書き出しは GDMA(段 11520B x4、同時 3、internal free 251KB)
+I (xxx) cfg: 設定 scale=4 bitrate=16000kbps split=15min vol=100%
+I (xxx) enc: エンコーダを開いた 960x640 16000kbps internal free=154KB 最大=44KB
+I (xxx) enc: PSRAM 書き出しは GDMA(分割 上下 2 コア、段 23040B x2 x2 組、組あたり同時 1、internal free 165KB)
 I (xxx) rec: SD マウント完了 /sd クラス=... 容量=...MB
 I (xxx) usbnano: 接続 1209:c001
 I (xxx) usbnano: 受注開始
 ```
 
-起動直後の internal RAM は約 250KB 空いていれば正常(直引き表 96KB とエンコーダ 39KB、
-GDMA の段 46KB を起動時に確保している)。
+起動直後の internal RAM は 4 倍で約 165KB、2 倍で約 250KB 空いていれば正常(直引き表 96KB と
+エンコーダ、GDMA の段を起動時に確保している)。
 
 ## 4. ベンチで速さを測る
 
@@ -89,11 +89,11 @@ $py = 'D:\esp\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe'
 & $py C:\Users\korok\gba-capture\recorder\scripts\p4seq.py D:\esp\scripts\rec.log T@0 p@17 i@30
 ```
 
-2026-10-18 の実測(REC_0013)は次のとおり。
+2026-10-18 の実測(4 倍、REC_0018)は次のとおり。
 
 ```
-I (24218) rec: 停止ログ REC_0013.mp4 映像=1211 先頭pts=0.00s 末尾pts=20.27s | 音声=635 先頭pts=0.00s 末尾pts=20.29s
-I (24229) enc: スケール内訳 us/枚 rgb=3164 y=0 uv=2258 copy=0 | 枚=1212 scale<=28298us enc<=12089us
+I (24424) rec: 停止ログ REC_0018.mp4 映像=1210 先頭pts=0.00s 末尾pts=20.27s | 音声=635 先頭pts=0.00s 末尾pts=20.29s
+I (24432) enc: スケール内訳 us/枚 rgb=7295 y=1872 uv=7704 copy=0 | 枚=1211 scale<=22651us enc<=22873us
 ```
 
 合格の目安は次の表のとおり。
@@ -106,7 +106,8 @@ I (24229) enc: スケール内訳 us/枚 rgb=3164 y=0 uv=2258 copy=0 | 枚=1212 
 | `ringovf` `rxadrop` | 0(開始直後の数個は可) |
 | `task_wdt` | 出ない |
 
-`p` のタスク統計で core1 の IDLE1 が 30% 前後あれば余裕がある(2026-10-18: scale 28%、aac 22%、rx 8%)。
+`p` のタスク統計で IDLE0 と IDLE1 がどちらも 25% 以上あれば余裕がある
+(2026-10-18 の 4 倍: scale 41%、scale_b 32%、aac 22%、usbh 13%、rx 10%、IDLE0 42%、IDLE1 27%)。
 
 ## 6. mp4 を検査する
 
@@ -119,11 +120,11 @@ ffprobe -v error -show_entries stream=codec_name,width,height,sample_rate,nb_fra
 |---|---|
 | moov | ある(なければ途中で切れている。停止を押さずに電源を切ると失われる) |
 | trak | 2 本。`vide` と `soun` |
-| vide | `avc1` 480x320、タイムスケール 59690、1 枚の間隔 999(= 59.7275fps) |
+| vide | `avc1` 960x640(2 倍なら 480x320)、タイムスケール 59690、1 枚の間隔 999(= 59.7275fps) |
 | soun | `mp4a` 32000Hz 2ch、1 枚 1024 サンプル |
 | 長さ | 映像と音声が一致 |
 
-960x640 にするには ffmpeg が要る(`winget install Gyan.FFmpeg` など)。
+2 倍で録ったものを 960x640 にするには ffmpeg が要る(`winget install Gyan.FFmpeg` など)。
 
 ```
 recorder\scripts\upscale_x2.bat REC_0013.mp4   # 隣に REC_0013_960x640.mp4 ができる
@@ -189,7 +190,6 @@ Explorer に「TinyUSB Flash Storage」が出る。戻すときはもう 1 回 `
 
 ## 11. 未完了(2026-10-18 時点)
 
-0. **nano v0.34 + 4KB 転送での録画確認**(2 倍で 20 秒、次に `4` で 960x640)。nano のケーブルを P4 へ戻してから
 1. ボタン(GPIO2)と LED(GPIO3)の実機確認
 2. MSC の往復(ケーブル差し替え → `m` → 読み出し → `m` → 続けて録画)
 3. 30 分連続録画と発熱、15 分スライスの境界が IDR になっているか

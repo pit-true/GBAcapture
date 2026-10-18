@@ -52,9 +52,9 @@ cd host && dotnet run --project GbaCap.Cli -- framestat  # 診断: フレーム�
 ## 進行中・次のアクション
 
 - **録画デバイス**（詳細: docs/recorder-plan-esp32p4.md 改訂5、2026-10-09）
-  - **2026-10-18: 480x320 の 20 秒録画が 60fps・音声欠落なしで通った**（docs/recorder-esp32p4-status-20261018.md 9 章）。
-    960x640 は PC で `recorder/scripts/upscale_x2.bat`（ドット 2 倍）。残りはボタン/LED の実機確認、MSC の往復、長時間試験
-  - 構成: **ESP32-P4-Pico**（手元にあり）+ esp_h264 HWエンコーダ + mp4(2x/480×320/8Mbps/AAC 32kHz)
+  - **2026-10-18: 960x640 の 20 秒録画が 59.7fps・欠け 0・音声欠落なしで通った**（docs/recorder-esp32p4-status-20261018.md 9 章）。
+    nano FW v0.34（パケット 512B）+ 拡大の 2 コア分割で到達。残りはボタン/LED の実機確認、MSC の往復、長時間試験
+  - 構成: **ESP32-P4-Pico**（手元にあり）+ esp_h264 HWエンコーダ + mp4(4x/960×640/16Mbps/AAC 32kHz)
     を基板上の microSD(FAT32) へ。nano とは 4ピン USB ヘッダ(HS)→Type-C オスで接続・給電。
     PC 向け SD 公開はパネル Type-C → GPIO26/27 の FS USB MSC（遅いので基本はカード抜き）。
     ケースはタカチ SW-75B、タクトSW TS-06104 + LED×2
