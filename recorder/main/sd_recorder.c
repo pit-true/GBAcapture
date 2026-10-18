@@ -849,11 +849,13 @@ static void pump_audio(bool flush)
     }
 }
 
-/* SD を FAT32 で作り直す。FAT の空きクラスタの鎖が壊れて、書き込みが
- * errno=5(FatFs の内部エラー)になる事故への復旧手段。
- * 実測(2026-10-18): 録画していない状態で新規ファイルに 32MB 書くと
- * 16MB 目(17個目)で errno=5、pos=-1。同じ時にカードへ直接セクタ読みは
- * ESP_OK で、sdmmc ドライバのエラーログもゼロ。なのでカードでなく FAT が壊れている。
+/* 下に定義。フォーマット後にもジオメトリを出すので前に必要 */
+static uint32_t fat_dump_state(void);
+
+/* SD を FAT32 で作り直す。復旧手段というより検査手段にもなる。
+ * 実測(2026-10-18): 生セクタ書き込みは全条件で ESP_OK なのにカードに残らない。
+ * f_mkfs が指定した 64KB クラスタ(csize=128)ではなく、読み直すと 16KB(csize=32)
+ * のまま。つまりフォーマットの内容も保存されていない。
  * esp_vfs_fat_sdcard_format が unmount → f_mkfs → remount をやってくれる。
  * 録画中と MSC 中は呼ばない。 */
 esp_err_t gbac_sd_format(void)
@@ -881,6 +883,9 @@ esp_err_t gbac_sd_format(void)
         ESP_LOGI(TAG, "SD 作り直し完了 total=%lluMB free=%lluMB",
                  (unsigned long long)(total >> 20), (unsigned long long)(freeb >> 20));
     }
+    /* カードから読み直したジオメトリ。csize が指定どおり 128(64KB)なら
+     * フォーマットがカードに保存された。32(16KB)のままなら保存されていない。 */
+    fat_dump_state();
     return ESP_OK;
 }
 
@@ -1059,6 +1064,7 @@ esp_err_t gbac_sd_fatscan(void)
         ESP_LOGE(TAG, "SD が使えない状態(mount 済み・非録画・非 MSC のときだけ)");
         return ESP_ERR_INVALID_STATE;
     }
+    fat_dump_state();
     fat_scan_nonzero(24);
     FATFS *fs = NULL;
     DWORD nc = 0;
