@@ -749,7 +749,7 @@ static void test_scale_ref4(void) {
 }
 
 /* ---------- 10c. scale=2 の全面突き合わせ(480x320 の既定経路) ----------
- * 2026-10-19 の仕様変更で録画は 480x320。PC 側で ffmpeg の最近傍 2 倍をやって
+ * 2026-10-18 の仕様変更で録画は 480x320。PC 側で ffmpeg の最近傍 2 倍をやって
  * 960x640 にする(彩度 1 個 = GBA 1 画素なのでにじまない)。
  * scale=2 の専用経路を入れたので、参照実装・汎用経路と 230,400 バイト全部で
  * 一致することを確かめる。段(DMA の代わり)を通した場合も同じ出力か見る。 */
@@ -831,7 +831,7 @@ static void test_scale_ref2(void) {
 }
 
 /* ---------- 11. 表引き(Y・U・V)が既存の式と 65536 色すべてで一致 ----------
- * 拡大の 1 画素ぶんの計算を「成分ごとの表の和」に置き換えた(2026-10-19 監督指示)。
+ * 拡大の 1 画素ぶんの計算を「成分ごとの表の和」に置き換えた(2026-10-18)。
  * シフト前の和が同じなら出力は 1 バイトも変わらないはずなので、全色で確かめる。
  * 1 色でも違えば mp4 の画質が変わる。ref_luma / ref_cu / ref_cv は gbac_scale.c の
  * 元の式をここに写したもの。 */
@@ -905,6 +905,130 @@ static void test_pts_ms(void) {
   OK_EQ(aprev, 63978);
 }
 
+/* ---------- 13. サンプル直引き表と raw 経路(2026-10-18) ----------
+ * 録画は復号を rx タスクでやめ、nano のサンプルのまま枠に写して、
+ * 拡大側で「復号 + 色変換」を 1 回の表引きにまとめた。
+ * 表が 65536 サンプルすべてで「復号してから色変換」と一致すること、
+ * raw 経路の拡大(2 倍・4 倍・汎用の 3 倍)が RGB565 経路と 1 バイトも違わない
+ * ことをここで固定する。 */
+static void test_raw_lut(void) {
+  int bad = 0;
+  for (uint32_t s = 0; s < 65536u; s++) {
+    uint32_t want = gbac_scale_ouyy_px(gbac_decode_rgb565((uint16_t)s));
+    uint32_t got = gbac_scale_raw_px((uint16_t)s);
+    if (got != want) {
+      if (bad < 5) printf("  raw(%04X) got %06X want %06X\n", s, got, want);
+      bad++;
+    }
+  }
+  OK_EQ(bad, 0);
+  /* bit7 は未使用なので、立っていても同じ結果 */
+  OK_EQ(gbac_scale_raw_px(0x0080), gbac_scale_raw_px(0x0000));
+  OK_EQ(gbac_scale_raw_px(0xFFFF), gbac_scale_raw_px(0xFF7F));
+}
+
+/* 5bit の r/g/b から nano のサンプルを組む(gbac_decode.c のビット配置の逆) */
+static uint16_t raw_of_rgb15(int r5, int g5, int b5) {
+  static const int rb[5] = {2, 6, 0, 1, 10};
+  static const int gb[5] = {11, 12, 13, 14, 15};
+  static const int bb[5] = {9, 8, 5, 4, 3};
+  uint16_t s = 0;
+  for (int i = 0; i < 5; i++) {
+    if (r5 & (1 << i)) s |= (uint16_t)(1u << rb[i]);
+    if (g5 & (1 << i)) s |= (uint16_t)(1u << gb[i]);
+    if (b5 & (1 << i)) s |= (uint16_t)(1u << bb[i]);
+  }
+  return s;
+}
+
+static uint16_t g_raw[GBAC_WIDTH * GBAC_HEIGHT];
+static uint8_t g_ouyy2[GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, GBAC_MAX_SCALE)];
+
+static void test_scale_raw(void) {
+  /* 逆配線が復号と一致する */
+  OK_EQ(gbac_decode_rgb565(raw_of_rgb15(31, 31, 31)), 0xFFFF);
+  OK_EQ(gbac_decode_rgb565(raw_of_rgb15(31, 0, 0)), 0xF800);
+  OK_EQ(gbac_decode_rgb565(raw_of_rgb15(0, 0, 31)), 0x001F);
+
+  for (int y = 0; y < GBAC_HEIGHT; y++) {
+    for (int x = 0; x < GBAC_WIDTH; x++) {
+      int r = (x * 5 + y * 3) & 31, g = (x * 7 + y * 11) & 31, b = (x * 13 + y * 2) & 31;
+      if (((x + y) % 17) == 0) r = g = b = 31;
+      if (((x * 3 + y * 7) % 23) == 0) r = g = b = 0;
+      if (((x * 5 + y * 11) % 29) == 0) { r = 0; g = 0; b = 31; }
+      uint16_t s = raw_of_rgb15(r, g, b);
+      if (((x * 7 + y) % 5) == 0) s |= 0x0080; /* 未使用の bit7 を混ぜる */
+      g_raw[y * GBAC_WIDTH + x] = s;
+      g_src[y * GBAC_WIDTH + x] = gbac_decode_rgb565(s);
+    }
+  }
+  const int scales[3] = {2, 4, 3};
+  for (int k = 0; k < 3; k++) {
+    const int sc = scales[k];
+    const int n = GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, sc);
+    memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+    memset(g_ouyy2, 0x55, sizeof(g_ouyy2));
+    gbac_scale_ouyy(g_src, GBAC_WIDTH, GBAC_HEIGHT, sc, g_ouyy);
+    gbac_scale_ouyy_raw(g_raw, GBAC_WIDTH, GBAC_HEIGHT, sc, g_ouyy2);
+    int diff = 0;
+    for (int i = 0; i < n; i++)
+      if (g_ouyy[i] != g_ouyy2[i]) diff++;
+    if (diff) printf("  scale=%d の raw 経路が RGB565 経路と %d バイト違う\n", sc, diff);
+    OK_EQ(diff, 0);
+  }
+  /* 段(DMA の代わり)を通す 2 倍の raw 経路も同じ。
+   * 段 5,760B(元行 4 本ずつ)と 11,520B(元行 8 本ずつ)の両方を見る */
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, GBAC_WIDTH, GBAC_HEIGHT, 2, g_ouyy);
+  gbac_scale_set_stage(g_st2, 4, 5760, st2_flush, st2_finish);
+  memset(g_ouyy2, 0x55, sizeof(g_ouyy2));
+  gbac_scale_ouyy_raw(g_raw, GBAC_WIDTH, GBAC_HEIGHT, 2, g_ouyy2);
+  gbac_scale_set_stage(NULL, 0, 0, NULL, NULL);
+  int diff = 0;
+  for (int i = 0; i < GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 2); i++)
+    if (g_ouyy[i] != g_ouyy2[i]) diff++;
+  OK_EQ(diff, 0);
+
+  static uint8_t stage8[4][11520] __attribute__((aligned(64)));
+  uint8_t *st8[4] = {stage8[0], stage8[1], stage8[2], stage8[3]};
+  gbac_scale_set_stage(st8, 4, 11520, st2_flush, st2_finish);
+  memset(g_ouyy2, 0x55, sizeof(g_ouyy2));
+  gbac_scale_ouyy_raw(g_raw, GBAC_WIDTH, GBAC_HEIGHT, 2, g_ouyy2);
+  gbac_scale_set_stage(NULL, 0, 0, NULL, NULL);
+  diff = 0;
+  for (int i = 0; i < GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 2); i++)
+    if (g_ouyy[i] != g_ouyy2[i]) diff++;
+  if (diff) printf("  scale=2 の 8 行段経路が %d バイト違う\n", diff);
+  OK_EQ(diff, 0);
+}
+
+/* raw モードの組立は復号せずサンプルのまま写す */
+static void test_asm_raw(void) {
+  static uint16_t s[GBAC_SAMPLES_PER_LINE];
+  gbac_asm_t a;
+  gbac_line_t ln;
+  for (int j = 0; j < GBAC_SAMPLES_PER_LINE; j++) s[j] = (uint16_t)(0x0447 + j);
+  ln.samples = s;
+  gbac_asm_init(&a);
+  OK_EQ(a.raw, 0);
+  gbac_asm_set_raw(&a, 1);
+  OK_EQ(a.raw, 1);
+  int completed = 0;
+  for (int i = 0; i < GBAC_LINES_PER_FRAME; i++) {
+    ln.frame_no = 9;
+    ln.line_no = (uint16_t)i;
+    if (gbac_asm_push(&a, &ln) == 1) completed++;
+  }
+  OK_EQ(completed, 1);
+  OK_EQ(a.lines[0][0], 0x0447);       /* 復号していない(復号なら 0xF800) */
+  OK_EQ(a.lines[159][239], 0x0447 + 239);
+  gbac_asm_set_raw(&a, 0);
+  ln.frame_no = 10;
+  ln.line_no = 0;
+  gbac_asm_push(&a, &ln);
+  OK_EQ(a.lines[0][0], 0xF800);       /* 戻せば復号する */
+}
+
 #define RUN(f)             \
   do {                     \
     printf("-- %s\n", #f); \
@@ -930,6 +1054,9 @@ int main(void) {
   RUN(test_scale_ref4);
   RUN(test_scale_ref2);
   RUN(test_ouyy65k);
+  RUN(test_raw_lut);
+  RUN(test_scale_raw);
+  RUN(test_asm_raw);
   RUN(test_seq_gap);
   RUN(test_pts_ms);
   printf("%d checks, %d failures\n", g_checks, g_fails);

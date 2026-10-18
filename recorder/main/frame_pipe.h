@@ -17,7 +17,8 @@ esp_err_t frame_pipe_init(void);
 void frame_pipe_push(const uint8_t *pkt, int len);
 
 /* 完成したフレームを 1 枚受け取る。
- * 戻り値 = 240x160 の RGB565(行優先)。NULL なら無い/待ち時間切れ。
+ * 戻り値 = 240x160 の nano サンプルそのまま(行優先、復号前。2026-10-18)。
+ *          拡大側が gbac_scale_ouyy_raw で復号込みに引く。NULL なら無い/待ち時間切れ。
  * 使い終わったら必ず frame_pipe_release() を呼ぶ。 */
 const uint16_t *frame_pipe_take(uint64_t *pts_us, TickType_t wait_ticks);
 void frame_pipe_release(void);

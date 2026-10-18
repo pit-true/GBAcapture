@@ -16,10 +16,15 @@ void gbac_asm_init(gbac_asm_t *a) {
   a->present_count = 0;
   a->have_frame = 0;
   a->frame_no = 0;
+  a->raw = 0;
   a->dropped_frames = 0;
   a->dropped_lines = 0;
   a->completed_frames = 0;
   memset(a->present, 0, sizeof(a->present));
+}
+
+void gbac_asm_set_raw(gbac_asm_t *a, int raw) {
+  if (a) a->raw = raw ? 1 : 0;
 }
 
 /* 次のフレームへ進む。lines の中身は消さない(欠けた行は前の内容のまま使う) */
@@ -65,8 +70,13 @@ int gbac_asm_push(gbac_asm_t *a, const gbac_line_t *line) {
   /* 同じラインの再送は後勝ち(同じセルへ重なるだけ) */
   uint16_t *dst = a->lines[line->line_no];
   const uint16_t *src = line->samples;
-  for (int j = 0; j < GBAC_SAMPLES_PER_LINE; j++) {
-    dst[j] = gbac_decode_rgb565_fast(src[j]);
+  if (a->raw) {
+    /* 復号は拡大側(直引き表)に任せ、ここは写すだけ(2026-10-18) */
+    memcpy(dst, src, sizeof(uint16_t) * GBAC_SAMPLES_PER_LINE);
+  } else {
+    for (int j = 0; j < GBAC_SAMPLES_PER_LINE; j++) {
+      dst[j] = gbac_decode_rgb565_fast(src[j]);
+    }
   }
 
   if (a->present_count != GBAC_LINES_PER_FRAME) return 0;

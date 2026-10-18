@@ -70,17 +70,23 @@ void gbac_rgb565_to888(uint16_t c, uint8_t *rgb /* [3] */);
  *     あっても完成扱いにして打ち切る(欠けた行は lines の前内容が残る)
  *   - 今のフレームより古い番号のラインは捨てて dropped_lines に数える */
 typedef struct {
-  uint16_t lines[GBAC_LINES_PER_FRAME][GBAC_SAMPLES_PER_LINE]; /* RGB565 */
+  /* raw=0 なら復号済みの RGB565、raw=1 なら nano のサンプルそのまま */
+  uint16_t lines[GBAC_LINES_PER_FRAME][GBAC_SAMPLES_PER_LINE];
   uint8_t present[GBAC_LINES_PER_FRAME];
   int present_count;
   int have_frame;
   uint8_t frame_no;
+  int raw;                   /* 1 = 復号せずサンプルのまま lines に写す */
   uint32_t dropped_frames;   /* 枠が足りなくて出せなかったフレーム */
   uint32_t dropped_lines;    /* 古いフレーム番号だったので捨てたライン */
   uint32_t completed_frames;
 } gbac_asm_t;
 
 void gbac_asm_init(gbac_asm_t *a);
+/* raw=1 にすると gbac_asm_push は復号せず 480 バイトの memcpy だけになる
+ * (2026-10-18)。復号は拡大側の表引きに含める(gbac_scale_ouyy_raw)。
+ * USB 受信タスクの 1 ライン 19us が 3us ほどになり、core1 が空く。 */
+void gbac_asm_set_raw(gbac_asm_t *a, int raw);
 /* 戻り値:
  *   1 = 160ライン揃ってフレーム完成(lines に格納済み)
  *   0 = まだ未完(このラインは今のフレームへ入った)
@@ -111,7 +117,7 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
  * ホスト(gcc)では計測しないので常に 0。 */
 extern int64_t gbac_scale_prof[4];
 
-/* RGB565 → (Y,U,V) の表を作る(2026-10-19 監督指示)。
+/* RGB565 → (Y,U,V) の表を作る(2026-10-18)。
  * Y・U・V は r・g・b の 1 次式なので、シフト前の積和を成分ごとに分けて持つ。
  *   Y_raw = TYr[r5] + TYg[g6] + TYb[b5](U_raw, V_raw も同じ形)
  * 個数は 32 + 64 + 32 = 128 を 3 成分ぶん = 384 個の int32 = 1.5KB。
@@ -125,6 +131,23 @@ int gbac_scale_init_lut(void);
 
 /* 1 画素ぶんの (Y,U,V) を byte0:Y byte1:U byte2:V で返す(テストから見る)。 */
 uint32_t gbac_scale_ouyy_px(uint32_t rgb565);
+
+/* ---- nano のサンプル → (Y,U,V) の直引き表(2026-10-18) ----
+ * 復号(gbac_decode_rgb565)と色変換(ouyy_of)を 1 回の表引きにまとめる。
+ * サンプルの bit7 は未使用なので 15 ビットに詰めて 32768 要素。
+ * Y 1 バイト + UV 2 バイト = 96KB。static で internal RAM に置く
+ * (PSRAM に置いた 256KB 表は L2 からあふれて遅かった。r105)。
+ * 表の中身は gbac_decode_rgb565 → gbac_scale_ouyy_px と 1 バイトも違わない
+ * (test_raw_lut が 65536 サンプルすべてを突き合わせる)。
+ * 起動時に 1 回呼ぶ(約 5ms)。呼ばなくても最初の raw 拡大で作る。 */
+#define GBAC_RAW_IDX(s) (((((uint32_t)(s)) >> 8) << 7) | (((uint32_t)(s)) & 0x7Fu))
+int gbac_scale_init_raw_lut(void);
+/* 1 サンプルぶんの (Y,U,V) を byte0:Y byte1:U byte2:V で返す(テストから見る) */
+uint32_t gbac_scale_raw_px(uint16_t sample);
+/* src が nano のサンプルそのまま(gbac_asm_set_raw(1) で組んだ枠)のときの拡大。
+ * 出力は「復号してから gbac_scale_ouyy」とバイト単位で同じ(test_scale_raw)。 */
+void gbac_scale_ouyy_raw(const uint16_t *src, int w, int h, int scale,
+                         uint8_t *out);
 
 /* ---- PSRAM へ書く手をアプリから差し込む(2026-10-18) ----
  * stages に internal RAM のステージ n 個(2..GBAC_STAGE_MAX=4)を渡すと、
@@ -140,7 +163,7 @@ typedef void (*gbac_scale_flush_t)(uint8_t *dst, const uint8_t *stage, size_t n)
 typedef void (*gbac_scale_finish_t)(void);
 
 /* 拡大の作業台。段バッファ・flush・元行の写し・内訳カウンタを組ごとに持つ。
- * 2 コアへ分割して同時に動かすので、共有する static は使わない(2026-10-19)。
+ * 2 コアへ分割して同時に動かすので、共有する static は使わない(2026-10-18)。
  * prof は 4 個の int64 の配列(NULL なら集計しない)。
  *   prof[0]=変換+luma+彩度 prof[1]=internal 内の複製 prof[2]=PSRAM へ書く手 */
 #define GBAC_STAGE_MAX 5
@@ -153,13 +176,16 @@ typedef struct {
   gbac_scale_finish_t finish;
   uint16_t srcrow[GBAC_WIDTH];
   int64_t *prof;
+  int raw; /* 1 = src は nano のサンプルそのまま(直引き表で復号込みに引く) */
 } gbac_scale_ctx_t;
 
 /* ctx に段バッファ n 個(2..GBAC_STAGE_MAX)と flush/finish を渡す。
- * stages に NULL を渡すと従来どおり 1 元行ずつ memcpy で PSRAM へ書く。 */
+ * stages に NULL を渡すと従来どおり 1 元行ずつ memcpy で PSRAM へ書く。
+ * raw は触らない(gbac_scale_ctx_raw で別に決める)。 */
 void gbac_scale_ctx_set(gbac_scale_ctx_t *c, uint8_t *const *stages, int n,
                         size_t stage_bytes, gbac_scale_flush_t flush,
                         gbac_scale_finish_t finish);
+void gbac_scale_ctx_raw(gbac_scale_ctx_t *c, int raw);
 
 /* 元行 [row0, row1) ぶんだけ out(枠の先頭)へ作る。
  * scale=4 の専用経路だけ分割できる(row0/row1 は 4 の倍数、row1<=h)。

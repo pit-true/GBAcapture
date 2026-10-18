@@ -12,7 +12,7 @@
 
 static const char *TAG = "frame";
 
-/* 3 枚ぶん持つ(2026-10-19 監督指示)。
+/* 3 枚ぶん持つ(2026-10-18)。
  * 2 枚だと、読み手が 1 枚持っているあいだに完成した枚を「読み待ち」に
  * 載せる枠がなく、必ず古い枚を処理して新しい枚を捨てることになっていた。
  * 3 枚なら「読み手(1)+ 書き手(1)+ 読み待ち(1)」がそろい、
@@ -36,7 +36,7 @@ esp_err_t frame_pipe_init(void)
         /* 1 枚 76.8KB。internal に置くと 2 枚で 154KB を常時つかむ。
          * エンコーダ(internal に約 69KB の連続ブロック + DMA バッファ)と
          * GDMA のステージ(23,040B x2)を起動時に常時確保するようになったため、
-         * internal からは確保できなくなった(2026-10-19 実測: internal に
+         * internal からは確保できなくなった(2026-10-18 実測: internal に
          * 確保していた間は frame_pipe だけで 152KB 減っていた)。
          * PSRAM でもキャッシュが効くので実測で遅さを確かめる(bench 'b')。 */
         g_asm[i] = heap_caps_malloc(sizeof(gbac_asm_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -45,6 +45,10 @@ esp_err_t frame_pipe_init(void)
             return ESP_ERR_NO_MEM;
         }
         gbac_asm_init(g_asm[i]);
+        /* 復号は拡大側の直引き表に任せる(2026-10-18)。rx は 480B の
+         * memcpy だけになり、core1 の rx が 1 ライン 19us → 数 us になる。
+         * frame_pipe_take が返す枠は nano のサンプルそのまま。 */
+        gbac_asm_set_raw(g_asm[i], 1);
     }
     g_sig = xSemaphoreCreateBinary();
     gbac_pts_init(&g_pts);
@@ -80,7 +84,7 @@ static int finish_frame(int cur, uint8_t frame_no)
     bool swapped = false;
     portENTER_CRITICAL(&g_mux);
     /* 完成した cur を「読み待ち」に載せる。すでに読み待ちがあれば古い方は捨て、
-     * 新しい方だけを残す(2026-10-19 監督指示: 溜まったら古いものを捨てる)。
+     * 新しい方だけを残す(2026-10-18: 溜まったら古いものを捨てる)。
      * 捨てた slot は書き手の新しい作業場になるので書き込みは止まらない。
      * 読み手が持っている slot は絶対に触らない。 */
     int victim = g_ready;

@@ -1,5 +1,5 @@
 /* GBA キャプチャ録画機(ESP32-P4-Pico)の本体。
- *   nanoCH32V305(USB-HS) → 受信 → 4x 拡大 → HW H.264 + AAC → microSD の mp4
+ *   nanoCH32V305(USB-HS) → 受信 → 2x 拡大(480x320) → HW H.264 + AAC → microSD の mp4
  * ボタン 1 回で録画開始、もう 1 回で停止。docs/recorder-plan-esp32p4.md 参照。 */
 #include <stdio.h>
 
@@ -57,13 +57,13 @@ static void on_packet(const uint8_t *pkt, int len, void *arg)
 }
 
 /* 1 秒ごとの受信速度。録画・テストの「経過秒」と「直近 1 秒の bytes/s」を
- * ログに残して、速さを推定ではなく実測で示すため(監督 2026-10-16 指示)。
+ * ログに残して、速さを推定ではなく実測で示すため(2026-10-16)。
  * サンプルはメインループの 1 秒周期で取る(追加タスクは作らない)。 */
 static int64_t g_run_us;        /* 録画/テスト開始時刻。0 = 止まっている */
 static uint32_t g_run_bytes;    /* 開始時の受信バイト累計 */
 static int64_t g_smp_us;        /* 前回サンプル時刻 */
 static uint32_t g_smp_bytes, g_smp_pkts, g_smp_ring, g_smp_fok, g_smp_fdrop;
-/* 音声入力側の 1 秒計測(監督 2026-10-16 02:57 指示)。
+/* 音声入力側の 1 秒計測(2026-10-16)。
  * 32,802 ペア/秒 = 683.4 パケット/秒が rx 側から届いているか、
  * seq の飛び幅(=失われたパケット数)が 1 秒にどれだけ出るかを見る。 */
 static uint32_t g_smp_apkt, g_smp_apair, g_smp_aseqlost, g_smp_aadrop;
@@ -460,7 +460,7 @@ static void uart_cmd_poll(void)
     }
 }
 
-/* internal RAM をどこがどれだけ食ったかの差分表(2026-10-19 監督指示)。
+/* internal RAM をどこがどれだけ食ったかの差分表(2026-10-18)。
  * 起動後の free 309KB が録画開始時に 45KB まで減っていた。
  * 大口を PSRAM へ移す判断材料にする。 */
 static uint32_t g_heap_mark;
@@ -502,7 +502,7 @@ void app_main(void)
     heap_mark("起動時");
     /* H.264 HW エンコーダと GDMA の internal RAM はここでたしかめておく。
      * 録画のたびに開くと heap が断片化して reference frame(約 69KB の連続)が
-     * 取れなくなる(2026-10-19 r99/r100 で -3)。 */
+     * 取れなくなる(2026-10-18 r99/r100 で -3)。 */
     if (gbac_enc_early_init(&g_cfg) != ESP_OK) {
         ESP_LOGE(TAG, "エンコーダが起動時に開けない。録画のときにリトライする");
     }

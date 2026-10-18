@@ -64,7 +64,8 @@ typedef struct {
 } row_cache_t;
 
 /* row を展開済みスロットの番号で返す。無ければいちばん古い行と入れ替える。 */
-static int row_slot(row_cache_t *c, const uint16_t *src, int w, int row) {
+static int row_slot(row_cache_t *c, const uint16_t *src, int w, int row,
+                    int raw) {
   int oldest = 0;
   for (int i = 0; i < 3; i++) {
     if (c->idx[i] == row) return i;
@@ -74,7 +75,8 @@ static int row_slot(row_cache_t *c, const uint16_t *src, int w, int row) {
   int64_t t0 = PROF_NOW();
   for (int x = 0; x < w; x++) {
     uint8_t rgb[3];
-    gbac_rgb565_to888(s[x], rgb);
+    /* raw(nano のサンプルそのまま)なら復号してから展開する */
+    gbac_rgb565_to888(raw ? gbac_decode_rgb565_fast(s[x]) : s[x], rgb);
     c->r[oldest][x] = rgb[0];
     c->g[oldest][x] = rgb[1];
     c->b[oldest][x] = rgb[2];
@@ -207,7 +209,7 @@ static void build_uv_rows(uint8_t *urow, uint8_t *vrow, const uint8_t *yrow,
  * prof[1](y 欄)、PSRAM への書き込みが prof[2](uv 欄)。prof[3](copy 欄)は 0 のまま。 */
 static uint8_t s_block[4 * GBAC_YW_MAX * 3 / 2] __attribute__((aligned(16)));
 
-/* ---- RGB565 → (Y,U,V) の表(2026-10-19 監督指示) ----
+/* ---- RGB565 → (Y,U,V) の表(2026-10-18) ----
  * Y・U・V は r・g・b の 1 次式なので、シフト前の積和を成分ごとの表に分ける。
  *   Y_raw = TYr[r5] + TYg[g6] + TYb[b5]   (U_raw, V_raw も同じ形)
  * rgb565→888 の展開((r5<<3)|(r5>>2) など)と係数掛けを表の中で済ませる。
@@ -266,9 +268,44 @@ uint32_t gbac_scale_ouyy_px(uint32_t c) {
   return ouyy_of(c);
 }
 
+/* ---- nano のサンプル → (Y,U,V) の直引き表(2026-10-18) ----
+ * 録画中は USB ホスト(割り込み + usbh タスク)が core0 の 6〜7 割を使い、
+ * core1 では rx タスクの復号(1 ライン 19us)と AAC が 6 割を使っていた。
+ * 復号と色変換を 1 回の表引きにまとめると、rx は memcpy だけになり、
+ * 拡大の 1 画素も 9 回の表引き + 加算 + クランプから 2 回の表引きになる。
+ * サンプルの bit7 は未使用(gbac_decode.c の V1〜V8)なので 15 ビットに詰める。
+ * Y(uint8) 32KB + UV(uint16、下位 U・上位 V) 64KB = 96KB。static の .bss は
+ * internal RAM なので表引きが PSRAM を触らない。 */
+static uint8_t s_rawY[32768];
+static uint16_t s_rawUV[32768];
+static int s_raw_ready;
+
+int gbac_scale_init_raw_lut(void) {
+  if (!s_tables_ready) gbac_scale_init_lut();
+  gbac_decode_tables_init(); /* 汎用経路(奇数スケール)の raw 復号に使う */
+  for (uint32_t i = 0; i < 32768u; i++) {
+    uint16_t s = (uint16_t)(((i >> 7) << 8) | (i & 0x7Fu));
+    uint32_t e = ouyy_of(gbac_decode_rgb565(s));
+    s_rawY[i] = (uint8_t)(e & 0xFFu);
+    s_rawUV[i] = (uint16_t)(e >> 8);
+  }
+  s_raw_ready = 1;
+  return 0;
+}
+
+static inline uint32_t raw_of(uint32_t s) {
+  uint32_t i = GBAC_RAW_IDX(s);
+  return (uint32_t)s_rawY[i] | ((uint32_t)s_rawUV[i] << 8);
+}
+
+uint32_t gbac_scale_raw_px(uint16_t sample) {
+  if (!s_raw_ready) gbac_scale_init_raw_lut();
+  return raw_of(sample);
+}
+
 /* アプリが渡した internal RAM のステージ(scale=4 で 4 元行ぶん)。
  * NULL のあいだは s_block + memcpy の従来経路。
- * 個数はアプリが決める(2026-10-19 監督指示で 1 組 4 個を 2 組)。
+ * 個数はアプリが決める(2026-10-18 に 1 組 4 個を 2 組)。
  * 4 元行グループを組み終わるたびに flush を呼ぶが、そのステージへの
  * 次の書き込みは「そのステージを使った DMA が終わるまで」待たせる。
  * 個数が多いほど DMA の待ちが見えなくなる。
@@ -294,10 +331,14 @@ void gbac_scale_set_stage(uint8_t *const *stages, int n, size_t stage_bytes,
   gbac_scale_ctx_set(&s_def, stages, n, stage_bytes, flush, finish);
 }
 
+void gbac_scale_ctx_raw(gbac_scale_ctx_t *c, int raw) {
+  c->raw = raw ? 1 : 0;
+}
+
 /* 内訳の加算。ctx->prof は gbac_scale_ctx_set で必ず向こうを向く。 */
 #define PROF_ADD(c, i, d) ((c)->prof[(i)] += (d))
 
-/* src の 1 行ぶんを一旦 internal RAM に写してから表を引く(2026-10-19 監督指示)。
+/* src の 1 行ぶんを一旦 internal RAM に写してから表を引く(2026-10-18)。
  * src は PSRAM のフレームバッファ。表引きと交互に読むと PSRAM の取り合いに
  * 巻き込まれて rgb が倍になった(r105 で 6.9 → 12.9ms)。
  * 1 行 480 バイトを先に 1 回だけ連続読みすると、内側のループは internal だけ。
@@ -316,24 +357,37 @@ static void build_row_x4(gbac_scale_ctx_t *c, const uint16_t *s, int w,
   uint32_t *wu = (uint32_t *)rowu;
   uint32_t *wv = (uint32_t *)rowv;
   int x = 0;
-  for (; x + 2 <= w; x += 2) {
-    /* 表引き 1 回で Y/U/V がそろう(2026-10-19 監督指示)。
-     * ouyy_of が internal の小キャッシュ → PSRAM の表 → 計算の順で引く。 */
-    uint32_t e0 = ouyy_of(s[x]);
-    uint32_t e1 = ouyy_of(s[x + 1]);
-    uint32_t y0 = e0 & 0xFFu, u0 = (e0 >> 8) & 0xFFu, v0 = e0 >> 16;
-    uint32_t y1 = e1 & 0xFFu, u1 = (e1 >> 8) & 0xFFu, v1 = e1 >> 16;
-    /* 2 画素で 12 バイト = 語 3 個。x が偶数のとき語境界に揃う。
-     * [C Y Y C Y Y | C Y Y C Y Y] */
-    *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u0 << 24));
-    *wu++ = (uint32_t)(y0 | (y0 << 8) | (u1 << 16) | (y1 << 24));
-    *wu++ = (uint32_t)(y1 | (u1 << 8) | (y1 << 16) | (y1 << 24));
-    *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v0 << 24));
-    *wv++ = (uint32_t)(y0 | (y0 << 8) | (v1 << 16) | (y1 << 24));
-    *wv++ = (uint32_t)(y1 | (v1 << 8) | (y1 << 16) | (y1 << 24));
+  /* 2 画素で 12 バイト = 語 3 個。x が偶数のとき語境界に揃う。
+   * [C Y Y C Y Y | C Y Y C Y Y] */
+#define X4_PAIR(e0, e1)                                                  \
+  do {                                                                   \
+    uint32_t y0 = (e0) & 0xFFu, u0 = ((e0) >> 8) & 0xFFu, v0 = (e0) >> 16; \
+    uint32_t y1 = (e1) & 0xFFu, u1 = ((e1) >> 8) & 0xFFu, v1 = (e1) >> 16; \
+    *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u0 << 24));       \
+    *wu++ = (uint32_t)(y0 | (y0 << 8) | (u1 << 16) | (y1 << 24));       \
+    *wu++ = (uint32_t)(y1 | (u1 << 8) | (y1 << 16) | (y1 << 24));       \
+    *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v0 << 24));       \
+    *wv++ = (uint32_t)(y0 | (y0 << 8) | (v1 << 16) | (y1 << 24));       \
+    *wv++ = (uint32_t)(y1 | (v1 << 8) | (y1 << 16) | (y1 << 24));       \
+  } while (0)
+  if (c->raw) {
+    /* サンプル直引き(復号込み)。1 画素 2 回の表引きで Y/U/V がそろう */
+    for (; x + 2 <= w; x += 2) {
+      uint32_t e0 = raw_of(s[x]);
+      uint32_t e1 = raw_of(s[x + 1]);
+      X4_PAIR(e0, e1);
+    }
+  } else {
+    /* 表引き 1 回で Y/U/V がそろう(2026-10-18)。 */
+    for (; x + 2 <= w; x += 2) {
+      uint32_t e0 = ouyy_of(s[x]);
+      uint32_t e1 = ouyy_of(s[x + 1]);
+      X4_PAIR(e0, e1);
+    }
   }
+#undef X4_PAIR
   if (x < w) { /* 奇数幅のとき最後の 1 画素(実運用では来ない) */
-    uint32_t e = ouyy_of(s[x]);
+    uint32_t e = c->raw ? raw_of(s[x]) : ouyy_of(s[x]);
     uint32_t y = e & 0xFFu, u = (e >> 8) & 0xFFu, v = e >> 16;
     uint8_t *p = rowu + x * 6;
     p[0] = (uint8_t)u; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
@@ -401,7 +455,7 @@ static void scale_ouyy_x4(gbac_scale_ctx_t *c, const uint16_t *src, int w,
   }
 }
 
-/* ---- scale=2 専用経路(2026-10-19 の仕様変更で既定) ----
+/* ---- scale=2 専用経路(2026-10-18 の仕様変更で既定) ----
  * 録画は 480x320。PC 側で ffmpeg の最近傍 2 倍をやって 960x640 にする。
  * 4 倍と違ってデータは 1/4。彩度は 2x2 ブロック = 元画素 1 個なので、
  * 1 元画素が 1 個の彩度と 4 個の輝度を作る(にじまない)。
@@ -420,24 +474,38 @@ static void build_row_x2(gbac_scale_ctx_t *c, const uint16_t *s, int w,
   uint32_t *wu = (uint32_t *)rowu;
   uint32_t *wv = (uint32_t *)rowv;
   int x = 0;
-  for (; x + 4 <= w; x += 4) {
-    uint32_t e0 = ouyy_of(s[x]), e1 = ouyy_of(s[x + 1]);
-    uint32_t e2 = ouyy_of(s[x + 2]), e3 = ouyy_of(s[x + 3]);
-    uint32_t y0 = e0 & 0xFFu, u0 = (e0 >> 8) & 0xFFu, v0 = e0 >> 16;
-    uint32_t y1 = e1 & 0xFFu, u1 = (e1 >> 8) & 0xFFu, v1 = e1 >> 16;
-    uint32_t y2 = e2 & 0xFFu, u2 = (e2 >> 8) & 0xFFu, v2 = e2 >> 16;
-    uint32_t y3 = e3 & 0xFFu, u3 = (e3 >> 8) & 0xFFu, v3 = e3 >> 16;
-    /* 4 画素で 12 バイト = 語 3 個。x が 4 の倍数のとき語境界に揃う。
-     * [C0 Y0 Y0 C1 | Y1 Y1 C2 Y2 | Y2 C3 Y3 Y3] */
-    *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u1 << 24));
-    *wu++ = (uint32_t)(y1 | (y1 << 8) | (u2 << 16) | (y2 << 24));
-    *wu++ = (uint32_t)(y2 | (u3 << 8) | (y3 << 16) | (y3 << 24));
-    *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v1 << 24));
-    *wv++ = (uint32_t)(y1 | (y1 << 8) | (v2 << 16) | (y2 << 24));
-    *wv++ = (uint32_t)(y2 | (v3 << 8) | (y3 << 16) | (y3 << 24));
+  /* 4 画素で 12 バイト = 語 3 個。x が 4 の倍数のとき語境界に揃う。
+   * [C0 Y0 Y0 C1 | Y1 Y1 C2 Y2 | Y2 C3 Y3 Y3] */
+#define X2_QUAD(e0, e1, e2, e3)                                            \
+  do {                                                                     \
+    uint32_t y0 = (e0) & 0xFFu, u0 = ((e0) >> 8) & 0xFFu, v0 = (e0) >> 16; \
+    uint32_t y1 = (e1) & 0xFFu, u1 = ((e1) >> 8) & 0xFFu, v1 = (e1) >> 16; \
+    uint32_t y2 = (e2) & 0xFFu, u2 = ((e2) >> 8) & 0xFFu, v2 = (e2) >> 16; \
+    uint32_t y3 = (e3) & 0xFFu, u3 = ((e3) >> 8) & 0xFFu, v3 = (e3) >> 16; \
+    *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u1 << 24));         \
+    *wu++ = (uint32_t)(y1 | (y1 << 8) | (u2 << 16) | (y2 << 24));         \
+    *wu++ = (uint32_t)(y2 | (u3 << 8) | (y3 << 16) | (y3 << 24));         \
+    *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v1 << 24));         \
+    *wv++ = (uint32_t)(y1 | (y1 << 8) | (v2 << 16) | (y2 << 24));         \
+    *wv++ = (uint32_t)(y2 | (v3 << 8) | (y3 << 16) | (y3 << 24));         \
+  } while (0)
+  if (c->raw) {
+    /* サンプル直引き(復号込み)。録画の本線はこちら(2026-10-18) */
+    for (; x + 4 <= w; x += 4) {
+      uint32_t e0 = raw_of(s[x]), e1 = raw_of(s[x + 1]);
+      uint32_t e2 = raw_of(s[x + 2]), e3 = raw_of(s[x + 3]);
+      X2_QUAD(e0, e1, e2, e3);
+    }
+  } else {
+    for (; x + 4 <= w; x += 4) {
+      uint32_t e0 = ouyy_of(s[x]), e1 = ouyy_of(s[x + 1]);
+      uint32_t e2 = ouyy_of(s[x + 2]), e3 = ouyy_of(s[x + 3]);
+      X2_QUAD(e0, e1, e2, e3);
+    }
   }
+#undef X2_QUAD
   for (; x < w; x++) { /* 4 の倍数でない残り(実運用では来ない) */
-    uint32_t e = ouyy_of(s[x]);
+    uint32_t e = c->raw ? raw_of(s[x]) : ouyy_of(s[x]);
     uint8_t y = (uint8_t)(e & 0xFFu), u = (uint8_t)((e >> 8) & 0xFFu), v = (uint8_t)(e >> 16);
     uint8_t *p = rowu + x * 3;
     p[0] = u; p[1] = y; p[2] = y;
@@ -452,17 +520,22 @@ static void scale_ouyy_x2(gbac_scale_ctx_t *c, const uint16_t *src, int w,
   (void)h;
   const int stride = w * 3;  /* 出力行 = (w*2) 画素 * 3 / 2 */
   const int blk = 2 * stride; /* 元行 1 本 = 出力行 2 本 */
-  const int grp = 4 * blk;    /* 元行 4 本 = 出力行 8 本 */
 
   if (!s_tables_ready) gbac_scale_init_lut();
 
-  /* 段を使う経路。段の巡回は呼び出しをまたぐカウンターで回す(scale=4 と同じ約束) */
+  /* 段を使う経路。段の巡回は呼び出しをまたぐカウンターで回す(scale=4 と同じ約束)。
+   * 1 回の flush は元行 4 本(5,760B)か、段が足りれば 8 本(11,520B)。
+   * DMA は 1 回あたりの固定費が大きく、r91 実測で 5,760B 刻みは 11,520B 刻みの
+   * 半分の速さだった。160 行は 8 でも割れる。 */
   if (c->stage_n >= 2 && c->stage[0] && c->stage[1] && c->flush &&
-      c->stage_bytes >= (size_t)grp && ((row1 - row0) & 3) == 0) {
-    for (int g = row0; g < row1; g += 4) {
+      c->stage_bytes >= (size_t)(4 * blk) && ((row1 - row0) & 3) == 0) {
+    int rows = 4;
+    if (c->stage_bytes >= (size_t)(8 * blk) && ((row1 - row0) & 7) == 0) rows = 8;
+    const int grp = rows * blk;
+    for (int g = row0; g < row1; g += rows) {
       uint8_t *stg = c->stage[c->stage_rot];
       if (++c->stage_rot >= c->stage_n) c->stage_rot = 0;
-      for (int k = 0; k < 4; k++) {
+      for (int k = 0; k < rows; k++) {
         uint8_t *b = stg + (size_t)k * blk;
         build_row_x2(c, src + (size_t)(g + k) * w, w, b, b + stride);
       }
@@ -488,7 +561,7 @@ void gbac_scale_ouyy_rows(gbac_scale_ctx_t *c, const uint16_t *src, int w, int h
                           int scale, uint8_t *out, int row0, int row1) {
   if (!src || !out || w <= 0 || h <= 0) return;
   /* 内訳カウンタは既定の作業台でも必ず実体へ向ける(ctx_set を呼ばずに
-   * gbac_scale_ouyy だけ使う経路がある。2026-10-19 ホストテストが
+   * gbac_scale_ouyy だけ使う経路がある。2026-10-18 ホストテストが
    * prof NULL でクラッシュした) */
   if (c->prof == NULL) c->prof = gbac_scale_prof;
   if (scale < 1) scale = 1;
@@ -496,6 +569,8 @@ void gbac_scale_ouyy_rows(gbac_scale_ctx_t *c, const uint16_t *src, int w, int h
   if (row0 < 0) row0 = 0;
   if (row1 > h) row1 = h;
   if (row0 >= row1) return;
+  /* 直引き表は起動時に作っておく。作り損ねていてもここで作る */
+  if (c->raw && !s_raw_ready) gbac_scale_init_raw_lut();
 
   const int W = w * scale;
   const int H = h * scale;
@@ -543,10 +618,10 @@ void gbac_scale_ouyy_rows(gbac_scale_ctx_t *c, const uint16_t *src, int w, int h
     const int b = (2 * cy + 1) / scale; /* H = h*scale なので h 越えはしない */
 
     if (a != cur_a || b != cur_b || sy != cur_sy) {
-      const int sa = row_slot(&s_cache, src, w, a);
-      const int sb = row_slot(&s_cache, src, w, b);
+      const int sa = row_slot(&s_cache, src, w, a, c->raw);
+      const int sb = row_slot(&s_cache, src, w, b, c->raw);
       if (sy != cur_sy) {
-        const int slot = row_slot(&s_cache, src, w, sy);
+        const int slot = row_slot(&s_cache, src, w, sy, c->raw);
         int64_t t1 = PROF_NOW();
         build_yrow(&s_cache, slot, w, scale, s_yrow);
         PROF_ADD(c, 1, PROF_NOW() - t1);
@@ -584,4 +659,14 @@ void gbac_scale_ouyy_rows(gbac_scale_ctx_t *c, const uint16_t *src, int w, int h
 void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
                      uint8_t *out) {
   gbac_scale_ouyy_rows(&s_def, src, w, h, scale, out, 0, h);
+}
+
+/* src が nano のサンプルそのまま(復号前)のときの拡大。
+ * 既定の作業台の raw を立てて同じ経路を通す。出力は復号してから
+ * gbac_scale_ouyy したものとバイト単位で同じ(test_scale_raw)。 */
+void gbac_scale_ouyy_raw(const uint16_t *src, int w, int h, int scale,
+                         uint8_t *out) {
+  s_def.raw = 1;
+  gbac_scale_ouyy_rows(&s_def, src, w, h, scale, out, 0, h);
+  s_def.raw = 0;
 }
