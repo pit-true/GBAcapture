@@ -268,41 +268,50 @@ uint32_t gbac_scale_ouyy_px(uint32_t c) {
 
 /* アプリが渡した internal RAM のステージ(scale=4 で 4 元行ぶん)。
  * NULL のあいだは s_block + memcpy の従来経路。
- * 個数はアプリが決める(2026-10-19 監督指示で 2 → 4 を想定)。
+ * 個数はアプリが決める(2026-10-19 監督指示で 1 組 4 個を 2 組)。
  * 4 元行グループを組み終わるたびに flush を呼ぶが、そのステージへの
  * 次の書き込みは「そのステージを使った DMA が終わるまで」待たせる。
- * 個数が多いほど DMA の待ちが見えなくなる。 */
-#define GBAC_STAGE_MAX 4
-static uint8_t *s_stage[GBAC_STAGE_MAX];
-static int s_stage_n;
-static size_t s_stage_bytes;
-static gbac_scale_flush_t s_flush;
-static gbac_scale_finish_t s_finish;
+ * 個数が多いほど DMA の待ちが見えなくなる。
+ * 作業台(ctx)ごとに持つので、2 コアから同時に動かしても共有しない。 */
+static gbac_scale_ctx_t s_def;   /* gbac_scale_ouyy / set_stage の既定の作業台 */
+
+void gbac_scale_ctx_set(gbac_scale_ctx_t *c, uint8_t *const *stages, int n,
+                        size_t stage_bytes, gbac_scale_flush_t flush,
+                        gbac_scale_finish_t finish) {
+  c->stage_n = (n > GBAC_STAGE_MAX) ? GBAC_STAGE_MAX : (n < 0 ? 0 : n);
+  for (int i = 0; i < GBAC_STAGE_MAX; i++) {
+    c->stage[i] = (stages != NULL && i < c->stage_n) ? stages[i] : NULL;
+  }
+  c->stage_bytes = stage_bytes;
+  c->stage_rot = 0;
+  c->flush = flush;
+  c->finish = finish;
+  if (c->prof == NULL) c->prof = gbac_scale_prof;
+}
 
 void gbac_scale_set_stage(uint8_t *const *stages, int n, size_t stage_bytes,
                           gbac_scale_flush_t flush, gbac_scale_finish_t finish) {
-  s_stage_n = (n > GBAC_STAGE_MAX) ? GBAC_STAGE_MAX : n;
-  for (int i = 0; i < GBAC_STAGE_MAX; i++) {
-    s_stage[i] = (stages != NULL && i < s_stage_n) ? stages[i] : NULL;
-  }
-  s_stage_bytes = stage_bytes;
-  s_flush = flush;
-  s_finish = finish;
+  gbac_scale_ctx_set(&s_def, stages, n, stage_bytes, flush, finish);
 }
+
+/* 内訳の加算。ctx->prof は gbac_scale_ctx_set で必ず向こうを向く。 */
+#define PROF_ADD(c, i, d) ((c)->prof[(i)] += (d))
 
 /* src の 1 行ぶんを一旦 internal RAM に写してから表を引く(2026-10-19 監督指示)。
  * src は PSRAM のフレームバッファ。表引きと交互に読むと PSRAM の取り合いに
  * 巻き込まれて rgb が倍になった(r105 で 6.9 → 12.9ms)。
- * 1 行 480 バイトを先に 1 回だけ連続読みすると、内側のループは internal だけ。 */
-static uint16_t s_srcrow[GBAC_WIDTH];
+ * 1 行 480 バイトを先に 1 回だけ連続読みすると、内側のループは internal だけ。
+ * 写し先は ctx ごと(2 コアで共有しない)。 */
 
 /* 元行 1 本ぶんから出力行 2 本 [U 行] [V 行] を作る(1 元画素 6 バイト)。
  * 呼び出しと rgb[3] の受け渡しを消すためここで展開する。 */
-static void build_row_x4(const uint16_t *s, int w, uint8_t *rowu, uint8_t *rowv) {
+static void build_row_x4(gbac_scale_ctx_t *c, const uint16_t *s, int w,
+                         uint8_t *rowu, uint8_t *rowv) {
   int64_t t0 = PROF_NOW();
+  uint16_t *tmp = c->srcrow;
   if (w <= GBAC_WIDTH) {
-    memcpy(s_srcrow, s, (size_t)w * sizeof(uint16_t));
-    s = s_srcrow;
+    memcpy(tmp, s, (size_t)w * sizeof(uint16_t));
+    s = tmp;
   }
   uint32_t *wu = (uint32_t *)rowu;
   uint32_t *wv = (uint32_t *)rowv;
@@ -333,10 +342,12 @@ static void build_row_x4(const uint16_t *s, int w, uint8_t *rowu, uint8_t *rowv)
     p[0] = (uint8_t)v; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
     p[3] = (uint8_t)v; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
   }
-  gbac_scale_prof[0] += PROF_NOW() - t0;
+  PROF_ADD(c, 0, PROF_NOW() - t0);
 }
 
-static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
+static void scale_ouyy_x4(gbac_scale_ctx_t *c, const uint16_t *src, int w,
+                          int h, uint8_t *out, int row0, int row1) {
+  (void)h; /* 範囲は row0/row1 で決まる。呼び出し側が h 以下に切る */
   const int stride = w * 6; /* w * 4 * 3 / 2 */
   const int blk = 4 * stride;  /* 元行 1 本 = 出力行 4 本 */
   const int grp = 4 * blk;     /* 元行 4 本 = 出力行 16 本 */
@@ -347,32 +358,37 @@ static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
   if (!s_tables_ready) gbac_scale_init_lut();
 
   /* ステージが渡されていれば 4 元行ぶんをそこに組み、flush でまとめて
-   * 書き出す(DMA 前提)。なければ s_block に 1 元行ずつ組み memcpy で書く。 */
-  if (s_stage_n >= 2 && s_stage[0] && s_stage[1] && s_flush &&
-      s_stage_bytes >= (size_t)grp && (h & 3) == 0) {
-    for (int g = 0; g < h; g += 4) {
-      uint8_t *stg = s_stage[(g >> 2) % s_stage_n];
+   * 書き出す(DMA 前提)。なければ s_block に 1 元行ずつ組み memcpy で書く。
+   * 段の巡回は呼び出しをまたぐカウンターで回す。同じ段を触る間隔は
+   * 必ず n 回あき、アプリの「残りを n-2 個以下まで待つ」で安全に守れる。 */
+  if (c->stage_n >= 2 && c->stage[0] && c->stage[1] && c->flush &&
+      c->stage_bytes >= (size_t)grp && ((row1 - row0) & 3) == 0) {
+    for (int g = row0; g < row1; g += 4) {
+      uint8_t *stg = c->stage[c->stage_rot];
+      if (++c->stage_rot >= c->stage_n) c->stage_rot = 0;
       for (int k = 0; k < 4; k++) {
         uint8_t *b = stg + (size_t)k * blk;
-        build_row_x4(src + (size_t)(g + k) * w, w, b, b + stride);
+        build_row_x4(c, src + (size_t)(g + k) * w, w, b, b + stride);
         int64_t t1 = PROF_NOW();
         memcpy(b + 2 * stride, b, 2 * stride); /* [U V] を [U V U V] に */
-        gbac_scale_prof[1] += PROF_NOW() - t1;
+        PROF_ADD(c, 1, PROF_NOW() - t1);
       }
       int64_t t2 = PROF_NOW();
-      s_flush(out + (size_t)g * blk, stg, (size_t)grp);
-      gbac_scale_prof[2] += PROF_NOW() - t2;
+      c->flush(out + (size_t)g * blk, stg, (size_t)grp);
+      PROF_ADD(c, 2, PROF_NOW() - t2);
     }
-    if (s_finish) s_finish();
+    if (c->finish) c->finish();
     return;
   }
 
+  /* 段を使わない経路。s_block は共有だが、この経路を使うタスクは 1 つだけ
+   * (段の確保に失敗したらアプリは分割をやめる)。 */
   uint8_t *rowu = s_block;
   uint8_t *rowv = s_block + stride;
 
-  for (int sy = 0; sy < h; sy++) {
+  for (int sy = row0; sy < row1; sy++) {
     const uint16_t *s = src + (size_t)sy * w;
-    build_row_x4(s, w, rowu, rowv);
+    build_row_x4(c, s, w, rowu, rowv);
 
     int64_t t1 = PROF_NOW();
     memcpy(s_block + 2 * stride, s_block, 2 * stride); /* [U V] を [U V U V] に */
@@ -380,25 +396,125 @@ static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
     memcpy(out + (size_t)sy * blk, s_block, blk);
     /* 専用経路では prof[1] が internal RAM 内の複製(460,800B/枚)、
      * prof[2] が PSRAM への書き込み(921,600B/枚)。どちらが壁かを見る。 */
-    gbac_scale_prof[1] += t2 - t1;
-    gbac_scale_prof[2] += PROF_NOW() - t2;
+    PROF_ADD(c, 1, t2 - t1);
+    PROF_ADD(c, 2, PROF_NOW() - t2);
   }
 }
 
-void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
-                     uint8_t *out) {
+/* ---- scale=2 専用経路(2026-10-19 の仕様変更で既定) ----
+ * 録画は 480x320。PC 側で ffmpeg の最近傍 2 倍をやって 960x640 にする。
+ * 4 倍と違ってデータは 1/4。彩度は 2x2 ブロック = 元画素 1 個なので、
+ * 1 元画素が 1 個の彩度と 4 個の輝度を作る(にじまない)。
+ * 元行 1 本 → 出力行 2 本 [U 行][V 行]。1 元画素ぶん 3 バイト [C Y Y]。
+ * 組み立ても DMA への書き出しも scale=4 と同じ形(元行 4 本ぶんを段に組む)。
+ * 出力は汎用経路とバイト単位で一致。test_scale_ref2 が 230,400 バイト全部を
+ * 参照実装と突き合わせて担保する。 */
+static void build_row_x2(gbac_scale_ctx_t *c, const uint16_t *s, int w,
+                         uint8_t *rowu, uint8_t *rowv) {
+  int64_t t0 = PROF_NOW();
+  uint16_t *tmp = c->srcrow;
+  if (w <= GBAC_WIDTH) {
+    memcpy(tmp, s, (size_t)w * sizeof(uint16_t));
+    s = tmp;
+  }
+  uint32_t *wu = (uint32_t *)rowu;
+  uint32_t *wv = (uint32_t *)rowv;
+  int x = 0;
+  for (; x + 4 <= w; x += 4) {
+    uint32_t e0 = ouyy_of(s[x]), e1 = ouyy_of(s[x + 1]);
+    uint32_t e2 = ouyy_of(s[x + 2]), e3 = ouyy_of(s[x + 3]);
+    uint32_t y0 = e0 & 0xFFu, u0 = (e0 >> 8) & 0xFFu, v0 = e0 >> 16;
+    uint32_t y1 = e1 & 0xFFu, u1 = (e1 >> 8) & 0xFFu, v1 = e1 >> 16;
+    uint32_t y2 = e2 & 0xFFu, u2 = (e2 >> 8) & 0xFFu, v2 = e2 >> 16;
+    uint32_t y3 = e3 & 0xFFu, u3 = (e3 >> 8) & 0xFFu, v3 = e3 >> 16;
+    /* 4 画素で 12 バイト = 語 3 個。x が 4 の倍数のとき語境界に揃う。
+     * [C0 Y0 Y0 C1 | Y1 Y1 C2 Y2 | Y2 C3 Y3 Y3] */
+    *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u1 << 24));
+    *wu++ = (uint32_t)(y1 | (y1 << 8) | (u2 << 16) | (y2 << 24));
+    *wu++ = (uint32_t)(y2 | (u3 << 8) | (y3 << 16) | (y3 << 24));
+    *wv++ = (uint32_t)(v0 | (y0 << 8) | (y0 << 16) | (v1 << 24));
+    *wv++ = (uint32_t)(y1 | (y1 << 8) | (v2 << 16) | (y2 << 24));
+    *wv++ = (uint32_t)(y2 | (v3 << 8) | (y3 << 16) | (y3 << 24));
+  }
+  for (; x < w; x++) { /* 4 の倍数でない残り(実運用では来ない) */
+    uint32_t e = ouyy_of(s[x]);
+    uint8_t y = (uint8_t)(e & 0xFFu), u = (uint8_t)((e >> 8) & 0xFFu), v = (uint8_t)(e >> 16);
+    uint8_t *p = rowu + x * 3;
+    p[0] = u; p[1] = y; p[2] = y;
+    p = rowv + x * 3;
+    p[0] = v; p[1] = y; p[2] = y;
+  }
+  PROF_ADD(c, 0, PROF_NOW() - t0);
+}
+
+static void scale_ouyy_x2(gbac_scale_ctx_t *c, const uint16_t *src, int w,
+                          int h, uint8_t *out, int row0, int row1) {
+  (void)h;
+  const int stride = w * 3;  /* 出力行 = (w*2) 画素 * 3 / 2 */
+  const int blk = 2 * stride; /* 元行 1 本 = 出力行 2 本 */
+  const int grp = 4 * blk;    /* 元行 4 本 = 出力行 8 本 */
+
+  if (!s_tables_ready) gbac_scale_init_lut();
+
+  /* 段を使う経路。段の巡回は呼び出しをまたぐカウンターで回す(scale=4 と同じ約束) */
+  if (c->stage_n >= 2 && c->stage[0] && c->stage[1] && c->flush &&
+      c->stage_bytes >= (size_t)grp && ((row1 - row0) & 3) == 0) {
+    for (int g = row0; g < row1; g += 4) {
+      uint8_t *stg = c->stage[c->stage_rot];
+      if (++c->stage_rot >= c->stage_n) c->stage_rot = 0;
+      for (int k = 0; k < 4; k++) {
+        uint8_t *b = stg + (size_t)k * blk;
+        build_row_x2(c, src + (size_t)(g + k) * w, w, b, b + stride);
+      }
+      int64_t t2 = PROF_NOW();
+      c->flush(out + (size_t)g * blk, stg, (size_t)grp);
+      PROF_ADD(c, 2, PROF_NOW() - t2);
+    }
+    if (c->finish) c->finish();
+    return;
+  }
+
+  /* 段を使わない経路。s_block は 5,760 バイトあるので 1 元行ぶん(1,440B)が入る */
+  for (int sy = row0; sy < row1; sy++) {
+    uint8_t *b = s_block;
+    build_row_x2(c, src + (size_t)sy * w, w, b, b + stride);
+    int64_t t2 = PROF_NOW();
+    memcpy(out + (size_t)sy * blk, b, blk);
+    PROF_ADD(c, 2, PROF_NOW() - t2);
+  }
+}
+
+void gbac_scale_ouyy_rows(gbac_scale_ctx_t *c, const uint16_t *src, int w, int h,
+                          int scale, uint8_t *out, int row0, int row1) {
   if (!src || !out || w <= 0 || h <= 0) return;
+  /* 内訳カウンタは既定の作業台でも必ず実体へ向ける(ctx_set を呼ばずに
+   * gbac_scale_ouyy だけ使う経路がある。2026-10-19 ホストテストが
+   * prof NULL でクラッシュした) */
+  if (c->prof == NULL) c->prof = gbac_scale_prof;
   if (scale < 1) scale = 1;
   if (scale > GBAC_MAX_SCALE) scale = GBAC_MAX_SCALE;
+  if (row0 < 0) row0 = 0;
+  if (row1 > h) row1 = h;
+  if (row0 >= row1) return;
 
   const int W = w * scale;
   const int H = h * scale;
   if (W > GBAC_YW_MAX || H > GBAC_YH_MAX) return; /* バッファ越えは守る */
   if (scale == 4 && (w & 1) == 0) {
-    /* scale=4 は専用経路(上のコメント参照)。w が偶数のときだけ語が揃う */
-    scale_ouyy_x4(src, w, h, out);
+    /* scale=4 は専用経路(上のコメント参照)。w が偶数のときだけ語が揃う。
+     * 元行の途中からでも作れる(彩度は 2x2 ブロックが元画素 1 個に潰れる) */
+    scale_ouyy_x4(c, src, w, h, out, row0, row1);
     return;
   }
+  if (scale == 2 && (w & 3) == 0) {
+    /* scale=2 も専用経路。行のまたぎがないので元行の途中から作れる。
+     * w が 4 の倍数のときだけ [C Y Y] の語が揃う */
+    scale_ouyy_x2(c, src, w, h, out, row0, row1);
+    return;
+  }
+  /* 汎用経路は行のまたぎ(彩度が隣り合う 2 元行を見る)があるので分割しない。
+   * 分割してくる呼び出しはアプリ側で scale=4 のときだけ。 */
+  if (row0 != 0 || row1 != h) return;
 
   const int stride = W * 3 / 2;
   const int cw = W / 2;
@@ -433,7 +549,7 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
         const int slot = row_slot(&s_cache, src, w, sy);
         int64_t t1 = PROF_NOW();
         build_yrow(&s_cache, slot, w, scale, s_yrow);
-        gbac_scale_prof[1] += PROF_NOW() - t1;
+        PROF_ADD(c, 1, PROF_NOW() - t1);
         cur_sy = sy;
       }
       {
@@ -441,7 +557,7 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
         build_uv_rows(s_urow, s_vrow, s_yrow, s_xmap, cw, even,
                       s_cache.r[sa], s_cache.g[sa], s_cache.b[sa], s_cache.r[sb],
                       s_cache.g[sb], s_cache.b[sb]);
-        gbac_scale_prof[2] += PROF_NOW() - t2;
+        PROF_ADD(c, 2, PROF_NOW() - t2);
       }
       cur_a = a;
       cur_b = b;
@@ -458,8 +574,14 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
       for (int k = 0; k < nrow; k++)
         memcpy(out + (size_t)(r + k) * stride, ((r + k) & 1) ? s_vrow : s_urow,
                stride);
-      gbac_scale_prof[3] += PROF_NOW() - t3;
+      PROF_ADD(c, 3, PROF_NOW() - t3);
     }
     r += nrow;
   }
+}
+
+/* 既定の作業台で枠全体を作る(テスト・ベンチ・分割しないアプリ) */
+void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
+                     uint8_t *out) {
+  gbac_scale_ouyy_rows(&s_def, src, w, h, scale, out, 0, h);
 }

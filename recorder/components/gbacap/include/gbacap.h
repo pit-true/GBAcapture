@@ -138,6 +138,36 @@ uint32_t gbac_scale_ouyy_px(uint32_t rgb565);
  * stage_bytes が足りないときも従来経路。単一タスクからの呼び出し前提。 */
 typedef void (*gbac_scale_flush_t)(uint8_t *dst, const uint8_t *stage, size_t n);
 typedef void (*gbac_scale_finish_t)(void);
+
+/* 拡大の作業台。段バッファ・flush・元行の写し・内訳カウンタを組ごとに持つ。
+ * 2 コアへ分割して同時に動かすので、共有する static は使わない(2026-10-19)。
+ * prof は 4 個の int64 の配列(NULL なら集計しない)。
+ *   prof[0]=変換+luma+彩度 prof[1]=internal 内の複製 prof[2]=PSRAM へ書く手 */
+#define GBAC_STAGE_MAX 5
+typedef struct {
+  uint8_t *stage[GBAC_STAGE_MAX];
+  int stage_n;
+  int stage_rot; /* 呼び出しをまたぐ巡回位置。同じ段の再利用間隔を n に保つ */
+  size_t stage_bytes;
+  gbac_scale_flush_t flush;
+  gbac_scale_finish_t finish;
+  uint16_t srcrow[GBAC_WIDTH];
+  int64_t *prof;
+} gbac_scale_ctx_t;
+
+/* ctx に段バッファ n 個(2..GBAC_STAGE_MAX)と flush/finish を渡す。
+ * stages に NULL を渡すと従来どおり 1 元行ずつ memcpy で PSRAM へ書く。 */
+void gbac_scale_ctx_set(gbac_scale_ctx_t *c, uint8_t *const *stages, int n,
+                        size_t stage_bytes, gbac_scale_flush_t flush,
+                        gbac_scale_finish_t finish);
+
+/* 元行 [row0, row1) ぶんだけ out(枠の先頭)へ作る。
+ * scale=4 の専用経路だけ分割できる(row0/row1 は 4 の倍数、row1<=h)。
+ * それ以外のスケールは row0=0, row1=h の全枠だけ扱う。 */
+void gbac_scale_ouyy_rows(gbac_scale_ctx_t *c, const uint16_t *src, int w, int h,
+                          int scale, uint8_t *out, int row0, int row1);
+
+/* ctx を使わない既定の作業台(テストとベンチ用) */
 void gbac_scale_set_stage(uint8_t *const *stages, int n, size_t stage_bytes,
                           gbac_scale_flush_t flush, gbac_scale_finish_t finish);
 

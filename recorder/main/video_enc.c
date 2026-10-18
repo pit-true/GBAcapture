@@ -46,7 +46,8 @@ static uint32_t g_encout_len;
 static esp_h264_enc_handle_t g_enc;
 static esp_h264_enc_param_hw_handle_t g_param;
 static TaskHandle_t g_task;        /* enc_task */
-static TaskHandle_t g_scale_task;  /* scale_task */
+static TaskHandle_t g_scale_task;  /* scale_task(arg=0、上半分) */
+static TaskHandle_t g_scale_task_b; /* scale_task(arg=1、下半分) */
 static volatile bool g_run;
 static bool g_bench;
 static volatile int g_bench_left;
@@ -105,58 +106,89 @@ static void bench_fill(uint16_t *dst, int n)
  * internal 23040B x5 = 113KB)。起動直後(enc+GDMA 後)の internal 309KB に入るので
  * 録画開始時の空きは減らない。
  * ドライバは source のキャッシュ writeback(C2M)と、dst のキャッシュライン
- * 境界外部分の退避を自分でやる(async_memcpy_gdma.c 374〜411 行)。 */
-#define STG_BYTES (GBAC_OUYY_STRIDE(GBAC_WIDTH, 4) * 4 * 4) /* 23040 */
-#define STG_N 5
-static uint8_t *g_stg[STG_N];
-static int g_stg_n;
-static async_memcpy_handle_t g_mcp;
-static SemaphoreHandle_t g_stg_sem;
-static volatile int g_dma_issue;
-static volatile int g_dma_done;
+ * 境界外部分の退避を自分でやる(async_memcpy_gdma.c 374〜411 行)。
+ * 2026-10-19 監督指示で 2 組に分割。上半分(元行 0〜79)を core0、下半分
+ * (元行 80〜159)を core1 のタスクが作るので、段と DMA と待ちは組ごとに持つ。
+ * 1 組 4 個(90KB)x2 = 180KB。internal の空きと相談して足りない組は CPU で書く。 */
+#define STG_BYTES_X4 (GBAC_OUYY_STRIDE(GBAC_WIDTH, 4) * 4 * 4) /* 23040 */
+#define STG_BYTES_X2 (GBAC_OUYY_STRIDE(GBAC_WIDTH, 2) * 2 * 4) /* 5760 */
+/* 段の大きさは設定の scale に合わせる(2026-10-19 の仕様変更で既定は 2)。
+ * scale が奇数(専用経路なし)なら段を作らず汎用経路で CPU が書く。 */
+static size_t g_stg_bytes;
+#define STG_N 4
+#define SCALE_SETS 2
+#define SCALE_HALF (GBAC_HEIGHT / 2)   /* 80。4 の倍数なので 4 元行組で割れる */
+/* 2026-10-19: 録画が 480x320 になり、1 枚ぶんの仕事は 1/4。
+ * 2 コア分割はここで止める(コードは残す)。既定は core0 の scale 1 本。 */
+#define SPLIT_ENABLE 0
+
+typedef struct {
+    uint8_t *stg[STG_N];
+    int n;
+    async_memcpy_handle_t mcp;
+    SemaphoreHandle_t sem;
+    volatile int issue;
+    volatile int done;
+    int row0, row1;
+    gbac_scale_ctx_t ctx;
+    int64_t prof[4];
+    uint32_t us_max;
+} scale_set_t;
+static scale_set_t g_ss[SCALE_SETS];
+static int g_split;               /* 2 組そろって動かせるか */
 /* 完了コールバックが載るコア。ISR でログは出せないので変数だけ置いて
  * 後でタスク側から印字する(GDMA の ISR が core1 なら mux/enc を踏む)。 */
 static volatile int g_dma_isr_core = -99;
+
+/* job の受け渡し(2026-10-19 監督指示の分割)。
+ * scale_a が枠を配って g_job_sem を与え、scale_b は自分の分を終わらせて
+ * g_join_sem を返す。scale_a は join を取るまで次の枠を作らないので、
+ * 同時に走るのは 1 枠ぶんだけ。 */
+static SemaphoreHandle_t g_job_sem;
+static SemaphoreHandle_t g_join_sem;
+static const uint16_t *g_job_px;
+static uint8_t *g_job_dst;
 
 static bool dma_done_cb(async_memcpy_handle_t h, async_memcpy_event_t *e, void *arg)
 {
     (void)h;
     (void)e;
+    scale_set_t *s = (scale_set_t *)arg;
     g_dma_isr_core = (int)xPortGetCoreID();
-    g_dma_done++;
+    s->done++;
     BaseType_t hp = pdFALSE;
-    xSemaphoreGiveFromISR((SemaphoreHandle_t)arg, &hp);
+    xSemaphoreGiveFromISR(s->sem, &hp);
     return hp == pdTRUE;
 }
 
-/* gbac_scale_ouyy が 4 元行ぶんを組み終えるたびに呼ばれる */
-static void dma_flush(uint8_t *dst, const uint8_t *stage, size_t n)
+/* gbac_scale が 4 元行ぶんを組み終えるたびに呼ばれる(flush は組ごとに差し替え) */
+static void dma_flush_set(scale_set_t *s, uint8_t *dst, const uint8_t *stage, size_t n)
 {
-    while (g_dma_issue - g_dma_done >= g_stg_n - 2) {
-        if (xSemaphoreTake(g_stg_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+    while (s->issue - s->done >= s->n - 2) {
+        if (xSemaphoreTake(s->sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
             ESP_LOGW(TAG, "DMA 完了待ちが 200ms 超過");
             break;
         }
     }
-    if (esp_async_memcpy(g_mcp, dst, (void *)stage, n, dma_done_cb, g_stg_sem) != ESP_OK) {
+    if (s->mcp == NULL || esp_async_memcpy(s->mcp, dst, (void *)stage, n, dma_done_cb, s) != ESP_OK) {
         memcpy(dst, stage, n); /* 発行に失敗したらその場で CPU が書く */
         g_errs++;
     } else {
-        g_dma_issue++;
+        s->issue++;
     }
 }
 
 /* 1 枚ぶん全部が PSRAM に乗るまで待つ(enc が読み始める前に必要) */
-static void dma_finish(void)
+static void dma_finish_set(scale_set_t *s)
 {
     static bool isr_core_logged;
     if (!isr_core_logged && g_dma_isr_core >= 0) {
         isr_core_logged = true;
         ESP_LOGI(TAG, "DMA 完了 ISR は core%d で動いている", g_dma_isr_core);
     }
-    while (g_dma_done < g_dma_issue) {
-        if (xSemaphoreTake(g_stg_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+    while (s->done < s->issue) {
+        if (xSemaphoreTake(s->sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
             ESP_LOGE(TAG, "DMA 完了待ちが 200ms 超過。枚を捨てる");
             break;
@@ -164,48 +196,106 @@ static void dma_finish(void)
     }
 }
 
-static void dma_stage_setup(void)
+static void dma_flush_a(uint8_t *d, const uint8_t *stg, size_t n) { dma_flush_set(&g_ss[0], d, stg, n); }
+static void dma_flush_b(uint8_t *d, const uint8_t *stg, size_t n) { dma_flush_set(&g_ss[1], d, stg, n); }
+static void dma_finish_a(void) { dma_finish_set(&g_ss[0]); }
+static void dma_finish_b(void) { dma_finish_set(&g_ss[1]); }
+
+/* 内訳カウンタは組ごとに別。既定の作業台(分割しない経路・ベンチ)と足し合わせる */
+static int64_t prof_sum(int i)
 {
-    if (g_mcp != NULL) {
+    int64_t v = gbac_scale_prof[i];
+    for (int k = 0; k < SCALE_SETS; k++) {
+        v += g_ss[k].prof[i];
+    }
+    return v;
+}
+
+static void prof_zero_all(void)
+{
+    for (int i = 0; i < 4; i++) {
+        gbac_scale_prof[i] = 0;
+        for (int k = 0; k < SCALE_SETS; k++) {
+            g_ss[k].prof[i] = 0;
+        }
+    }
+    for (int k = 0; k < SCALE_SETS; k++) {
+        g_ss[k].us_max = 0;
+    }
+}
+
+static void dma_stage_setup(int scale)
+{
+    static bool done_once;
+    if (done_once) {
         return;
     }
-    for (int i = 0; i < STG_N; i++) {
-        g_stg[i] = heap_caps_aligned_alloc(64, STG_BYTES,
-                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        if (g_stg[i] == NULL) {
-            break;
-        }
-        g_stg_n = i + 1;
+    done_once = true;
+    g_stg_bytes = (scale == 4) ? STG_BYTES_X4 : (scale == 2 ? STG_BYTES_X2 : 0);
+    if (g_stg_bytes == 0) {
+        /* 1 や 3 など専用経路のない scale。汎用経路が PSRAM へ直接書く */
+        ESP_LOGI(TAG, "scale=%d は専用経路なし。段は作らない", scale);
+        return;
     }
-    if (g_stg_n < 2) {
-        ESP_LOGW(TAG, "internal RAM に %dB x2 が確保できない。CPU で書く",
-                 (int)STG_BYTES);
+    for (int k = 0; k < (SPLIT_ENABLE ? SCALE_SETS : 1); k++) {
+        scale_set_t *s = &g_ss[k];
+        s->row0 = (k == 0) ? 0 : SCALE_HALF;
+        s->row1 = (k == 0) ? SCALE_HALF : GBAC_HEIGHT;
         for (int i = 0; i < STG_N; i++) {
-            if (g_stg[i] != NULL) {
-                heap_caps_free(g_stg[i]);
-                g_stg[i] = NULL;
+            s->stg[i] = heap_caps_aligned_alloc(64, g_stg_bytes,
+                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            if (s->stg[i] == NULL) {
+                break;
             }
+            s->n = i + 1;
         }
-        g_stg_n = 0;
-        return;
+        if (s->n < 2) {
+            for (int i = 0; i < STG_N; i++) {
+                if (s->stg[i] != NULL) {
+                    heap_caps_free(s->stg[i]);
+                    s->stg[i] = NULL;
+                }
+            }
+            s->n = 0;
+            continue;
+        }
+        s->sem = xSemaphoreCreateCounting(16, 0);
+        async_memcpy_config_t ac = ASYNC_MEMCPY_DEFAULT_CONFIG();
+        ac.backlog = 8;
+        ac.dma_burst_size = 128;
+        esp_err_t e = esp_async_memcpy_install_gdma_axi(&ac, &s->mcp);
+        if (e != ESP_OK) {
+            e = esp_async_memcpy_install_gdma_ahb(&ac, &s->mcp);
+        }
+        if (e != ESP_OK) {
+            s->mcp = NULL;   /* DMA が飛べなければ CPU がその場で書く */
+        }
+        s->issue = s->done = 0;
+        s->ctx.prof = s->prof;   /* ctx_set より先に置く(ctx_set は NULL のときだけ埋める) */
+        gbac_scale_ctx_set(&s->ctx, s->stg, s->n, g_stg_bytes,
+                           (k == 0) ? dma_flush_a : dma_flush_b,
+                           (k == 0) ? dma_finish_a : dma_finish_b);
     }
-    g_stg_sem = xSemaphoreCreateCounting(16, 0);
-    async_memcpy_config_t ac = ASYNC_MEMCPY_DEFAULT_CONFIG();
-    ac.backlog = 8;
-    ac.dma_burst_size = 128;
-    esp_err_t e = esp_async_memcpy_install_gdma_axi(&ac, &g_mcp);
-    if (e != ESP_OK) {
-        e = esp_async_memcpy_install_gdma_ahb(&ac, &g_mcp);
+    g_split = SPLIT_ENABLE && (g_ss[0].n >= 2 && g_ss[1].n >= 2);
+    if (!g_split) {
+        /* 分割しないので組 0 だけで全枠を作る(既定の作業台に同じ段を渡す) */
+        if (g_ss[1].n >= 2) {
+            for (int i = 0; i < STG_N; i++) {
+                if (g_ss[1].stg[i] != NULL) {
+                    heap_caps_free(g_ss[1].stg[i]);
+                    g_ss[1].stg[i] = NULL;
+                }
+            }
+            g_ss[1].n = 0;
+        }
+        gbac_scale_set_stage(g_ss[0].stg, g_ss[0].n, g_stg_bytes, dma_flush_a, dma_finish_a);
     }
-    if (e != ESP_OK) {
-        ESP_LOGW(TAG, "async memcpy が使えない(%s)。CPU で書く", esp_err_to_name(e));
-        g_mcp = NULL;
-        return;
-    }
-    g_dma_issue = g_dma_done = 0;
-    gbac_scale_set_stage(g_stg, g_stg_n, STG_BYTES, dma_flush, dma_finish);
-    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(ステージ %dB x%d、同時 %d、internal free %uKB)",
-             (int)STG_BYTES, g_stg_n, g_stg_n - 1,
+    g_job_sem = xSemaphoreCreateBinary();
+    g_join_sem = xSemaphoreCreateBinary();
+    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(分割 %s、段 %dB x%d x%d 組、同時 %d、internal free %uKB)",
+             g_split ? "上下 2 コア" : "なし", (int)g_stg_bytes, g_ss[0].n,
+             SPLIT_ENABLE ? SCALE_SETS : 1,
+             g_ss[0].n - 1,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }
 
@@ -224,7 +314,7 @@ static void dma_selfcheck(uint8_t *slot, const uint16_t *px)
     }
     gbac_scale_set_stage(NULL, 0, 0, NULL, NULL);   /* CPU が直接書く経路 */
     gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, ref);
-    gbac_scale_set_stage(g_stg, g_stg_n, STG_BYTES, dma_flush, dma_finish);
+    gbac_scale_set_stage(g_ss[0].stg, g_ss[0].n, g_stg_bytes, dma_flush_a, dma_finish_a);
     /* slot は CPU が一度も読んでいないのでキャッシュに無いはずだが、
      * 念のため M2C で無効化してから読む(アドレス・サイズは 64B の倍数) */
     esp_cache_msync(slot, g_yuv_len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
@@ -238,16 +328,44 @@ static void dma_selfcheck(uint8_t *slot, const uint16_t *px)
     ESP_LOGI(TAG, "DMA 一致確認: %u/%u バイト不一致(最初の不一致=%u slot=%p ref=%p)",
              (unsigned)bad, (unsigned)g_yuv_len, (unsigned)first,
              (void *)slot, (void *)ref);
-    for (int i = 0; i < 4; i++) {
-        gbac_scale_prof[i] = 0;   /* 確認ぶんを内訳から除外する */
-    }
+    prof_zero_all();   /* 確認ぶんを内訳から除外する */
 }
 
-/* ---- 前段: RGB565 -> OUYY 拡大 ---- */
+/* ---- 前段: RGB565 -> OUYY 拡大 ----
+ * scale_a(core0)が枠を受け取り、上半分(元行 0〜79)を作る。
+ * scale_b(core1)は g_job_sem を受け取って下半分(元行 80〜159)を作る。
+ * 両方がそろってから scale_a が枠を enc へ渡す(2026-10-19 監督指示)。 */
 static void scale_task(void *arg)
 {
-    (void)arg;
+    const int k = (int)(intptr_t)arg;
+    scale_set_t *s = &g_ss[k];
     uint32_t made = 0;
+
+    if (k == 1) {
+        /* 下半分。枠の受け取りから enc へ渡すまで(=解放)は scale_a がやる */
+        while (g_run) {
+            if (xSemaphoreTake(g_job_sem, pdMS_TO_TICKS(300)) != pdTRUE) {
+                continue;
+            }
+            if (!g_run) {
+                break;
+            }
+            int64_t t0 = esp_timer_get_time();
+            gbac_scale_ouyy_rows(&s->ctx, g_job_px, GBAC_WIDTH, GBAC_HEIGHT,
+                                 g_scale, g_job_dst, s->row0, s->row1);
+            uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+            if (dt > s->us_max) {
+                s->us_max = dt;
+            }
+            xSemaphoreGive(g_join_sem);
+            made++;
+        }
+        ESP_LOGI(TAG, "スケール B 終了 枚=%u stack 残り=%uB",
+                 (unsigned)made, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        g_scale_task_b = NULL;
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
 
     while (g_run) {
         if (g_bench) {
@@ -283,13 +401,29 @@ static void scale_task(void *arg)
         }
 
         int64_t t0 = esp_timer_get_time();
-        gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, g_yuv[slot]);
+        if (g_split) {
+            g_job_px = px;
+            g_job_dst = g_yuv[slot];
+            xSemaphoreGive(g_job_sem);
+            gbac_scale_ouyy_rows(&s->ctx, px, GBAC_WIDTH, GBAC_HEIGHT, g_scale,
+                                 g_yuv[slot], s->row0, s->row1);
+        } else {
+            gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, g_yuv[slot]);
+        }
+        int64_t tA = esp_timer_get_time();
+        if (g_split && xSemaphoreTake(g_join_sem, pdMS_TO_TICKS(400)) != pdTRUE) {
+            g_errs++;
+            ESP_LOGW(TAG, "scale_b が 400ms 以内に終わらない");
+        }
         int64_t t1 = esp_timer_get_time();
         if (!g_bench) {
             frame_pipe_release();
         }
-        if (g_bench && g_mcp != NULL && g_scale == 4 && made == 0) {
+        if (g_bench && g_ss[0].mcp != NULL && (g_scale == 4 || g_scale == 2) && made == 0) {
             dma_selfcheck(g_yuv[slot], px);
+        }
+        if ((uint32_t)(tA - t0) > s->us_max) {
+            s->us_max = (uint32_t)(tA - t0);
         }
         if ((uint32_t)(t1 - t0) > g_scale_us_max) {
             g_scale_us_max = (uint32_t)(t1 - t0);
@@ -414,9 +548,10 @@ static void enc_task(void *arg)
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
     if (g_bench) {
         const int n = done > 0 ? (int)done : 1;
-        ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f",
-                 (double)gbac_scale_prof[0] / n, (double)gbac_scale_prof[1] / n,
-                 (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n);
+        ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f | a<=%uus b<=%uus",
+                 (double)prof_sum(0) / n, (double)prof_sum(1) / n,
+                 (double)prof_sum(2) / n, (double)prof_sum(3) / n,
+                 (unsigned)g_ss[0].us_max, (unsigned)g_ss[1].us_max);
     }
     g_task = NULL;
     /* enc のスタックは PSRAM なので WithCaps 用の削除を使う */
@@ -549,7 +684,7 @@ esp_err_t gbac_enc_early_init(const gbac_cfg_t *cfg)
     if (r != ESP_OK) {
         return r;
     }
-    dma_stage_setup();
+    dma_stage_setup(cfg->scale);
     ESP_LOGI(TAG, "internal free=%uKB 最大=%uKB DMA 可=%uKB PSRAM free=%uKB",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
@@ -616,14 +751,19 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     g_scale_us_max = 0;
     g_enc_us_max = 0;
     g_fail_logged = 0;
-    for (int i = 0; i < 4; i++) {
-        gbac_scale_prof[i] = 0;
-    }
+    prof_zero_all();
     /* 前段の PSRAM 書き出しを DMA に切り替える(起動時に済んでいる。
      * 失敗していても従来経路(CPU が直接書く)で動く) */
-    dma_stage_setup();
-    if (g_mcp != NULL) {
-        g_dma_issue = g_dma_done = 0;
+    dma_stage_setup(cfg->scale);
+    for (int k = 0; k < SCALE_SETS; k++) {
+        g_ss[k].issue = g_ss[k].done = 0;
+    }
+    /* 前の録画で取り残した job の旗を下ろしておく(2026-10-19 の分割) */
+    if (g_job_sem != NULL) {
+        while (xSemaphoreTake(g_job_sem, 0) == pdTRUE) { }
+    }
+    if (g_join_sem != NULL) {
+        while (xSemaphoreTake(g_join_sem, 0) == pdTRUE) { }
     }
     /* エンコーダは開きっぱなしなので、この録画の 1 枚目を IDR にする。
      * IDR の NAL には SPS+PPS が付くので、muxer はそこから mp4 を始められる。 */
@@ -642,14 +782,20 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * 2026-10-19 r103 は core0 に scale(13.2ms/枚)+enc+aac(約 47%)を載せたため
      * core0 が 100% になり、IDLE0 が餓死して task_wdt が 10 秒ごとに出た。
      * main(prio1)も回らず 20 秒の自動停止も統計も出なかった(MEPC=build_row_x4)。
-     * 2026-10-19 監督指示の配分: core0 = scale だけ(+USB)、
+     * 2026-10-19 監督指示の配分: core0 = scale の上半分(+USB)と scale_b 待ち、
      * core1 = enc(HW 待ちが大半)・aac・mux・rx。
      *
      * スタックは PSRAM(計算だけのタスクなので SD/NVS は呼ばない)。
      * エンコーダと GDMA のステージを起動時に常時確保したため、internal の
      * 空きが少なくなっている(2026-10-19 r101)。TCB は internal のまま。 */
-    xTaskCreatePinnedToCoreWithCaps(scale_task, "scale", 12288, NULL, 5, &g_scale_task, 0,
-                                    MALLOC_CAP_SPIRAM);
+    xTaskCreatePinnedToCoreWithCaps(scale_task, "scale_a", 12288, (void *)(intptr_t)0,
+                                    5, &g_scale_task, 0, MALLOC_CAP_SPIRAM);
+    if (g_split) {
+        xTaskCreatePinnedToCoreWithCaps(scale_task, "scale_b", 12288, (void *)(intptr_t)1,
+                                        5, &g_scale_task_b, 1, MALLOC_CAP_SPIRAM);
+    } else {
+        g_scale_task_b = NULL;
+    }
     /* 後段(エンコード)。esp_h264_enc_process は HW 待ちでブロックするので
      * CPU は常に取り合わない。core1 では rx(4)の下、mux(2)の上の prio3。
      * 2026-10-19 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった
@@ -667,8 +813,9 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * この時点の internal RAM を 1 回だけ出す(2026-10-19 r98 で
      * aac が 6 倍遅くなり ringovf=10662 になった原因を見る)。 */
     ESP_LOGI(TAG, "タスク表 core/prio: usb_lib 0/22 usbh 0/21 rx 1/4 mux 1/2 aac 1/1 "
-                  "scale %d/%d enc %d/%d (このログを出したタスクは core%d)",
-             0, (int)uxTaskPriorityGet(g_scale_task),
+                  "scale_a %d/%d scale_b %d/%d enc %d/%d (このログを出したタスクは core%d)",
+             0, g_scale_task ? (int)uxTaskPriorityGet(g_scale_task) : -1,
+             1, g_scale_task_b ? (int)uxTaskPriorityGet(g_scale_task_b) : -1,
              1, (int)uxTaskPriorityGet(g_task), (int)xPortGetCoreID());
     ESP_LOGI(TAG, "internal free=%uKB 最大ブロック=%uKB DMA 可=%uKB PSRAM free=%uKB",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -683,14 +830,15 @@ void gbac_enc_stop(void)
     g_run = false;
     /* 前段は frame_pipe_take のタイムアウト(100ms)で一度ループを見て抜ける。
      * 後段は g_yuv_q を空にしてから抜ける。 */
-    for (int i = 0; i < 200 && (g_task != NULL || g_scale_task != NULL); i++) {
+    for (int i = 0; i < 300 && (g_task != NULL || g_scale_task != NULL ||
+                                g_scale_task_b != NULL); i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     /* エンコーダは開きっぱなしにする。close/del すると internal の塊が
      * 断片化して、後で reference frame が取れなくなる。
      * 次回の gbac_enc_start で force_idr するので、mp4 の先頭は IDR のまま。 */
-    if (g_mcp != NULL) {
-        g_dma_issue = g_dma_done = 0;
+    for (int k = 0; k < SCALE_SETS; k++) {
+        g_ss[k].issue = g_ss[k].done = 0;
     }
 }
 
@@ -727,15 +875,16 @@ int gbac_enc_queued(void)
 void gbac_enc_prof_report(void)
 {
     double n = g_frames > 0 ? (double)g_frames : 1.0;
-    ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f | 枚=%u scale<=%uus enc<=%uus",
-             (double)gbac_scale_prof[0] / n, (double)gbac_scale_prof[1] / n,
-             (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n,
-             (unsigned)g_frames, (unsigned)g_scale_us_max, (unsigned)g_enc_us_max);
+    ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f | 枚=%u a<=%uus b<=%uus wall<=%uus enc<=%uus",
+             (double)prof_sum(0) / n, (double)prof_sum(1) / n,
+             (double)prof_sum(2) / n, (double)prof_sum(3) / n,
+             (unsigned)g_frames, (unsigned)g_ss[0].us_max, (unsigned)g_ss[1].us_max,
+             (unsigned)g_scale_us_max, (unsigned)g_enc_us_max);
 }
 
 void gbac_enc_bench(const gbac_cfg_t *cfg, int bench_frames)
 {
-    for (int i = 0; i < 4; i++) gbac_scale_prof[i] = 0;
+    prof_zero_all();
     int64_t t0 = esp_timer_get_time();
     if (gbac_enc_start(cfg, bench_frames) != ESP_OK) {
         return;

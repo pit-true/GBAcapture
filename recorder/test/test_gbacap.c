@@ -748,6 +748,88 @@ static void test_scale_ref4(void) {
   OK_EQ(diff, 0);
 }
 
+/* ---------- 10c. scale=2 の全面突き合わせ(480x320 の既定経路) ----------
+ * 2026-10-19 の仕様変更で録画は 480x320。PC 側で ffmpeg の最近傍 2 倍をやって
+ * 960x640 にする(彩度 1 個 = GBA 1 画素なのでにじまない)。
+ * scale=2 の専用経路を入れたので、参照実装・汎用経路と 230,400 バイト全部で
+ * 一致することを確かめる。段(DMA の代わり)を通した場合も同じ出力か見る。 */
+static uint8_t g_stage2[4][5760] __attribute__((aligned(64)));
+static uint8_t *g_st2[4] = {g_stage2[0], g_stage2[1], g_stage2[2], g_stage2[3]};
+static void st2_flush(uint8_t *dst, const uint8_t *stg, size_t n) { memcpy(dst, stg, n); }
+static void st2_finish(void) {}
+
+static void test_scale_ref2(void) {
+  const int scale = 2, w = GBAC_WIDTH, h = GBAC_HEIGHT;
+  const int W = w * scale, H = h * scale, stride = W * 3 / 2;
+  static uint8_t ref[GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, 2)];
+
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      uint16_t c = (uint16_t)((((x * 11 + y * 5) & 31) << 11) |
+                              (((x * 3 + y * 13) & 63) << 5) |
+                              ((x * 7 + y * 17) & 31));
+      if (((x + y) % 13) == 0) c = 0xFFFF;
+      if (((x * 5 + y * 3) % 19) == 0) c = 0x0000;
+      if (((x * 11 + y * 7) % 29) == 0) c = 0x001F; /* U が 256 を超えて 255 へ */
+      g_src[y * w + x] = c;
+    }
+  }
+
+  for (int r = 0; r < H; r++) {
+    uint8_t *row = ref + (size_t)r * stride;
+    const int cy = r / 2;
+    for (int cx = 0; cx < W / 2; cx++) {
+      int R = 0, G = 0, B = 0;
+      for (int k = 0; k < 4; k++) {
+        int ox = 2 * cx + (k & 1), oy = 2 * cy + (k >> 1);
+        uint8_t rgb[3];
+        gbac_rgb565_to888(g_src[(oy / scale) * w + (ox / scale)], rgb);
+        R += rgb[0];
+        G += rgb[1];
+        B += rgb[2];
+      }
+      int ar = (R + 2) >> 2, ag = (G + 2) >> 2, ab = (B + 2) >> 2;
+      uint8_t *p = row + cx * 3;
+      p[0] = (uint8_t)((r & 1) ? ref_cv(ar, ag, ab) : ref_cu(ar, ag, ab));
+      for (int k = 0; k < 2; k++) {
+        uint8_t rgb[3];
+        gbac_rgb565_to888(g_src[(r / scale) * w + ((2 * cx + k) / scale)], rgb);
+        p[1 + k] = (uint8_t)ref_luma(rgb[0], rgb[1], rgb[2]);
+      }
+    }
+  }
+
+  int diff = 0;
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, w, h, scale, g_ouyy);
+  for (int i = 0; i < (int)sizeof(ref); i++)
+    if (ref[i] != g_ouyy[i]) diff++;
+  if (diff) printf("  scale=2 が参照実装と %d バイト違う\n", diff);
+  OK_EQ(diff, 0);
+
+  /* 段を通す経路(実機では flush が GDMA 発行)。出力は同じでなければならない */
+  diff = 0;
+  gbac_scale_set_stage(g_st2, 4, 5760, st2_flush, st2_finish);
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy(g_src, w, h, scale, g_ouyy);
+  gbac_scale_set_stage(NULL, 0, 0, NULL, NULL);
+  for (int i = 0; i < (int)sizeof(ref); i++)
+    if (ref[i] != g_ouyy[i]) diff++;
+  if (diff) printf("  scale=2 の段経路が参照実装と %d バイト違う\n", diff);
+  OK_EQ(diff, 0);
+
+  /* 元行の上下分割(2 コアで組むときの形)。合わせて全枠と同じ */
+  diff = 0;
+  static gbac_scale_ctx_t ctx;
+  memset(g_ouyy, 0xAA, sizeof(g_ouyy));
+  gbac_scale_ouyy_rows(&ctx, g_src, w, h, scale, g_ouyy, 0, h / 2);
+  gbac_scale_ouyy_rows(&ctx, g_src, w, h, scale, g_ouyy, h / 2, h);
+  for (int i = 0; i < (int)sizeof(ref); i++)
+    if (ref[i] != g_ouyy[i]) diff++;
+  if (diff) printf("  scale=2 の上下分割が参照実装と %d バイト違う\n", diff);
+  OK_EQ(diff, 0);
+}
+
 /* ---------- 11. 表引き(Y・U・V)が既存の式と 65536 色すべてで一致 ----------
  * 拡大の 1 画素ぶんの計算を「成分ごとの表の和」に置き換えた(2026-10-19 監督指示)。
  * シフト前の和が同じなら出力は 1 バイトも変わらないはずなので、全色で確かめる。
@@ -846,6 +928,7 @@ int main(void) {
   RUN(test_split);
   RUN(test_scale_real);
   RUN(test_scale_ref4);
+  RUN(test_scale_ref2);
   RUN(test_ouyy65k);
   RUN(test_seq_gap);
   RUN(test_pts_ms);

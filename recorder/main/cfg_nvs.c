@@ -15,11 +15,15 @@ static const char *TAG = "cfg";
 #define KEY_BITRATE   "bitrate"
 #define KEY_SPLIT     "split_min"
 #define KEY_VOLUME    "volume"
+#define KEY_VER       "ver"
+/* 2026-10-19 の仕様変更(録画は 480x320。960x640 への 2 倍は PC の ffmpeg)で 2 へ。
+ * NVS に古い値(scale=4, 16000kbps)が入っていても 1 回だけ新しい既定値に寄せる。 */
+#define CFG_VER       2
 
 void gbac_cfg_default(gbac_cfg_t *c)
 {
-    c->scale = 4;
-    c->bitrate_kbps = 16000;
+    c->scale = 2;
+    c->bitrate_kbps = 8000;
     c->split_min = 15;
     c->volume_pct = 100;
 }
@@ -27,10 +31,10 @@ void gbac_cfg_default(gbac_cfg_t *c)
 void gbac_cfg_clamp(gbac_cfg_t *c)
 {
     if (c->scale < 1 || c->scale > 4) {
-        c->scale = 4;
+        c->scale = 2;
     }
     if (c->bitrate_kbps < 1000 || c->bitrate_kbps > 40000) {
-        c->bitrate_kbps = 16000;
+        c->bitrate_kbps = 8000;
     }
     if (c->split_min < 1 || c->split_min > 60) {
         c->split_min = 15;
@@ -71,6 +75,8 @@ void gbac_cfg_load(gbac_cfg_t *c)
                  (int)c->scale, (int)c->bitrate_kbps, (int)c->split_min);
         return;
     }
+    int32_t ver = 0;
+    nvs_get_i32(h, KEY_VER, &ver);
     nvs_get_i32(h, KEY_SCALE, &c->scale);
     nvs_get_i32(h, KEY_BITRATE, &c->bitrate_kbps);
     nvs_get_i32(h, KEY_SPLIT, &c->split_min);
@@ -78,6 +84,17 @@ void gbac_cfg_load(gbac_cfg_t *c)
     nvs_close(h);
 
     gbac_cfg_clamp(c);
+    if (ver < CFG_VER) {
+        /* 4 が保存済みでもここでは 2 にする(2026-10-19 の仕様変更)。
+         * 960x640 を直接録画すると 1 枚 921,600 バイトで P4 では重すぎた。
+         * 480x320(230,400 バイト)にすれば 1/4 で、彩度 1 個 = GBA 1 画素。
+         * 960x640 への 2 倍は PC の ffmpeg(recorder/tools)でやる。 */
+        ESP_LOGW(TAG, "設定を移行(ver %d → %d)。scale=%d bitrate=%dkbps",
+                 (int)ver, CFG_VER, (int)c->scale, (int)c->bitrate_kbps);
+        c->scale = 2;
+        c->bitrate_kbps = 8000;
+        gbac_cfg_save(c);
+    }
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
              (int)c->scale, (int)c->bitrate_kbps, (int)c->split_min, (int)c->volume_pct);
 }
@@ -95,6 +112,7 @@ void gbac_cfg_save(const gbac_cfg_t *c)
     nvs_set_i32(h, KEY_BITRATE, c->bitrate_kbps);
     nvs_set_i32(h, KEY_SPLIT, c->split_min);
     nvs_set_i32(h, KEY_VOLUME, c->volume_pct);
+    nvs_set_i32(h, KEY_VER, CFG_VER);
     esp_err_t e = nvs_commit(h);
     nvs_close(h);
     if (e != ESP_OK) {
