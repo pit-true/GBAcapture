@@ -314,6 +314,39 @@ static void stop_pipe_test(void)
     show_status();
 }
 
+/* PC に SD を見せる(MSC)。録画中なら止めてから。
+ * 入り口は 3 つ: コンソール 'm'、ボタン長押し(2 秒)、ボタンを押しながら給電。 */
+static void enter_msc(void)
+{
+    if (g_recording) {
+        stop_recording();
+    }
+    if (g_pipe_test) {
+        stop_pipe_test();
+    }
+    esp_err_t e = gbac_msc_start();
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "MSC モード。PC の Explorer に SD が出るはず。戻すのはボタン短押しか 'm'");
+    } else {
+        ESP_LOGE(TAG, "MSC に切り替えない(%s)", esp_err_to_name(e));
+    }
+}
+
+/* MSC を畳んで nano 受信(ホスト)に戻す */
+static void leave_msc(void)
+{
+    esp_err_t e = gbac_msc_stop();
+    ESP_LOGI(TAG, "MSC 解除(%s)", esp_err_to_name(e));
+    if (e != ESP_OK) {
+        /* OTG PHY が残ったままだとホストをもう一度立てられない。
+         * ここで無理にやると usb_lib タスクだけ動いてログが洪水になる。 */
+        ESP_LOGE(TAG, "TinyUSB が畳みきれない。'd' で書き込みモードか電源入れ直し");
+    } else {
+        esp_err_t e2 = gbac_usb_start(on_packet, NULL);
+        ESP_LOGI(TAG, "USB ホスト復旧(%s)", esp_err_to_name(e2));
+    }
+}
+
 /* コンソールの RX(GPIO38)に届いた 1 文字で操作できるようにする。
  * esptool が 460800 で ROM と握手できたので、PC→基板の RX 配線は実証済み。
  * これで RST ボタンやタクト SW に頼まず、PC 側から再起動・ベンチ・録画開始ができる。
@@ -442,29 +475,9 @@ static void uart_cmd_handle(char c)
     } else if (c == 'm') {
         /* PC に SD を見せる(MSC)⇄ nano を受ける(ホスト)の切り替え */
         if (gbac_msc_active()) {
-            esp_err_t e = gbac_msc_stop();
-            ESP_LOGI(TAG, "MSC 解除(%s)", esp_err_to_name(e));
-            if (e != ESP_OK) {
-                /* OTG PHY が残ったままだとホストをもう一度立てられない。
-                 * ここで無理にやると usb_lib タスクだけ動いてログが洪水になる。 */
-                ESP_LOGE(TAG, "TinyUSB が畳みきれない。'd' で書き込みモードか電源入れ直し");
-            } else {
-                esp_err_t e2 = gbac_usb_start(on_packet, NULL);
-                ESP_LOGI(TAG, "USB ホスト復旧(%s)", esp_err_to_name(e2));
-            }
+            leave_msc();
         } else {
-            if (g_recording) {
-                stop_recording();
-            }
-            if (g_pipe_test) {
-                stop_pipe_test();
-            }
-            esp_err_t e = gbac_msc_start();
-            if (e == ESP_OK) {
-                ESP_LOGI(TAG, "MSC モード。PC の Explorer に SD が出るはず");
-            } else {
-                ESP_LOGE(TAG, "MSC に切り替えない(%s)", esp_err_to_name(e));
-            }
+            enter_msc();
         }
     }
 }
@@ -542,6 +555,16 @@ void app_main(void)
     }
     heap_mark("sd_mount 後");
 
+    /* ボタンを押しながら給電したら、PC に SD を見せるモードで立ち上がる(2026-10-18)。
+     * 4PIN ヘッダに PC をつないだ状態で、ケースのボタンを押したまま電源を入れる使い方。 */
+    if (gbac_button_is_down()) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (gbac_button_is_down()) {
+            ESP_LOGI(TAG, "ボタンを押しながら起動 → MSC モードで立ち上げる");
+            enter_msc();
+        }
+    }
+
 #if CONFIG_GBAC_BENCH_FRAMES > 0
     /* 手順 2: HW エンコーダが 960x640@60 に耐えるかの実測。
      * SD がなくてもエンコーダ単体なら測れるので、両方用意しておく。 */
@@ -555,12 +578,36 @@ void app_main(void)
 #endif
 
     int64_t last_log = esp_timer_get_time();
+    int64_t msc_blink_at = 0;
     while (1) {
-        if (gbac_button_wait(pdMS_TO_TICKS(1000))) {
+        int ev = gbac_button_wait(pdMS_TO_TICKS(gbac_msc_active() ? 250 : 1000));
+        if (ev == GBAC_BTN_LONG) {
+            /* 長押し: 録画中でなければ MSC へ。録画中は無視(誤操作で録画を切らない) */
             if (g_recording) {
+                ESP_LOGW(TAG, "録画中の長押しは無視する(止めるのは短押し)");
+            } else if (!gbac_msc_active()) {
+                ESP_LOGI(TAG, "ボタン長押し → MSC モードへ");
+                enter_msc();
+            }
+        } else if (ev == GBAC_BTN_SHORT) {
+            if (gbac_msc_active()) {
+                ESP_LOGI(TAG, "ボタン短押し → MSC を抜けて nano 受信へ");
+                leave_msc();
+                gbac_led_rec(false);
+            } else if (g_recording) {
                 stop_recording();
             } else {
                 start_recording();
+            }
+        }
+        if (gbac_msc_active()) {
+            /* MSC 中は LED をゆっくり点滅(0.5 秒ごと)させて録画中と区別する */
+            int64_t now = esp_timer_get_time();
+            if (now - msc_blink_at > 500 * 1000) {
+                msc_blink_at = now;
+                static bool on;
+                on = !on;
+                gbac_led_rec(on);
             }
         }
         if (g_auto_stop_at != 0 && esp_timer_get_time() >= g_auto_stop_at) {
@@ -569,6 +616,10 @@ void app_main(void)
             if (g_recording) {
                 stop_recording();
             }
+        }
+        if (gbac_msc_active()) {
+            uart_cmd_poll();
+            continue;   /* MSC 中は nano が外れた判定や状態ログを回さない */
         }
         if (g_recording && !gbac_usb_ready()) {
             ESP_LOGE(TAG, "nano が外れた。録画を止める");
