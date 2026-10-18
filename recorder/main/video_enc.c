@@ -98,12 +98,18 @@ static void bench_fill(uint16_t *dst, int n)
  * で、CPU memcpy(10.48ms)より 23,040B 刻みが速い。46,080B は internal RAM が
  * 46KB の塊を 2 個もたないので使えない。よって元行 4 本ぶん(23,040B)を
  * internal RAM のステージに組み、それを DMA で PSRAM へ送る。
- * ステージは 2 個交互。前回そのステージを使ったコピー(2 グループ前)が
- * 終わるのを待ってから組み直す。ステージ 2 個で 46KB。
+ * ステージは n 個を循環。前回そのステージを使った DMA(= n-1 個前の発行)が
+ * 終わるのを待ってから組み直す。発行の直前に「残り n-2 個以下」まで待てば、
+ * 次の組み立て先(n-1 個前に使ったステージ)の DMA は必ず終わっている。
+ * よって同時に飛ぶ DMA は n-1 個。2026-10-19 監督指示で 2 → 5 個(同時 4 個、
+ * internal 23040B x5 = 113KB)。起動直後(enc+GDMA 後)の internal 309KB に入るので
+ * 録画開始時の空きは減らない。
  * ドライバは source のキャッシュ writeback(C2M)と、dst のキャッシュライン
  * 境界外部分の退避を自分でやる(async_memcpy_gdma.c 374〜411 行)。 */
 #define STG_BYTES (GBAC_OUYY_STRIDE(GBAC_WIDTH, 4) * 4 * 4) /* 23040 */
-static uint8_t *g_stg[2];
+#define STG_N 5
+static uint8_t *g_stg[STG_N];
+static int g_stg_n;
 static async_memcpy_handle_t g_mcp;
 static SemaphoreHandle_t g_stg_sem;
 static volatile int g_dma_issue;
@@ -126,7 +132,7 @@ static bool dma_done_cb(async_memcpy_handle_t h, async_memcpy_event_t *e, void *
 /* gbac_scale_ouyy が 4 元行ぶんを組み終えるたびに呼ばれる */
 static void dma_flush(uint8_t *dst, const uint8_t *stage, size_t n)
 {
-    while (g_dma_issue - g_dma_done >= 2) {
+    while (g_dma_issue - g_dma_done >= g_stg_n - 2) {
         if (xSemaphoreTake(g_stg_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
             ESP_LOGW(TAG, "DMA 完了待ちが 200ms 超過");
@@ -163,19 +169,29 @@ static void dma_stage_setup(void)
     if (g_mcp != NULL) {
         return;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < STG_N; i++) {
         g_stg[i] = heap_caps_aligned_alloc(64, STG_BYTES,
                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
         if (g_stg[i] == NULL) {
-            ESP_LOGW(TAG, "internal RAM に %dB x2 が確保できない。CPU で書く",
-                     (int)STG_BYTES);
-            g_stg[0] = g_stg[1] = NULL;
-            return;
+            break;
         }
+        g_stg_n = i + 1;
+    }
+    if (g_stg_n < 2) {
+        ESP_LOGW(TAG, "internal RAM に %dB x2 が確保できない。CPU で書く",
+                 (int)STG_BYTES);
+        for (int i = 0; i < STG_N; i++) {
+            if (g_stg[i] != NULL) {
+                heap_caps_free(g_stg[i]);
+                g_stg[i] = NULL;
+            }
+        }
+        g_stg_n = 0;
+        return;
     }
     g_stg_sem = xSemaphoreCreateCounting(16, 0);
     async_memcpy_config_t ac = ASYNC_MEMCPY_DEFAULT_CONFIG();
-    ac.backlog = 4;
+    ac.backlog = 8;
     ac.dma_burst_size = 128;
     esp_err_t e = esp_async_memcpy_install_gdma_axi(&ac, &g_mcp);
     if (e != ESP_OK) {
@@ -187,9 +203,9 @@ static void dma_stage_setup(void)
         return;
     }
     g_dma_issue = g_dma_done = 0;
-    gbac_scale_set_stage(g_stg[0], g_stg[1], STG_BYTES, dma_flush, dma_finish);
-    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(ステージ %dB x2、internal free %uKB)",
-             (int)STG_BYTES,
+    gbac_scale_set_stage(g_stg, g_stg_n, STG_BYTES, dma_flush, dma_finish);
+    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(ステージ %dB x%d、同時 %d、internal free %uKB)",
+             (int)STG_BYTES, g_stg_n, g_stg_n - 1,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }
 
@@ -206,9 +222,9 @@ static void dma_selfcheck(uint8_t *slot, const uint16_t *px)
             return;
         }
     }
-    gbac_scale_set_stage(NULL, NULL, 0, NULL, NULL);   /* CPU が直接書く経路 */
+    gbac_scale_set_stage(NULL, 0, 0, NULL, NULL);   /* CPU が直接書く経路 */
     gbac_scale_ouyy(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, ref);
-    gbac_scale_set_stage(g_stg[0], g_stg[1], STG_BYTES, dma_flush, dma_finish);
+    gbac_scale_set_stage(g_stg, g_stg_n, STG_BYTES, dma_flush, dma_finish);
     /* slot は CPU が一度も読んでいないのでキャッシュに無いはずだが、
      * 念のため M2C で無効化してから読む(アドレス・サイズは 64B の倍数) */
     esp_cache_msync(slot, g_yuv_len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
@@ -519,6 +535,11 @@ esp_err_t gbac_enc_early_init(const gbac_cfg_t *cfg)
     g_H = GBAC_HEIGHT * g_scale;
     g_yuv_len = GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, g_scale);
     g_encout_len = g_yuv_len;
+    /* RGB565 → (Y,U,V) の 256KB 表を PSRAM に作る(2026-10-19 監督指示)。
+     * 拡大の 1 画素ぶんの計算を表引き 1 回にする。録画前に済ませておく。 */
+    if (gbac_scale_init_lut() != 0) {
+        ESP_LOGE(TAG, "色の変換表が作れない。拡大は計算経路で動く");
+    }
     esp_err_t r = pool_alloc();
     if (r != ESP_OK) {
         return r;

@@ -12,7 +12,13 @@
 
 static const char *TAG = "frame";
 
-#define NSLOT 2
+/* 3 枚ぶん持つ(2026-10-19 監督指示)。
+ * 2 枚だと、読み手が 1 枚持っているあいだに完成した枚を「読み待ち」に
+ * 載せる枠がなく、必ず古い枚を処理して新しい枚を捨てることになっていた。
+ * 3 枚なら「読み手(1)+ 書き手(1)+ 読み待ち(1)」がそろい、
+ * 読み待ちは常にいちばん新しい枚だけを残せる(古い方は捨てる)。
+ * 1 枚 76.8KB x 3 = 230KB は PSRAM に置く。 */
+#define NSLOT 3
 
 static gbac_asm_t *g_asm[NSLOT];
 static uint64_t g_slot_pts[NSLOT];
@@ -73,18 +79,34 @@ static int finish_frame(int cur, uint8_t frame_no)
 
     bool swapped = false;
     portENTER_CRITICAL(&g_mux);
-    int other = 1 - cur;
-    if (g_ready < 0 && g_held < 0) {
+    /* 完成した cur を「読み待ち」に載せる。すでに読み待ちがあれば古い方は捨て、
+     * 新しい方だけを残す(2026-10-19 監督指示: 溜まったら古いものを捨てる)。
+     * 捨てた slot は書き手の新しい作業場になるので書き込みは止まらない。
+     * 読み手が持っている slot は絶対に触らない。 */
+    int victim = g_ready;
+    int next = victim;
+    if (next < 0) {
+        for (int i = 0; i < NSLOT; i++) {
+            if (i != cur && i != g_held) {
+                next = i;
+                break;
+            }
+        }
+    }
+    if (next >= 0 && next != cur) {
+        if (victim >= 0) {
+            g_asm[victim]->dropped_frames++;
+        }
         g_slot_pts[cur] = pts_us;
         g_ready = cur;
-        g_cur = other;
+        g_cur = next;
         swapped = true;
     }
     portEXIT_CRITICAL(&g_mux);
 
     if (swapped) {
         xSemaphoreGive(g_sig);
-        return other;
+        return g_cur; /* 捨てた slot へ書き手が移っている */
     }
     g_asm[cur]->dropped_frames++;
     return cur;

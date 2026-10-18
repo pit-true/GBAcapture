@@ -207,59 +207,113 @@ static void build_uv_rows(uint8_t *urow, uint8_t *vrow, const uint8_t *yrow,
  * prof[1](y 欄)、PSRAM への書き込みが prof[2](uv 欄)。prof[3](copy 欄)は 0 のまま。 */
 static uint8_t s_block[4 * GBAC_YW_MAX * 3 / 2] __attribute__((aligned(16)));
 
-/* gbac_rgb565_to888 と同じ式。呼び出しと rgb[3] の受け渡しを消すためここで展開する。 */
-static void rgb565_of(int c, int *r, int *g, int *b) {
-  int r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
-  *r = (r5 << 3) | (r5 >> 2);
-  *g = (g6 << 2) | (g6 >> 4);
-  *b = (b5 << 3) | (b5 >> 2);
+/* ---- RGB565 → (Y,U,V) の表(2026-10-19 監督指示) ----
+ * Y・U・V は r・g・b の 1 次式なので、シフト前の積和を成分ごとの表に分ける。
+ *   Y_raw = TYr[r5] + TYg[g6] + TYb[b5]   (U_raw, V_raw も同じ形)
+ * rgb565→888 の展開((r5<<3)|(r5>>2) など)と係数掛けを表の中で済ませる。
+ * 32 + 64 + 32 = 128 個 × 3 成分 = 384 個の int32 = 1.5KB。
+ * static で internal RAM に置くので表引きは PSRAM に触れない。
+ * 65536 色 x 4 バイト = 256KB の表は PSRAM に置いたが、L2(128KB)より大きく
+ * 表引き 1 回が PSRAM 読みになって rgb が 12.9ms/枚になった(r105)。
+ * シフト前の和は元の式と同一なので出力は 1 バイトも変わらない。
+ * test_ouyy65k が 65536 色すべてを既存の式と突き合わせて担保する。 */
+static int32_t TYr[32], TYg[64], TYb[32];
+static int32_t TUr[32], TUg[64], TUb[32];
+static int32_t TVr[32], TVg[64], TVb[32];
+static int s_tables_ready;
+
+int gbac_scale_init_lut(void) {
+  for (int i = 0; i < 32; i++) {
+    int r = (i << 3) | (i >> 2);
+    TYr[i] = 77 * r;
+    TUr[i] = -43 * r;
+    TVr[i] = 128 * r;
+  }
+  for (int i = 0; i < 64; i++) {
+    int g = (i << 2) | (i >> 4);
+    TYg[i] = 150 * g;
+    TUg[i] = -85 * g;
+    TVg[i] = -107 * g;
+  }
+  for (int i = 0; i < 32; i++) {
+    int b = (i << 3) | (i >> 2);
+    TYb[i] = 29 * b;
+    TUb[i] = 128 * b;
+    TVb[i] = -21 * b;
+  }
+  s_tables_ready = 1;
+  return 0;
 }
 
-/* 彩度のクランプは上でよい。8bit 全範囲で chroma_u/chroma_v の生値は
- * 1..256 に収まる(最小は r=g=255 の 1、最大は b=255 や r=255 の 256)。
- * なので下側の比較はいらない。clamp8 と結果は同じ。 */
-static int chroma_u8(int r, int g, int b) {
-  int v = 128 + ((-43 * r - 85 * g + 128 * b + 128) >> 8);
-  return v > 255 ? 255 : v;
+/* 1 画素ぶんの (Y,U,V) を byte0:Y byte1:U byte2:V で返す。
+ * 和だけ表、+128 → >>8 → +128 → 上側クランプは luma/chroma_u8/chroma_v8 と同じ。
+ * Y は 0..255 に収まる(最大 256*255 >> 8 = 255)のでクランプしない。
+ * U・V の生値は 1..256 なので下側の比較はいらない(clamp8 と同じ)。 */
+static inline uint32_t ouyy_of(uint32_t c) {
+  int r5 = (int)((c >> 11) & 0x1Fu), g6 = (int)((c >> 5) & 0x3Fu),
+      b5 = (int)(c & 0x1Fu);
+  uint32_t y = (uint32_t)((TYr[r5] + TYg[g6] + TYb[b5]) >> 8);
+  int u = 128 + (int)((TUr[r5] + TUg[g6] + TUb[b5] + 128) >> 8);
+  int v = 128 + (int)((TVr[r5] + TVg[g6] + TVb[b5] + 128) >> 8);
+  if (u > 255) u = 255;
+  if (v > 255) v = 255;
+  return y | ((uint32_t)u << 8) | ((uint32_t)v << 16);
 }
-static int chroma_v8(int r, int g, int b) {
-  int v = 128 + ((128 * r - 107 * g - 21 * b + 128) >> 8);
-  return v > 255 ? 255 : v;
+
+/* ホストテスト(test_ouyy65k)が表引きの経路を 1 画素ぶん外から見るため */
+uint32_t gbac_scale_ouyy_px(uint32_t c) {
+  if (!s_tables_ready) gbac_scale_init_lut();
+  return ouyy_of(c);
 }
 
 /* アプリが渡した internal RAM のステージ(scale=4 で 4 元行ぶん)。
- * NULL のあいだは s_block + memcpy の従来経路。 */
-static uint8_t *s_stage[2];
+ * NULL のあいだは s_block + memcpy の従来経路。
+ * 個数はアプリが決める(2026-10-19 監督指示で 2 → 4 を想定)。
+ * 4 元行グループを組み終わるたびに flush を呼ぶが、そのステージへの
+ * 次の書き込みは「そのステージを使った DMA が終わるまで」待たせる。
+ * 個数が多いほど DMA の待ちが見えなくなる。 */
+#define GBAC_STAGE_MAX 4
+static uint8_t *s_stage[GBAC_STAGE_MAX];
+static int s_stage_n;
 static size_t s_stage_bytes;
 static gbac_scale_flush_t s_flush;
 static gbac_scale_finish_t s_finish;
 
-void gbac_scale_set_stage(uint8_t *stage_a, uint8_t *stage_b, size_t stage_bytes,
+void gbac_scale_set_stage(uint8_t *const *stages, int n, size_t stage_bytes,
                           gbac_scale_flush_t flush, gbac_scale_finish_t finish) {
-  s_stage[0] = stage_a;
-  s_stage[1] = stage_b;
+  s_stage_n = (n > GBAC_STAGE_MAX) ? GBAC_STAGE_MAX : n;
+  for (int i = 0; i < GBAC_STAGE_MAX; i++) {
+    s_stage[i] = (stages != NULL && i < s_stage_n) ? stages[i] : NULL;
+  }
   s_stage_bytes = stage_bytes;
   s_flush = flush;
   s_finish = finish;
 }
 
+/* src の 1 行ぶんを一旦 internal RAM に写してから表を引く(2026-10-19 監督指示)。
+ * src は PSRAM のフレームバッファ。表引きと交互に読むと PSRAM の取り合いに
+ * 巻き込まれて rgb が倍になった(r105 で 6.9 → 12.9ms)。
+ * 1 行 480 バイトを先に 1 回だけ連続読みすると、内側のループは internal だけ。 */
+static uint16_t s_srcrow[GBAC_WIDTH];
+
 /* 元行 1 本ぶんから出力行 2 本 [U 行] [V 行] を作る(1 元画素 6 バイト)。
  * 呼び出しと rgb[3] の受け渡しを消すためここで展開する。 */
 static void build_row_x4(const uint16_t *s, int w, uint8_t *rowu, uint8_t *rowv) {
   int64_t t0 = PROF_NOW();
+  if (w <= GBAC_WIDTH) {
+    memcpy(s_srcrow, s, (size_t)w * sizeof(uint16_t));
+    s = s_srcrow;
+  }
   uint32_t *wu = (uint32_t *)rowu;
   uint32_t *wv = (uint32_t *)rowv;
   int x = 0;
   for (; x + 2 <= w; x += 2) {
-    int r, g, b;
-    rgb565_of(s[x], &r, &g, &b);
-    int y0 = luma(r, g, b);
-    int u0 = chroma_u8(r, g, b);
-    int v0 = chroma_v8(r, g, b);
-    rgb565_of(s[x + 1], &r, &g, &b);
-    int y1 = luma(r, g, b);
-    int u1 = chroma_u8(r, g, b);
-    int v1 = chroma_v8(r, g, b);
+    /* 表引き 1 回で Y/U/V がそろう(2026-10-19 監督指示)。
+     * ouyy_of が internal の小キャッシュ → PSRAM の表 → 計算の順で引く。 */
+    uint32_t e0 = ouyy_of(s[x]);
+    uint32_t e1 = ouyy_of(s[x + 1]);
+    uint32_t y0 = e0 & 0xFFu, u0 = (e0 >> 8) & 0xFFu, v0 = e0 >> 16;
+    uint32_t y1 = e1 & 0xFFu, u1 = (e1 >> 8) & 0xFFu, v1 = e1 >> 16;
     /* 2 画素で 12 バイト = 語 3 個。x が偶数のとき語境界に揃う。
      * [C Y Y C Y Y | C Y Y C Y Y] */
     *wu++ = (uint32_t)(u0 | (y0 << 8) | (y0 << 16) | (u0 << 24));
@@ -270,11 +324,8 @@ static void build_row_x4(const uint16_t *s, int w, uint8_t *rowu, uint8_t *rowv)
     *wv++ = (uint32_t)(y1 | (v1 << 8) | (y1 << 16) | (y1 << 24));
   }
   if (x < w) { /* 奇数幅のとき最後の 1 画素(実運用では来ない) */
-    int r, g, b;
-    rgb565_of(s[x], &r, &g, &b);
-    int y = luma(r, g, b);
-    int u = chroma_u8(r, g, b);
-    int v = chroma_v8(r, g, b);
+    uint32_t e = ouyy_of(s[x]);
+    uint32_t y = e & 0xFFu, u = (e >> 8) & 0xFFu, v = e >> 16;
     uint8_t *p = rowu + x * 6;
     p[0] = (uint8_t)u; p[1] = (uint8_t)y; p[2] = (uint8_t)y;
     p[3] = (uint8_t)u; p[4] = (uint8_t)y; p[5] = (uint8_t)y;
@@ -290,12 +341,17 @@ static void scale_ouyy_x4(const uint16_t *src, int w, int h, uint8_t *out) {
   const int blk = 4 * stride;  /* 元行 1 本 = 出力行 4 本 */
   const int grp = 4 * blk;     /* 元行 4 本 = 出力行 16 本 */
 
+  /* 表は起動時に gbac_scale_init_lut で作っておく。作り損ねていてもここで作る
+   * (ホストテストは gbac_scale_init_lut を呼ばずに同じ経路を通る)。
+   * 確保に失敗したあいだは build_row_x4 が計算経路で動く。 */
+  if (!s_tables_ready) gbac_scale_init_lut();
+
   /* ステージが渡されていれば 4 元行ぶんをそこに組み、flush でまとめて
    * 書き出す(DMA 前提)。なければ s_block に 1 元行ずつ組み memcpy で書く。 */
-  if (s_stage[0] && s_stage[1] && s_flush && s_stage_bytes >= (size_t)grp &&
-      (h & 3) == 0) {
+  if (s_stage_n >= 2 && s_stage[0] && s_stage[1] && s_flush &&
+      s_stage_bytes >= (size_t)grp && (h & 3) == 0) {
     for (int g = 0; g < h; g += 4) {
-      uint8_t *stg = s_stage[(g >> 2) & 1];
+      uint8_t *stg = s_stage[(g >> 2) % s_stage_n];
       for (int k = 0; k < 4; k++) {
         uint8_t *b = stg + (size_t)k * blk;
         build_row_x4(src + (size_t)(g + k) * w, w, b, b + stride);

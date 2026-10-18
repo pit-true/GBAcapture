@@ -748,7 +748,30 @@ static void test_scale_ref4(void) {
   OK_EQ(diff, 0);
 }
 
-/* ---------- 11. mp4 へ渡す pts が ms である前提 ---------- */
+/* ---------- 11. 表引き(Y・U・V)が既存の式と 65536 色すべてで一致 ----------
+ * 拡大の 1 画素ぶんの計算を「成分ごとの表の和」に置き換えた(2026-10-19 監督指示)。
+ * シフト前の和が同じなら出力は 1 バイトも変わらないはずなので、全色で確かめる。
+ * 1 色でも違えば mp4 の画質が変わる。ref_luma / ref_cu / ref_cv は gbac_scale.c の
+ * 元の式をここに写したもの。 */
+static void test_ouyy65k(void) {
+  int bad = 0;
+  for (uint32_t c = 0; c < 65536u; c++) {
+    uint8_t rgb[3];
+    gbac_rgb565_to888((uint16_t)c, rgb);
+    uint32_t y = (uint32_t)ref_luma(rgb[0], rgb[1], rgb[2]);
+    uint32_t u = (uint32_t)ref_cu(rgb[0], rgb[1], rgb[2]);
+    uint32_t v = (uint32_t)ref_cv(rgb[0], rgb[1], rgb[2]);
+    uint32_t want = y | (u << 8) | (v << 16);
+    uint32_t got = gbac_scale_ouyy_px(c);
+    if (got != want) {
+      if (bad < 5) printf("  ouyy(%04X) got %06X want %06X\n", c, got, want);
+      bad++;
+    }
+  }
+  OK_EQ(bad, 0);
+}
+
+/* ---------- 12. mp4 へ渡す pts が ms である前提 ---------- */
 /* esp_muxer のヘッダには pts の単位が書かれていない(min_packet_duration だけ
  * が明示的に ms)。公式例は上位の esp_capture 経由で生の API を示さない。
  * そこで映像も音声も ms で揃えている前提を、単調増加と重複なしとして
@@ -823,6 +846,7 @@ int main(void) {
   RUN(test_split);
   RUN(test_scale_real);
   RUN(test_scale_ref4);
+  RUN(test_ouyy65k);
   RUN(test_seq_gap);
   RUN(test_pts_ms);
   printf("%d checks, %d failures\n", g_checks, g_fails);

@@ -111,17 +111,34 @@ void gbac_scale_ouyy(const uint16_t *src, int w, int h, int scale,
  * ホスト(gcc)では計測しないので常に 0。 */
 extern int64_t gbac_scale_prof[4];
 
+/* RGB565 → (Y,U,V) の表を作る(2026-10-19 監督指示)。
+ * Y・U・V は r・g・b の 1 次式なので、シフト前の積和を成分ごとに分けて持つ。
+ *   Y_raw = TYr[r5] + TYg[g6] + TYb[b5](U_raw, V_raw も同じ形)
+ * 個数は 32 + 64 + 32 = 128 を 3 成分ぶん = 384 個の int32 = 1.5KB。
+ * static で internal RAM に置くので表引きは PSRAM に触れない。
+ * scale=4 の専用経路は 1 画素の計算(展開+luma+彩度 2 つ)を表引き 1 回に替える。
+ * 起動時に 1 回呼ぶと充填を録画前に済ませられる。
+ * 呼ばなくても最初の gbac_scale_ouyy で遅延初期化する。
+ * 表の中身は gbac_rgb565_to888 + luma + chroma_u/chroma_v と 1 バイトも違わない
+ * (test_ouyy65k が 65536 色すべてを突き合わせる)。戻り値は常に 0。 */
+int gbac_scale_init_lut(void);
+
+/* 1 画素ぶんの (Y,U,V) を byte0:Y byte1:U byte2:V で返す(テストから見る)。 */
+uint32_t gbac_scale_ouyy_px(uint32_t rgb565);
+
 /* ---- PSRAM へ書く手をアプリから差し込む(2026-10-18) ----
- * stage_a / stage_b に internal RAM のステージ 2 個を渡すと、scale=4 の
- * 専用経路は 4 元行ぶん(出力行 16 本 = GBAC_OUYY_STRIDE(w,4)*4*4 バイト)を
+ * stages に internal RAM のステージ n 個(2..GBAC_STAGE_MAX=4)を渡すと、
+ * scale=4 の専用経路は 4 元行ぶん(出力行 16 本 = GBAC_OUYY_STRIDE(w,4)*4*4 バイト)を
  * そこへ組み立て、flush(その 4 行ぶんの出力先, stage, バイト数) を
  * 1 グループ(元行 4 本)ごとに呼ぶ。全行組み終わったら finish() を呼ぶ。
- * stage は交互に渡すので、アプリ側は 2 グループ前の書き出しが終わっていれば
- * 待たずに済む。NULL を渡すと従来どおり 1 元行ずつ memcpy で PSRAM へ書く。
+ * ステージは循環。n 個あると同時進行は n-1 個まで。
+ * アプリは flush の直前に「残りを n-2 個以下」まで待てば、次の組み立て先
+ * (n-1 個前に使ったステージ)の書き出しと衝突しない。
+ * NULL を渡すと従来どおり 1 元行ずつ memcpy で PSRAM へ書く。
  * stage_bytes が足りないときも従来経路。単一タスクからの呼び出し前提。 */
 typedef void (*gbac_scale_flush_t)(uint8_t *dst, const uint8_t *stage, size_t n);
 typedef void (*gbac_scale_finish_t)(void);
-void gbac_scale_set_stage(uint8_t *stage_a, uint8_t *stage_b, size_t stage_bytes,
+void gbac_scale_set_stage(uint8_t *const *stages, int n, size_t stage_bytes,
                           gbac_scale_flush_t flush, gbac_scale_finish_t finish);
 
 /* ---- 音声加工 (host/GbaCap.Viewer/ViewerForm.cs と同じ連鎖) ----
