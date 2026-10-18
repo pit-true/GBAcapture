@@ -37,7 +37,7 @@
 static const char *TAG = "rec";
 
 #define SD_BASE     "/sd"
-#define AAC_RATE    48000
+#define AAC_RATE    GBAC_AAC_RATE   /* audio_pipe.h。48000 → 32000(2026-10-18) */
 #define AAC_BITRATE 128000
 
 /* SD の空き容量のしきい値。16Mbps + AAC 128kbps で毎秒約 2.1MB、
@@ -681,7 +681,7 @@ static int mux_w_close(void *w)
     return fclose((FILE *)w) == 0 ? 0 : -1;
 }
 
-/* internal RAM の差分表(2026-10-19 監督指示)。app_main.c の heap_mark とおなじ。
+/* internal RAM の差分表(2026-10-18)。app_main.c の heap_mark とおなじ。
  * 起動後 309KB だった free が録画開始時に 45KB まで減っていたので、
  * 録画開始の各確保でどれだけ減るかを実測する。 */
 static uint32_t g_int_mark;
@@ -709,7 +709,7 @@ static esp_err_t open_muxer(void)
     mc.base_config.url_pattern_ex = slice_path;
     mc.base_config.ram_cache_size = 128 * 1024;
     mc.display_in_order = true;
-    /* ram_cache_size 128KB が internal に来ていないか実測する(2026-10-19 監督指示) */
+    /* ram_cache_size 128KB が internal に来ていないか実測する(2026-10-18) */
     int_mark("muxer open 前");
     g_muxer = esp_muxer_open((esp_muxer_config_t *)&mc, sizeof(mc));
     int_mark("muxer open 後");
@@ -741,14 +741,14 @@ static esp_err_t open_muxer(void)
         goto fail;
     }
     /* AAC の AudioSpecificConfig は esp_audio_codec 2.5.x が enc_info で返す
-     * (AAC-LC 48000Hz stereo なら 0x11 0x90 0x00)。返さない版向けの
+     * (AAC-LC 48000Hz stereo なら 0x11 0x90 0x00、32000Hz なら 0x12 0x90 0x00)。返さない版向けの
      * フォールバックも持っておく。mp4 の esds に入る値。 */
-    static const uint8_t k_asc[] = { 0x11, 0x90, 0x00 };
+    static const uint8_t k_asc[] = { (AAC_RATE == 48000) ? 0x11 : 0x12, 0x90, 0x00 };
     const void *asc = k_asc;
     int asc_len = (int)sizeof(k_asc);
     esp_audio_enc_info_t ai = { 0 };
     if (esp_audio_enc_get_info(g_aac, &ai) != ESP_AUDIO_ERR_OK) {
-        ESP_LOGW(TAG, "AAC info が取れない。48000Hz/2ch/16bit として書く");
+        ESP_LOGW(TAG, "AAC info が取れない。%dHz/2ch/16bit として書く", (int)AAC_RATE);
     } else {
         if (ai.sample_rate != AAC_RATE || ai.channel != 2) {
             ESP_LOGW(TAG, "AAC info が想定と違う(sr=%u ch=%u bps=%u br=%u)",
@@ -765,7 +765,7 @@ static esp_err_t open_muxer(void)
         .channel = 2,
         .bits_per_sample = 16,
         .sample_rate = AAC_RATE,
-        .min_packet_duration = 21,
+        .min_packet_duration = 1024 * 1000 / AAC_RATE,   /* 1 枚の長さ ms(48k=21、32k=32) */
         .codec_spec_info = (void *)asc,
         .spec_info_len = asc_len,
     };
@@ -788,7 +788,7 @@ static void encode_audio(int bytes);
 static int pump_audio(bool flush);
 
 /* AAC 符号化は mux(SD 書き込み)から切り離す。
- * 2026-10-19 r98 で mux が SD 書き込みで止まっている間 AAC を作れず、
+ * 2026-10-18 r98 で mux が SD 書き込みで止まっている間 AAC を作れず、
  * 音声リングが溢れて(ringovf=10662)mp4 の音が 353 本しか入らなかった。
  * aac タスクは PCM を読み続けて符号化し、mux は出来上がった AAC を
  * mp4 に足すだけにする。 */
@@ -916,7 +916,7 @@ static void drain_audio_q(void)
 }
 
 /* PCM を読んで AAC にするタスク。mux は SD 書き込みで 200ms 止まることがあるので、
- * それに引っ張られないよう別コア(core0)で回す。2026-10-19 r98 の音声欠け対策。 */
+ * それに引っ張られないよう別コア(core0)で回す。2026-10-18 r98 の音声欠け対策。 */
 static void aac_task(void *arg)
 {
     (void)arg;
@@ -1978,10 +1978,10 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
         return e;
     }
     g_run = true;
-    /* AAC 符号化のタスク。2026-10-19 監督指示の配分(core0 = scale だけ、
+    /* AAC 符号化のタスク。2026-10-18 の配分(core0 = scale だけ、
      * core1 = enc・aac・mux・rx)で core1 の最下位(prio1)に置く。
      * aac は 10ms x 約 47 回/秒で約 47% を食うので、scale と同じ core0 に
-     * 載せると core0 が 100% を超えて IDLE0 が餓死した(2026-10-19 r103)。
+     * 載せると core0 が 100% を超えて IDLE0 が餓死した(2026-10-18 r103)。
      * mux より下なのは、SD 書き込みを止めて mp4 を壊したくないため。
      * 音が欠けたら ringovf と aac の統計で分かる。 */
     g_aac_run = true;
@@ -1995,7 +1995,7 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
     /* SD 書き込みだけ。AAC は上のタスクが作るので優先度は rx より下でよい。
      * enc(core1 prio3)より下にして、符号化待ちで enc を止めないようにする。
      * スタックは internal のまま(SD 書き込みや NVS を呼ぶタスクのスタックを
-     * PSRAM に置くのは危険。2026-10-19 監督指示)。 */
+     * PSRAM に置くのは危険。2026-10-18)。 */
     xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 2, &g_task, 1);
     int_mark("タスク生成後");
     return ESP_OK;
@@ -2067,3 +2067,4 @@ esp_err_t gbac_rec_bench(const gbac_cfg_t *cfg, int bench_frames)
              (unsigned)g_vpkts, (unsigned)g_verr);
     return ESP_OK;
 }
+

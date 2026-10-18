@@ -1,5 +1,5 @@
 /* 0xA6 の音声パケット(32.8kHz ステレオ、ADC 生 0..4095)を受け取り、
- * PC 側ビューアと同じ DC 除去 + ローパス + ゲイン → 48kHz へリサンプルして
+ * PC 側ビューアと同じ DC 除去 + ローパス + ゲイン → GBAC_AAC_RATE へリサンプルして
  * int16 ステレオ(左,右の順)で取り出せるようにする。
  * 書き込みは USB のクライアントタスク、読み出しはエンコードタスク。 */
 #pragma once
@@ -8,12 +8,19 @@
 
 #include "esp_err.h"
 
+/* AAC の標本化周波数。48000 から 32000 へ(2026-10-18)。
+ * AAC は 1024 サンプルを 1 枚にするので、毎秒の枚数が 46.9 → 31.3 になり、
+ * core1 の約半分を使っていた AAC エンコード(1 枚 11ms)が 2/3 になる。
+ * nano の実レートは 32802Hz なので、リサンプルもほぼ 1:1 になって質が落ちない。
+ * 32000 は AAC-LC の標準レート(mp4 の esds の周波数 index は 5)。 */
+#define GBAC_AAC_RATE 32000
+
 esp_err_t audio_pipe_init(int volume_pct);
 
 /* 0xA6 パケットを 1 個渡す。USB のクライアントタスクの文脈で呼ぶ。 */
 void audio_pipe_push(const uint8_t *pkt, int len);
 
-/* 48kHz ステレオを max_pairs ペアまで取り出す(out は 2*max_pairs 個の int16)。
+/* GBAC_AAC_RATE のステレオを max_pairs ペアまで取り出す(out は 2*max_pairs 個の int16)。
  * 戻り値 = 実際に取り出したペア数(0 のことがある)。 */
 int audio_pipe_read(int16_t *out, int max_pairs);
 

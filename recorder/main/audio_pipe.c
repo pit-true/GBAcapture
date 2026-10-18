@@ -25,7 +25,7 @@ static gbac_resamp_t g_rs;
 static uint32_t g_gaps;
 static uint32_t g_overruns;
 static uint32_t g_drops;        /* 溢れて捨てたペア数(PTS のずれ補正に使う) */
-/* 入力側の計測(監督 2026-10-16 02:57 指示)。r9 で 48kHz 出力が 32,965 ペア/秒
+/* 入力側の計測(2026-10-16)。r9 で AAC レート(当時 48kHz)の出力が 32,965 ペア/秒
  * しかなった = 入力が 32,802 ペア/秒に届いていない疑い。
  * g_push_pkts = 解析に成功してここへ来た音声パケット数
  * g_push_pairs = リングに書き込んだ入力ペア数(32.8kHz 側)
@@ -51,7 +51,7 @@ esp_err_t audio_pipe_init(int volume_pct)
     }
     audio_pipe_reset();
     gbac_audio_fx_init(&g_fx, (float)volume_pct / 100.0f);
-    gbac_resamp_init(&g_rs, 32802, 48000);
+    gbac_resamp_init(&g_rs, 32802, GBAC_AAC_RATE);
     return ESP_OK;
 }
 
@@ -78,7 +78,7 @@ void audio_pipe_push(const uint8_t *pkt, int len)
 
     /* seq は 8bit 循環。飛んでいれば音声データそのものが失われている。
      * 飛び幅の合計 = 失われたパケット数(1 パケット = 48 ペア = 1.46ms)。
-     * r9 で音声 6 秒分がどこへ消えたか切り分けるために数える(監督 2026-10-16 指示)。 */
+     * r9 で音声 6 秒分がどこへ消えたか切り分けるために数える(2026-10-16)。 */
     if (g_have_seq) {
         uint8_t want = (uint8_t)(g_seq + 1);
         if (a.seq != want) {
@@ -116,7 +116,7 @@ int audio_pipe_read(int16_t *out, int max_pairs)
         if (avail_pairs <= 0) {
             break;
         }
-        /* リサンプルは入力チャンク 1 個に対して 48000/32802 倍(+1)の出力を作る。
+        /* リサンプルは入力チャンク 1 個に対して GBAC_AAC_RATE/32802 倍(+1)の出力を作る。
          * 出力が足りないと入力を途中で捨ててしまうので、部屋から入力個数を決める。
          * 部屋が 1 ペアだと入力が 0 に切り捨てられて永久に埋まらないので、
          * gbac_resamp_in_pairs が 0 を返したらそこでやめる(呼び出し側は部屋を広く取る)。 */
