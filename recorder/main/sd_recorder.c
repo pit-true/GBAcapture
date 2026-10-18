@@ -1978,19 +1978,22 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
         return e;
     }
     g_run = true;
-    /* AAC 符号化のタスク。core0 の低優先度で、PCM を読み続けて AAC にする。
-     * mux(core1)の SD 書き込みに引っ張られないため別コアに置く。
-     * 2026-10-19 r98 は mux が止まっている間 AAC が作れず音が欠けた。 */
+    /* AAC 符号化のタスク。2026-10-19 監督指示の配分(core0 = scale だけ、
+     * core1 = enc・aac・mux・rx)で core1 の最下位(prio1)に置く。
+     * aac は 10ms x 約 47 回/秒で約 47% を食うので、scale と同じ core0 に
+     * 載せると core0 が 100% を超えて IDLE0 が餓死した(2026-10-19 r103)。
+     * mux より下なのは、SD 書き込みを止めて mp4 を壊したくないため。
+     * 音が欠けたら ringovf と aac の統計で分かる。 */
     g_aac_run = true;
     g_aac_task = (TaskHandle_t)1; /* 生成前に NULL と区別できるようにする */
-    if (xTaskCreatePinnedToCore(aac_task, "aac", 8192, NULL, 2, &g_aac_task, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(aac_task, "aac", 8192, NULL, 1, &g_aac_task, 1) != pdPASS) {
         g_aac_run = false;
         g_aac_task = NULL;
         rec_free();
         return ESP_ERR_NO_MEM;
     }
     /* SD 書き込みだけ。AAC は上のタスクが作るので優先度は rx より下でよい。
-     * enc(core0 prio4)より下にして、符号化待ちで enc を止めないようにする。
+     * enc(core1 prio3)より下にして、符号化待ちで enc を止めないようにする。
      * スタックは internal のまま(SD 書き込みや NVS を呼ぶタスクのスタックを
      * PSRAM に置くのは危険。2026-10-19 監督指示)。 */
     xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 2, &g_task, 1);

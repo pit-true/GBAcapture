@@ -618,19 +618,21 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * rx(prio4)を starvation させ、USB rx リング(128 枠=9ms)が溢れて
      * r9 では 61,763 パケット(音声 6 秒分)が捨てられた。
      * core0 の上位(usb_lib=22, usbh=21)は prio5 より上なので USB 受信は邪魔されない。
-     * 拡大が USB 受信に割り込まれて 85ms/枚になったのは、割り込みで止まる
-     * 見かけ上の値なので、後段と重ねることで実効スループットを上げる。
+     * 2026-10-19 r103 は core0 に scale(13.2ms/枚)+enc+aac(約 47%)を載せたため
+     * core0 が 100% になり、IDLE0 が餓死して task_wdt が 10 秒ごとに出た。
+     * main(prio1)も回らず 20 秒の自動停止も統計も出なかった(MEPC=build_row_x4)。
+     * 2026-10-19 監督指示の配分: core0 = scale だけ(+USB)、
+     * core1 = enc(HW 待ちが大半)・aac・mux・rx。
      *
      * スタックは PSRAM(計算だけのタスクなので SD/NVS は呼ばない)。
      * エンコーダと GDMA のステージを起動時に常時確保したため、internal の
      * 空きが少なくなっている(2026-10-19 r101)。TCB は internal のまま。 */
     xTaskCreatePinnedToCoreWithCaps(scale_task, "scale", 12288, NULL, 5, &g_scale_task, 0,
                                     MALLOC_CAP_SPIRAM);
-    /* 後段(エンコード)。1 枚 10ms の締め切りがあるので mux より上にする。
-     * core1 だと rx(prio4)と同じ優先度で同じコアになるため core0 へ移した。
-     * core0 では scale(prio5)の下、aac(prio2)と mux(prio2)の上。
-     * esp_h264_enc_process は HW 待ちでブロックするので CPU は常に取り合わない。
-     * 2026-10-19 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった。
+    /* 後段(エンコード)。esp_h264_enc_process は HW 待ちでブロックするので
+     * CPU は常に取り合わない。core1 では rx(4)の下、mux(2)の上の prio3。
+     * 2026-10-19 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった
+     * ので、mux より上に置く。
      *
      * スタックは PSRAM(xTaskCreatePinnedToCoreWithCaps)。エンコーダと GDMA の
      * ステージを起動時に常時確保したので、internal に 8KB のスタックを置くと
@@ -638,15 +640,15 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * internal free 45KB・最大 21KB しかなく、mux が詰まって停止時に
      * CPU0 の interrupt WDT で panic した)。TCB は internal のまま。
      * 自己終了は vTaskDeleteWithCaps(NULL) が必須。 */
-    xTaskCreatePinnedToCoreWithCaps(enc_task, "enc", 8192, NULL, 4, &g_task, 0,
+    xTaskCreatePinnedToCoreWithCaps(enc_task, "enc", 8192, NULL, 3, &g_task, 1,
                                     MALLOC_CAP_SPIRAM);
     /* 録画中に enc が回っていないときの切り分け用。コアと優先度の実値と、
      * この時点の internal RAM を 1 回だけ出す(2026-10-19 r98 で
      * aac が 6 倍遅くなり ringovf=10662 になった原因を見る)。 */
-    ESP_LOGI(TAG, "タスク表 core/prio: usb_lib 0/22 usbh 0/21 rx 1/4 mux 1/2 aac 0/2 "
+    ESP_LOGI(TAG, "タスク表 core/prio: usb_lib 0/22 usbh 0/21 rx 1/4 mux 1/2 aac 1/1 "
                   "scale %d/%d enc %d/%d (このログを出したタスクは core%d)",
              0, (int)uxTaskPriorityGet(g_scale_task),
-             0, (int)uxTaskPriorityGet(g_task), (int)xPortGetCoreID());
+             1, (int)uxTaskPriorityGet(g_task), (int)xPortGetCoreID());
     ESP_LOGI(TAG, "internal free=%uKB 最大ブロック=%uKB DMA 可=%uKB PSRAM free=%uKB",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
