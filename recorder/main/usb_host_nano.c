@@ -24,7 +24,10 @@ static const char *TAG = "usbnano";
  * 転送のバッファは usb_host_transfer_alloc が internal の DMA 可能メモリから取る:
  * 4KB × 4 本 × 3 EP = 48KB(v0.33 の 512B × 32 × 3 = 48KB と同じ)。
  * 4 本で 16KB = 3.4ms ぶんが常に飛んでいるので、完了→再投入の遅れでは溢れない。 */
-#define XFER_BYTES   4096
+#define XFER_BYTES   4096         /* EP4(映像の主)。8 パケットをまとめて受ける */
+#define XFER_BYTES_EP1 512        /* EP1(映像のあふれ分)。流量が少なく不定期なので、
+                                   * まとめるとラインが何フレームも遅れて届く。1 パケットずつ */
+#define XFER_BYTES_EP3 1024       /* EP3(音声)。683 パケット/秒で一定。2 パケットずつ(3ms) */
 #define RX_PER_EP    4
 #define MAX_RX_EP    3
 
@@ -211,6 +214,14 @@ static void rx_cb(usb_transfer_t *t)
     }
 }
 
+/* EP ごとの 1 転送の大きさ(上の XFER_BYTES の説明を参照) */
+static int xfer_bytes_for(int ep)
+{
+    if (ep == 0x81) return XFER_BYTES_EP1;
+    if (ep == 0x83) return XFER_BYTES_EP3;
+    return XFER_BYTES;
+}
+
 static void attach(uint8_t addr)
 {
     const usb_device_desc_t *dd;
@@ -287,7 +298,7 @@ static void attach(uint8_t addr)
     for (int i = 0; i < g_rx_n; i++) {
         for (int j = 0; j < RX_PER_EP; j++) {
             if (g_rx[i][j] == NULL) {
-                if (usb_host_transfer_alloc(XFER_BYTES, 0, &g_rx[i][j]) != ESP_OK) {
+                if (usb_host_transfer_alloc(xfer_bytes_for(g_rx_ep[i]), 0, &g_rx[i][j]) != ESP_OK) {
                     ESP_LOGE(TAG, "transfer_alloc 失敗");
                     return;
                 }
@@ -297,7 +308,7 @@ static void attach(uint8_t addr)
             t->bEndpointAddress = g_rx_ep[i];
             t->callback = rx_cb;
             t->context = (void *)(intptr_t)i;   /* reasm_feed の EP 番号 */
-            t->num_bytes = XFER_BYTES;
+            t->num_bytes = xfer_bytes_for(g_rx_ep[i]);
             t->timeout_ms = 0;
             if (usb_host_transfer_submit(t) != ESP_OK) {
                 g_errs++;
