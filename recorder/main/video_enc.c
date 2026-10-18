@@ -298,7 +298,8 @@ static void scale_task(void *arg)
     ESP_LOGI(TAG, "スケール終了 枚=%u stack 残り=%uB",
              (unsigned)made, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     g_scale_task = NULL;
-    vTaskDelete(NULL);
+    /* スタックは PSRAM なので WithCaps 用の削除を使う */
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* ---- 後段: H.264 HW エンコード ---- */
@@ -402,7 +403,8 @@ static void enc_task(void *arg)
                  (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n);
     }
     g_task = NULL;
-    vTaskDelete(NULL);
+    /* enc のスタックは PSRAM なので WithCaps 用の削除を使う */
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* PSRAM 側の部屋とキューを作る。録画のたびに作り直さない(断片化避け)。 */
@@ -617,14 +619,27 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * r9 では 61,763 パケット(音声 6 秒分)が捨てられた。
      * core0 の上位(usb_lib=22, usbh=21)は prio5 より上なので USB 受信は邪魔されない。
      * 拡大が USB 受信に割り込まれて 85ms/枚になったのは、割り込みで止まる
-     * 見かけ上の値なので、後段と重ねることで実効スループットを上げる。 */
-    xTaskCreatePinnedToCore(scale_task, "scale", 12288, NULL, 5, &g_scale_task, 0);
+     * 見かけ上の値なので、後段と重ねることで実効スループットを上げる。
+     *
+     * スタックは PSRAM(計算だけのタスクなので SD/NVS は呼ばない)。
+     * エンコーダと GDMA のステージを起動時に常時確保したため、internal の
+     * 空きが少なくなっている(2026-10-19 r101)。TCB は internal のまま。 */
+    xTaskCreatePinnedToCoreWithCaps(scale_task, "scale", 12288, NULL, 5, &g_scale_task, 0,
+                                    MALLOC_CAP_SPIRAM);
     /* 後段(エンコード)。1 枚 10ms の締め切りがあるので mux より上にする。
      * core1 だと rx(prio4)と同じ優先度で同じコアになるため core0 へ移した。
      * core0 では scale(prio5)の下、aac(prio2)と mux(prio2)の上。
      * esp_h264_enc_process は HW 待ちでブロックするので CPU は常に取り合わない。
-     * 2026-10-19 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった。 */
-    xTaskCreatePinnedToCore(enc_task, "enc", 8192, NULL, 4, &g_task, 0);
+     * 2026-10-19 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった。
+     *
+     * スタックは PSRAM(xTaskCreatePinnedToCoreWithCaps)。エンコーダと GDMA の
+     * ステージを起動時に常時確保したので、internal に 8KB のスタックを置くと
+     * 録画のときに internal が枯渇する(2026-10-19 r101: 録画開始時点で
+     * internal free 45KB・最大 21KB しかなく、mux が詰まって停止時に
+     * CPU0 の interrupt WDT で panic した)。TCB は internal のまま。
+     * 自己終了は vTaskDeleteWithCaps(NULL) が必須。 */
+    xTaskCreatePinnedToCoreWithCaps(enc_task, "enc", 8192, NULL, 4, &g_task, 0,
+                                    MALLOC_CAP_SPIRAM);
     /* 録画中に enc が回っていないときの切り分け用。コアと優先度の実値と、
      * この時点の internal RAM を 1 回だけ出す(2026-10-19 r98 で
      * aac が 6 倍遅くなり ringovf=10662 になった原因を見る)。 */

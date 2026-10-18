@@ -27,9 +27,13 @@ static int g_pts_dbg;   /* 先頭 20 フレームの PTS をログに出す回�
 esp_err_t frame_pipe_init(void)
 {
     for (int i = 0; i < NSLOT; i++) {
-        /* 1 枚 76.8KB。PSRAM に逃がすと DMA/キャッシュ越しで遅くなるので
-         * 内部 RAM に確保する(2 枚で 154KB)。 */
-        g_asm[i] = heap_caps_malloc(sizeof(gbac_asm_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        /* 1 枚 76.8KB。internal に置くと 2 枚で 154KB を常時つかむ。
+         * エンコーダ(internal に約 69KB の連続ブロック + DMA バッファ)と
+         * GDMA のステージ(23,040B x2)を起動時に常時確保するようになったため、
+         * internal からは確保できなくなった(2026-10-19 実測: internal に
+         * 確保していた間は frame_pipe だけで 152KB 減っていた)。
+         * PSRAM でもキャッシュが効くので実測で遅さを確かめる(bench 'b')。 */
+        g_asm[i] = heap_caps_malloc(sizeof(gbac_asm_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (g_asm[i] == NULL) {
             ESP_LOGE(TAG, "フレームバッファが確保できない");
             return ESP_ERR_NO_MEM;

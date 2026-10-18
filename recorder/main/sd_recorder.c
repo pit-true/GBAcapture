@@ -681,6 +681,20 @@ static int mux_w_close(void *w)
     return fclose((FILE *)w) == 0 ? 0 : -1;
 }
 
+/* internal RAM の差分表(2026-10-19 監督指示)。app_main.c の heap_mark とおなじ。
+ * 起動後 309KB だった free が録画開始時に 45KB まで減っていたので、
+ * 録画開始の各確保でどれだけ減るかを実測する。 */
+static uint32_t g_int_mark;
+static void int_mark(const char *what)
+{
+    uint32_t now = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t diff = (g_int_mark >= now) ? (g_int_mark - now) : 0u;
+    ESP_LOGI(TAG, "internal heap %-18s free=%uKB 差分=-%uKB 最大=%uKB", what,
+             (unsigned)(now / 1024), (unsigned)(diff / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    g_int_mark = now;
+}
+
 static esp_err_t open_muxer(void)
 {
     if (!g_registered) {
@@ -695,7 +709,10 @@ static esp_err_t open_muxer(void)
     mc.base_config.url_pattern_ex = slice_path;
     mc.base_config.ram_cache_size = 128 * 1024;
     mc.display_in_order = true;
+    /* ram_cache_size 128KB が internal に来ていないか実測する(2026-10-19 監督指示) */
+    int_mark("muxer open 前");
     g_muxer = esp_muxer_open((esp_muxer_config_t *)&mc, sizeof(mc));
+    int_mark("muxer open 後");
     if (!g_muxer) {
         ESP_LOGE(TAG, "muxer open 失敗");
         return ESP_FAIL;
@@ -1948,11 +1965,14 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
     g_seek_last = 0;
     g_nal_dbg = 0;
     g_pts_dbg = 0;
+    int_mark("録画開始");
     if (aac_open() != ESP_OK) {
         rec_free();
         return ESP_FAIL;
     }
+    int_mark("aac_open 後");
     esp_err_t e = gbac_enc_start(cfg, bench_frames);
+    int_mark("enc_start 後");
     if (e != ESP_OK) {
         rec_free();
         return e;
@@ -1970,8 +1990,11 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
         return ESP_ERR_NO_MEM;
     }
     /* SD 書き込みだけ。AAC は上のタスクが作るので優先度は rx より下でよい。
-     * enc(core0 prio4)より下にして、符号化待ちで enc を止めないようにする。 */
+     * enc(core0 prio4)より下にして、符号化待ちで enc を止めないようにする。
+     * スタックは internal のまま(SD 書き込みや NVS を呼ぶタスクのスタックを
+     * PSRAM に置くのは危険。2026-10-19 監督指示)。 */
     xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 2, &g_task, 1);
+    int_mark("タスク生成後");
     return ESP_OK;
 }
 

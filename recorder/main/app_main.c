@@ -460,6 +460,20 @@ static void uart_cmd_poll(void)
     }
 }
 
+/* internal RAM をどこがどれだけ食ったかの差分表(2026-10-19 監督指示)。
+ * 起動後の free 309KB が録画開始時に 45KB まで減っていた。
+ * 大口を PSRAM へ移す判断材料にする。 */
+static uint32_t g_heap_mark;
+static void heap_mark(const char *what)
+{
+    uint32_t now = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t diff = (g_heap_mark >= now) ? (g_heap_mark - now) : 0u;
+    ESP_LOGI(TAG, "internal heap %-18s free=%uKB 差分=-%uKB 最大=%uKB", what,
+             (unsigned)(now / 1024), (unsigned)(diff / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    g_heap_mark = now;
+}
+
 void app_main(void)
 {
     gbac_board_init();
@@ -485,21 +499,27 @@ void app_main(void)
     }
 #endif
 
+    heap_mark("起動時");
     /* H.264 HW エンコーダと GDMA の internal RAM はここでたしかめておく。
      * 録画のたびに開くと heap が断片化して reference frame(約 69KB の連続)が
      * 取れなくなる(2026-10-19 r99/r100 で -3)。 */
     if (gbac_enc_early_init(&g_cfg) != ESP_OK) {
         ESP_LOGE(TAG, "エンコーダが起動時に開けない。録画のときにリトライする");
     }
+    heap_mark("enc+GDMA 後");
     frame_pipe_init();
+    heap_mark("frame_pipe 後");
     audio_pipe_init(g_cfg.volume_pct);
+    heap_mark("audio 後");
     gbac_button_init();
     gbac_usb_start(on_packet, NULL);
+    heap_mark("usb 後");
     if (gbac_sd_mount() != ESP_OK) {
         /* 結線は確定済み(slot0/LDO VO4/40MHz)なので総当たりはしない。
          * ここで見えないときはカードの接触か未挿入。`s` で再確認できる。 */
         ESP_LOGE(TAG, "SD が見えない。カードを挿し直すか、's' で結線を確かめてね");
     }
+    heap_mark("sd_mount 後");
 
 #if CONFIG_GBAC_BENCH_FRAMES > 0
     /* 手順 2: HW エンコーダが 960x640@60 に耐えるかの実測。
