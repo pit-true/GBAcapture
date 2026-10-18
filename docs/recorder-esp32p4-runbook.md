@@ -11,7 +11,7 @@ nanoCH32V305 から映像と音声を受け取り、**480x320 の mp4(H.264 + AA
 | もの | 用途 | 状態 |
 |---|---|---|
 | ESP32-P4-Pico(SKU 32101) | 本体 | 動作確認済み |
-| nanoCH32V305 | 映像・音声の送信元 | FW v0.33。変更しない |
+| nanoCH32V305 | 映像・音声の送信元 | FW v0.34(パケット 512B)。録画機の最新ビルドは v0.34 が前提 |
 | MX1.25 4PIN → USB(A) ケーブル | P4 の USB-HS ホストへ繋ぐ | 確保済み |
 | microSD(FAT32) | 録画先 | SanDisk 32GB で動作確認済み |
 | タクトスイッチ 1 個 | 録画の開始と停止 | GPIO2 ↔ GND。実機未確認 |
@@ -29,7 +29,7 @@ nano との受信も、PC へ SD を見せる MSC も、MX1.25 4PIN ヘッダ(US
 2. 基板の TF スロットに挿す
 3. 書き込みが成功と返るのに内容が残らないカードがあった(古い microSD)。8MB の速度テスト(`w`)で読み戻し一致を確かめる
 
-起動ログの期待値:
+起動ログには次の 2 行が出る。
 
 ```
 I (xxxx) rec: SD マウント完了 /sd クラス=... 容量=29512MB
@@ -70,7 +70,7 @@ GDMA の段 46KB を起動時に確保している)。
 ## 4. ベンチで速さを測る
 
 コンソールの `b` で合成映像 600 枚を拡大 + エンコードする(SD には書かない)。
-nano が止まっているときの 2026-10-18 の実測:
+nano が止まっているときの 2026-10-18 の実測は次のとおり。
 
 ```
 I (xxxx) enc: スケール内訳 us/枚 rgb=2852 y=0 uv=2125 copy=0
@@ -89,14 +89,14 @@ $py = 'D:\esp\tools\python_env\idf5.5_py3.12_env\Scripts\python.exe'
 & $py C:\Users\korok\gba-capture\recorder\scripts\p4seq.py D:\esp\scripts\rec.log T@0 p@17 i@30
 ```
 
-2026-10-18 の実測(REC_0013):
+2026-10-18 の実測(REC_0013)は次のとおり。
 
 ```
 I (24218) rec: 停止ログ REC_0013.mp4 映像=1211 先頭pts=0.00s 末尾pts=20.27s | 音声=635 先頭pts=0.00s 末尾pts=20.29s
 I (24229) enc: スケール内訳 us/枚 rgb=3164 y=0 uv=2258 copy=0 | 枚=1212 scale<=28298us enc<=12089us
 ```
 
-合格の目安:
+合格の目安は次の表のとおり。
 
 | 項目 | 期待値 |
 |---|---|
@@ -123,7 +123,7 @@ ffprobe -v error -show_entries stream=codec_name,width,height,sample_rate,nb_fra
 | soun | `mp4a` 32000Hz 2ch、1 枚 1024 サンプル |
 | 長さ | 映像と音声が一致 |
 
-960x640 にする(ffmpeg が要る。`winget install Gyan.FFmpeg` など):
+960x640 にするには ffmpeg が要る(`winget install Gyan.FFmpeg` など)。
 
 ```
 recorder\scripts\upscale_x2.bat REC_0013.mp4   # 隣に REC_0013_960x640.mp4 ができる
@@ -170,6 +170,7 @@ Explorer に「TinyUSB Flash Storage」が出る。戻すときはもう 1 回 `
 | `T` | 録画を始めて 20 秒で自動停止(試験用) |
 | `e` | 受信 + 拡大 + エンコードだけ回す(SD に書かない) |
 | `D` | 最新の mp4 を UART で送る(`p4pull.py` が受ける) |
+| `2` `4` | 倍率を 2(480x320・8Mbps)か 4(960x640・16Mbps)にして再起動 |
 | `m` | MSC(PC に SD を見せる)⇄ ホストの切り替え |
 | `d` | 書き込みモードで再起動 |
 | `w` `s` `y` `z` `x` `v` `F` `k` | SD と PPA の診断(開発用) |
@@ -188,6 +189,7 @@ Explorer に「TinyUSB Flash Storage」が出る。戻すときはもう 1 回 `
 
 ## 11. 未完了(2026-10-18 時点)
 
+0. **nano v0.34 + 4KB 転送での録画確認**(2 倍で 20 秒、次に `4` で 960x640)。nano のケーブルを P4 へ戻してから
 1. ボタン(GPIO2)と LED(GPIO3)の実機確認
 2. MSC の往復(ケーブル差し替え → `m` → 読み出し → `m` → 続けて録画)
 3. 30 分連続録画と発熱、15 分スライスの境界が IDR になっているか
