@@ -50,6 +50,9 @@ CONFIG_FATFS_FS_LOCK=0
 # PSRAM だと SDMMC の DMA が古いキャッシュ線を読み、FAT 表の更新だけが壊れて
 # 一定サイズで errno=5 になった(2026-10-18 実測: 32MB テストが 16MB 地点で失敗)
 CONFIG_FATFS_ALLOC_PREFER_EXTRAM=n
+# SD のセクタは 512B。4096 にすると FatFs のウィンドウが 4KB になり、
+# FAT 表の 1 セクタ書き込みがカードに届かず FR_INT_ERR になる疑い(2026-10-18 実測)
+CONFIG_FATFS_SECTOR_512=y
 CONFIG_FATFS_IMMEDIATE_FSYNC=n
 CONFIG_FATFS_PER_FILE_CACHE=y
 

@@ -377,8 +377,16 @@ static void uart_cmd_handle(char c)
         if (g_recording) {
             ESP_LOGW(TAG, "録画中なので速度テストは使えない");
         } else {
-            gbac_sd_speedtest(32);
+            gbac_sd_speedtest(8);
         }
+    } else if (c == 'y') {
+        gbac_sd_rawtest(4, 1024);
+    } else if (c == 'z') {
+        gbac_sd_fatscan();
+    } else if (c == 'x') {
+        gbac_sd_buf_battery();
+    } else if (c == 'v') {
+        gbac_sd_wrprobe();
     } else if (c == 'F') {
         gbac_sd_format();
     } else if (c == 'd') {

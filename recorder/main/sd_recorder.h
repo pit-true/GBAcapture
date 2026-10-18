@@ -58,3 +58,13 @@ esp_err_t gbac_sd_speedtest(int mb);
 
 /* SD を FAT32 で作り直す(FAT 破損からの復旧)。録画中・MSC 中は断る */
 esp_err_t gbac_sd_format(void);
+
+/* FatFs を通さずカードの生セクタへ mb MB 書いて読み戻し比較する。
+ * start_mb 地点(データ領域の後ろの方)に書くので、そこにあったファイルは壊れる。 */
+esp_err_t gbac_sd_rawtest(int mb, int start_mb);
+/* FAT 表を実カードから読む検査 */
+esp_err_t gbac_sd_fatscan(void);
+/* 生セクタの 1 セクタ単発書き込みをバッファ種類で比べる検査 */
+esp_err_t gbac_sd_buf_battery(void);
+/* 生セクタ書き込みがどこへ行ったか探す検査 */
+esp_err_t gbac_sd_wrprobe(void);

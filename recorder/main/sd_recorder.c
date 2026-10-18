@@ -884,6 +884,405 @@ esp_err_t gbac_sd_format(void)
     return ESP_OK;
 }
 
+/* FatFs のボリューム内部の状態を出す。FAT 表のジオメトリとウィンドウ位置。
+ * 書き込みが FR_INT_ERR で止まったとき、どこでおかしいかを見るため。 */
+static uint32_t fat_dump_state(void)
+{
+    FATFS *fs = NULL;
+    DWORD nclst = 0;
+    FRESULT fr = f_getfree("0:", &nclst, &fs);
+    if (fr != FR_OK || !fs) {
+        ESP_LOGE(TAG, "f_getfree fr=%d", (int)fr);
+        return 0;
+    }
+    int ssize;
+#if FF_MAX_SS != FF_MIN_SS
+    ssize = fs->ssize;
+#else
+    ssize = FF_MAX_SS;
+#endif
+    ESP_LOGE(TAG, "FAT type=%d ssize=%d csize=%d n_fats=%d n_fatent=%u fsize=%u fatbase=%llu database=%llu winsect=%llu wflag=%d last_clst=%u free_clst=%u",
+             (int)fs->fs_type, ssize, (int)fs->csize, (int)fs->n_fats,
+             (unsigned)fs->n_fatent, (unsigned)fs->fsize,
+             (unsigned long long)fs->fatbase, (unsigned long long)fs->database,
+             (unsigned long long)fs->winsect, (int)fs->wflag,
+             (unsigned)fs->last_clst, (unsigned)fs->free_clst);
+    return (uint32_t)fs->winsect;
+}
+
+/* 64 バイトを 16 進 1 行に(3 文字 × 64) */
+static void hex64(const uint8_t *p, char *out)
+{
+    for (int i = 0; i < 64; i++) {
+        sprintf(out + i * 3, "%02x ", p[i]);
+    }
+    out[64 * 3 - 1] = '\0';
+}
+
+/* FatFs を通さずカードから生セクタを 1 つ読み、DMA 整列バッファと
+ * 4 バイトずらしたバッファの 2 とおりで中身を出す。FatFs のウィンドウ
+ * (fs->win)と同じセクタなので、FatFs が見ている内容と実カードの内容を
+ * 比べられる。FAT 表のセクタが読めていない疑いを確かめるため。 */
+static void fat_sector_probe(uint32_t sect)
+{
+    FATFS *fs = NULL;
+    DWORD nc = 0;
+    FRESULT frg = f_getfree("0:", &nc, &fs);
+    if (frg != FR_OK || !fs) {
+        ESP_LOGE(TAG, "probe %u: FATFS が取れない fr=%d", sect, (int)frg);
+        return;
+    }
+    uint8_t *al = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA);
+    uint8_t *raw = heap_caps_aligned_alloc(64, 520, MALLOC_CAP_DMA);
+    if (!al || !raw) {
+        ESP_LOGE(TAG, "probe %u: バッファ確保失敗", sect);
+        free(al);
+        free(raw);
+        return;
+    }
+    uint8_t *un = raw + 4;      /* DMA 整列(16B)を崩す */
+    esp_err_t e1 = sdmmc_read_sectors(g_card, al, sect, 1);
+    esp_err_t e2 = sdmmc_read_sectors(g_card, un, sect, 1);
+    char ha[64 * 3], hu[64 * 3], hw[64 * 3];
+    hex64(al, ha);
+    hex64(un, hu);
+    hex64(fs->win, hw);
+    ESP_LOGE(TAG, "sec %u 整列 err=%d %s", sect, (int)e1, ha);
+    ESP_LOGE(TAG, "sec %u 非整列 err=%d %s", sect, (int)e2, hu);
+    ESP_LOGE(TAG, "sec %u win(winsect=%llu) %s", sect,
+             (unsigned long long)fs->winsect, hw);
+    int d_au = 0, d_aw = 0;
+    for (int i = 0; i < 512; i++) {
+        if (al[i] != un[i]) {
+            d_au++;
+        }
+        if (al[i] != fs->win[i]) {
+            d_aw++;
+        }
+    }
+    ESP_LOGE(TAG, "sec %u 比較 整列vs非整列 不一致 %d/512  整列vs win 不一致 %d/512",
+             sect, d_au, d_aw);
+    uint32_t bc = (uint32_t)(sect - (uint32_t)fs->fatbase) * 128u;
+    const uint32_t *e = (const uint32_t *)al;
+    ESP_LOGE(TAG, "sec %u FAT32 ent[%u..%u]: %08x %08x %08x %08x %08x %08x %08x %08x",
+             sect, bc, bc + 7, e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
+    free(al);
+    free(raw);
+}
+
+/* FAT 表を実カードからまとめて読み、0 でないエントリを出す。
+ * FatFs が書いた FAT がカードに届いているのか、届いているならどこへ行ったのかを見る。 */
+static void fat_scan_nonzero(uint32_t maxrep)
+{
+    FATFS *fs = NULL;
+    DWORD nc = 0;
+    if (f_getfree("0:", &nc, &fs) != FR_OK || !fs) {
+        ESP_LOGE(TAG, "FAT scan: FATFS が取れない");
+        return;
+    }
+    uint8_t *b = heap_caps_aligned_alloc(64, 32768, MALLOC_CAP_DMA);
+    if (!b) {
+        ESP_LOGE(TAG, "FAT scan: 32KB が確保できない");
+        return;
+    }
+    const uint32_t CH_SEC = 64;
+    for (uint32_t copy = 0; copy < (uint32_t)fs->n_fats; copy++) {
+        uint32_t base = (uint32_t)fs->fatbase + copy * (uint32_t)fs->fsize;
+        uint32_t nz = 0, rep = 0;
+        for (uint32_t s = 0; s < (uint32_t)fs->fsize; s += CH_SEC) {
+            uint32_t cnt = (uint32_t)fs->fsize - s;
+            if (cnt > CH_SEC) {
+                cnt = CH_SEC;
+            }
+            if (sdmmc_read_sectors(g_card, b, base + s, cnt) != ESP_OK) {
+                ESP_LOGE(TAG, "FAT scan copy%u: sec %u 読み失敗", copy, base + s);
+                break;
+            }
+            const uint32_t *e = (const uint32_t *)b;
+            for (uint32_t i = 0; i < cnt * 128u; i++) {
+                if (e[i] == 0) {
+                    continue;
+                }
+                nz++;
+                if (rep < maxrep) {
+                    ESP_LOGE(TAG, "FAT copy%u sec=%u off=%u ent=%u val=%08x", copy,
+                             base + s + (i >> 7), (i & 127) * 4, s * 128u + i, e[i]);
+                    rep++;
+                }
+            }
+        }
+        ESP_LOGE(TAG, "FAT copy%u %u..%u 非ゼロ %u 個(表示 %u)", copy, base,
+                 base + (uint32_t)fs->fsize - 1, nz, rep);
+    }
+    free(b);
+}
+
+/* 1 セクタだけ書いて読み戻す。FatFs が FAT 表へ書くのと同じ大きさ(512B)の
+ * 書き込みがカードに届くかを見る。試した後は 'F' で作り直すこと。 */
+static void raw_one_sector(uint32_t sect)
+{
+    uint8_t *w = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA);
+    uint8_t *r = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA);
+    if (!w || !r) {
+        free(w);
+        free(r);
+        ESP_LOGE(TAG, "1セクタ試験: バッファ確保失敗");
+        return;
+    }
+    for (int i = 0; i < 512; i++) {
+        w[i] = (uint8_t)((i * 7 + 0x31) & 0xff);
+    }
+    esp_err_t e1 = sdmmc_write_sectors(g_card, w, sect, 1);
+    memset(r, 0, 512);
+    esp_err_t e2 = sdmmc_read_sectors(g_card, r, sect, 1);
+    int d = 0;
+    for (int i = 0; i < 512; i++) {
+        if (w[i] != r[i]) {
+            d++;
+        }
+    }
+    char hw[64 * 3], hr[64 * 3];
+    hex64(w, hw);
+    hex64(r, hr);
+    ESP_LOGE(TAG, "1セクタ sec=%u 書込=%s 読込=%s 不一致 %d/512", sect,
+             esp_err_to_name(e1), esp_err_to_name(e2), d);
+    ESP_LOGE(TAG, "  期待 %s", hw);
+    ESP_LOGE(TAG, " 実際 %s", hr);
+    free(w);
+    free(r);
+}
+
+/* FAT 表の中身を実カードから読む検査('z') */
+esp_err_t gbac_sd_fatscan(void)
+{
+    if (!g_card || g_detached || g_task) {
+        ESP_LOGE(TAG, "SD が使えない状態(mount 済み・非録画・非 MSC のときだけ)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    fat_scan_nonzero(24);
+    FATFS *fs = NULL;
+    DWORD nc = 0;
+    if (f_getfree("0:", &nc, &fs) == FR_OK && fs) {
+        raw_one_sector((uint32_t)fs->fatbase + 15);   /* 壊れている FAT セクタ */
+        raw_one_sector((uint32_t)fs->database + 4);   /* データ領域 */
+    }
+    ESP_LOGE(TAG, "この検査の後は 'F' で SD を作り直すこと");
+    return ESP_OK;
+}
+
+/* 生セクタ書き込みがどこへ行くのか探す検査('v')。
+ * 模様を書いてから、同じセクタ・周辺・カード先頭を読み、
+ * 模様が実在する場所を探す。書き込み先がずれているならここで分かる。 */
+static size_t find_pattern(const uint8_t *hay, size_t hlen, const uint8_t *pat, size_t plen)
+{
+    if (hlen < plen) {
+        return SIZE_MAX;
+    }
+    for (size_t i = 0; i + plen <= hlen; i++) {
+        if (hay[i] == pat[0] && memcmp(hay + i, pat, plen) == 0) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+esp_err_t gbac_sd_wrprobe(void)
+{
+    if (!g_card || g_detached || g_task) {
+        ESP_LOGE(TAG, "SD が使えない状態(mount 済み・非録画・非 MSC のときだけ)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    sdmmc_card_print_info(stdout, g_card);
+    ESP_LOGE(TAG, "get_status=%s ocr=%08x capacity=%u bus=%dbit real=%dkhz max=%u",
+             esp_err_to_name(sdmmc_get_status(g_card)), (unsigned)g_card->ocr,
+             (unsigned)g_card->csd.capacity, 1u << (unsigned)g_card->log_bus_width,
+             g_card->real_freq_khz, (unsigned)g_card->max_freq_khz);
+    FATFS *fs = NULL;
+    DWORD nc = 0;
+    if (f_getfree("0:", &nc, &fs) != FR_OK || !fs) {
+        ESP_LOGE(TAG, "FATFS が取れない");
+        return ESP_FAIL;
+    }
+    const uint32_t X = (uint32_t)fs->database + 2048u * 1024u;   /* データ 1GB 地点 */
+    uint8_t *w = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA);
+    uint8_t *r = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA);
+    uint8_t *big = heap_caps_malloc(64 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!w || !r || !big) {
+        free(w);
+        free(r);
+        free(big);
+        ESP_LOGE(TAG, "wrprobe: バッファ確保失敗");
+        return ESP_ERR_NO_MEM;
+    }
+    static const char MAGIC[] = "GBAPROBE12345678";
+    memcpy(w, MAGIC, 16);
+    for (int i = 16; i < 512; i++) {
+        w[i] = (uint8_t)((i * 3 + 0x11) & 0xff);
+    }
+    esp_err_t e1 = sdmmc_write_sectors(g_card, w, X, 1);
+    memset(r, 0, 512);
+    esp_err_t e2 = sdmmc_read_sectors(g_card, r, X, 1);
+    int d = 0;
+    for (int i = 0; i < 512; i++) {
+        if (w[i] != r[i]) {
+            d++;
+        }
+    }
+    ESP_LOGE(TAG, "wrprobe sec=%u 書込=%s 読込=%s 不一致 %d/512", X,
+             esp_err_to_name(e1), esp_err_to_name(e2), d);
+    ESP_LOGE(TAG, "書込後の get_status=%s",
+             esp_err_to_name(sdmmc_get_status(g_card)));
+
+    /* 周辺 ±64 セクタ(128 セクタ)を探す */
+    uint32_t s0 = X - 64;
+    if (sdmmc_read_sectors(g_card, big, s0, 128) == ESP_OK) {
+        size_t at = find_pattern(big, 128 * 512, (const uint8_t *)MAGIC, 16);
+        if (at == SIZE_MAX) {
+            ESP_LOGE(TAG, "周辺検索 %u..%u : 模様なし", s0, s0 + 127);
+        } else {
+            ESP_LOGE(TAG, "周辺検索 %u..%u : sec=%u off=%u に発見", s0, s0 + 127,
+                     s0 + (uint32_t)(at / 512), (unsigned)(at % 512));
+        }
+    }
+    /* カード先頭 1MB を探す(アドレス指定の間違いならここ) */
+    size_t found_at = SIZE_MAX;
+    for (uint32_t s = 0; s < 2048; s += 128) {
+        if (sdmmc_read_sectors(g_card, big, s, 128) != ESP_OK) {
+            break;
+        }
+        size_t at = find_pattern(big, 128 * 512, (const uint8_t *)MAGIC, 16);
+        if (at != SIZE_MAX) {
+            found_at = (size_t)s * 512 + at;
+            break;
+        }
+    }
+    ESP_LOGE(TAG, "先頭 1MB 検索: %s",
+             found_at == SIZE_MAX ? "模様なし" : "発見");
+    if (found_at != SIZE_MAX) {
+        ESP_LOGE(TAG, "  場所: バイト %u セクタ %u off %u", (unsigned)found_at,
+                 (unsigned)(found_at / 512), (unsigned)(found_at % 512));
+    }
+    /* 0 で戻す */
+    memset(w, 0, 512);
+    ESP_LOGE(TAG, "sec=%u を 0 で戻した(%s)", X,
+             esp_err_to_name(sdmmc_write_sectors(g_card, w, X, 1)));
+    free(w);
+    free(r);
+    free(big);
+    ESP_LOGE(TAG, "この検査の後は 'F' で SD を作り直すこと");
+    return ESP_OK;
+}
+
+/* 生セクタへ nsec 個書いて読み戻し、バッファの種類で書き込みが消えるか見る。
+ * (a) 内部 RAM の 64 バイト整列 DMA バッファ
+ * (b) 内部 RAM で 4 バイトずらして DMA 整列を崩したもの
+ * (c) PSRAM バッファ
+ * 書いた場所は最後に 0 で戻す。 */
+static void raw_write_test(uint32_t sect, uint32_t nsec)
+{
+    size_t sz = (size_t)nsec * 512;
+    uint8_t *al = heap_caps_aligned_alloc(64, sz, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint8_t *rawb = heap_caps_aligned_alloc(64, sz + 4, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint8_t *ps = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *rd = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ps || !rd) {
+        ESP_LOGE(TAG, "sec=%u n=%u: %uKB×2 が確保できない", sect, nsec, (unsigned)(sz / 1024));
+        free(al);
+        free(rawb);
+        free(ps);
+        free(rd);
+        return;
+    }
+    const char *nm[3] = { "内部整列", "内部4ずら", "PSRAM" };
+    uint8_t *kb[3] = { al, rawb ? rawb + 4 : NULL, ps };
+    for (int k = 0; k < 3; k++) {
+        if (!kb[k]) {
+            ESP_LOGE(TAG, "sec=%u n=%u %s: バッファなし", sect, nsec, nm[k]);
+            continue;
+        }
+        for (size_t i = 0; i < sz; i++) {
+            kb[k][i] = (uint8_t)((i * 3 + k * 17 + 0x11) & 0xff);
+        }
+        esp_err_t e1 = sdmmc_write_sectors(g_card, kb[k], sect, nsec);
+        memset(rd, 0, sz);
+        esp_err_t e2 = sdmmc_read_sectors(g_card, rd, sect, nsec);
+        size_t d = 0, first = 0;
+        for (size_t i = 0; i < sz; i++) {
+            if (rd[i] != kb[k][i]) {
+                if (!d) {
+                    first = i;
+                }
+                d++;
+            }
+        }
+        ESP_LOGE(TAG, "sec=%u n=%u %s 書込=%s 読込=%s 不一致 %u/%u 最初 %zu(期待%02x 実際%02x)",
+                 sect, nsec, nm[k], esp_err_to_name(e1), esp_err_to_name(e2),
+                 (unsigned)d, (unsigned)sz, first, kb[k][first], rd[first]);
+    }
+    memset(ps, 0, sz);
+    esp_err_t e3 = sdmmc_write_sectors(g_card, ps, sect, nsec);
+    ESP_LOGE(TAG, "sec=%u n=%u を 0 で戻した(%s)", sect, nsec, esp_err_to_name(e3));
+    free(al);
+    free(rawb);
+    free(ps);
+    free(rd);
+}
+
+/* 1 セクタ単発の書き込みが消えるのか、バッファの種類で違うのかを見る検査('x')。
+ * FAT1 の未使用領域とデータ領域の後ろでやる。後は 'F' で作り直すこと。 */
+esp_err_t gbac_sd_buf_battery(void)
+{
+    if (!g_card || g_detached || g_task) {
+        ESP_LOGE(TAG, "SD が使えない状態(mount 済み・非録画・非 MSC のときだけ)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    FATFS *fs = NULL;
+    DWORD nc = 0;
+    if (f_getfree("0:", &nc, &fs) != FR_OK || !fs) {
+        ESP_LOGE(TAG, "FATFS が取れない");
+        return ESP_FAIL;
+    }
+    ESP_LOGE(TAG, "FAT1 %u..%u FAT2 %u..%u データ開始 %u",
+             (unsigned)fs->fatbase, (unsigned)(fs->fatbase + fs->fsize - 1),
+             (unsigned)(fs->fatbase + fs->fsize),
+             (unsigned)(fs->fatbase + 2 * fs->fsize - 1), (unsigned)fs->database);
+    raw_write_test((uint32_t)fs->fatbase + fs->fsize - 328, 1);   /* FAT1 未使用 */
+    raw_write_test((uint32_t)fs->database + 2048, 1);             /* データ 1MB 地点 */
+    raw_write_test((uint32_t)fs->database + 2048u * 1024u, 1);    /* 1GB 地点 1 セクタ */
+    raw_write_test((uint32_t)fs->database + 2048u * 1024u, 2);    /* 2 セクタ */
+    raw_write_test((uint32_t)fs->database + 2048u * 1024u, 8);    /* 8 セクタ */
+    raw_write_test((uint32_t)fs->database + 2048u * 1024u, 256);  /* 256 セクタ */
+    ESP_LOGE(TAG, "この検査の後は 'F' で SD を作り直すこと");
+    return ESP_OK;
+}
+
+/* fp.clust が載っている FAT セクタ(1 枚目と 2 枚目)を実カードから読み、
+ * 鎖のエントリがカードに残っているか出す。f_sync 直後に確認する。 */
+static void fat_check_clust(uint32_t clust)
+{
+    FATFS *fs = NULL;
+    DWORD nc = 0;
+    if (f_getfree("0:", &nc, &fs) != FR_OK || !fs) {
+        ESP_LOGE(TAG, "FAT ent[%u]: FATFS が取れない", clust);
+        return;
+    }
+    uint8_t *b = heap_caps_aligned_alloc(64, 512, MALLOC_CAP_DMA);
+    if (!b) {
+        ESP_LOGE(TAG, "FAT ent[%u]: 512B が確保できない", clust);
+        return;
+    }
+    uint32_t off = (clust & 127u) * 4u;
+    uint32_t s1 = (uint32_t)fs->fatbase + clust / 128u;
+    uint32_t s2 = s1 + (uint32_t)fs->fsize;
+    esp_err_t e1 = sdmmc_read_sectors(g_card, b, s1, 1);
+    uint32_t v1 = *(const uint32_t *)(b + off);
+    esp_err_t e2 = sdmmc_read_sectors(g_card, b, s2, 1);
+    uint32_t v2 = *(const uint32_t *)(b + off);
+    ESP_LOGE(TAG, "FAT ent[%u] 1枚目 sec=%u %s val=%08x 2枚目 sec=%u %s val=%08x",
+             clust, s1, esp_err_to_name(e1), v1, s2, esp_err_to_name(e2), v2);
+    free(b);
+}
+
 /* SD の実測の書き込み・読み出し速度。esp_muxer の ram_cache_size を決める材料と、
  * mux が詰まる原因(SD が遅い / 止まる)を切り分けるために使う。
  * 録画していないときだけ呼ぶこと(FAT を二重に触らない)。 */
@@ -908,55 +1307,207 @@ esp_err_t gbac_sd_speedtest(int mb)
     }
     memset(buf, 0x5a, (size_t)CH);
 
-    char path[64];
-    snprintf(path, sizeof(path), "%s/SPEED.BIN", SD_BASE);
-    unlink(path);
-    FILE *f = fopen(path, "wb");
-    if (!f) {
+    /* stdio 経由だと FRESULT が errno に潰されて、ディスク層のエラーなのか
+     * FatFs の内部エラーなのか区別できない。FatFs の API を直接呼ぶ。 */
+    FIL fl;
+    FRESULT fr = f_open(&fl, "0:/SPEED.BIN", FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
         free(buf);
-        ESP_LOGE(TAG, "%s を作れない", path);
+        ESP_LOGE(TAG, "f_open 失敗 fr=%d", (int)fr);
         return ESP_FAIL;
     }
 
     int64_t t0 = esp_timer_get_time();
     int wrote = 0;
-    for (int i = 0; i < mb; i++) {
-        if (fwrite(buf, 1, (size_t)CH, f) != (size_t)CH) {
+    int n = mb * 8;                 /* 1 回 128KB なので mb MB には 8 倍必要 */
+    UINT bw = 0;
+    for (int i = 0; i < n; i++) {
+        fr = f_write(&fl, buf, (UINT)CH, &bw);
+        if (fr != FR_OK || bw != (UINT)CH) {
             int64_t e = esp_timer_get_time();
-            ESP_LOGE(TAG, "書き込み失敗 %dMB目 %.1fMB/s errno=%d pos=%lld", i,
+            ESP_LOGE(TAG, "f_write 失敗 %d回目=%.2fMB %.1fMB/s fr=%d wrote=%u pos=%llu fp.err=%d fp.clust=%u",
+                     i, (double)((int64_t)i * CH) / 1048576.0,
                      (double)wrote * CH / 1e6 / ((double)(e - t0) / 1e6),
-                     errno, (long long)ftell(f));
-            fclose(f);
+                     (int)fr, bw, (unsigned long long)f_tell(&fl), (int)fl.err,
+                     (unsigned)fl.clust);
+            uint32_t ws = fat_dump_state();
+            if (ws) {
+                /* 壊れている疑いのある FAT セクタと、その前後を実カードから読む */
+                fat_sector_probe(ws);
+                fat_sector_probe(ws + 1);
+                fat_sector_probe(ws - 1);
+            }
+            ESP_LOGE(TAG, "f_close fr=%d", (int)f_close(&fl));
             free(buf);
             return ESP_FAIL;
         }
         wrote++;
-        if ((wrote & 3) == 0) {
+        if ((wrote & 15) == 0) {
             int64_t e = esp_timer_get_time();
-            ESP_LOGI(TAG, "SD 書込 %dMB %.1fMB/s", wrote,
+            ESP_LOGI(TAG, "SD 書込 %.1fMB %.1fMB/s",
+                     (double)((int64_t)wrote * CH) / 1048576.0,
                      (double)wrote * CH / 1e6 / ((double)(e - t0) / 1e6));
         }
     }
     int64_t tw = esp_timer_get_time();
-    fclose(f);
+    fr = f_sync(&fl);
+    int64_t ts = esp_timer_get_time();
+    fr = f_close(&fl);
     int64_t tf = esp_timer_get_time();
-    ESP_LOGI(TAG, "SD 書込 %dMB %.1fMB/s  fclose に %.0fms", wrote,
+    ESP_LOGI(TAG, "SD 書込 %.1fMB %.1fMB/s  sync %.0fms(fr=%d) close %.0fms(fr=%d)",
+             (double)((int64_t)wrote * CH) / 1048576.0,
              (double)wrote * CH / 1e6 / ((double)(tw - t0) / 1e6),
-             (double)(tf - tw) / 1000.0);
+             (double)(ts - tw) / 1000.0, (int)fr,
+             (double)(tf - ts) / 1000.0, (int)fr);
 
     /* 読み戻し。マウントの読み側と FAT の状態も見る */
-    f = fopen(path, "rb");
-    if (!f) {
+    fr = f_open(&fl, "0:/SPEED.BIN", FA_READ);
+    if (fr != FR_OK) {
+        ESP_LOGE(TAG, "読み戻しの f_open 失敗 fr=%d", (int)fr);
+        /* ルートディレクトリを直接数えて、目录エントリが残っているか見る。
+         * 書いた直後に消えているなら、目录エントリの書き込みが飛んでいる。 */
+        FATFS *fs2 = NULL;
+        DWORD nclst2 = 0;
+        ESP_LOGE(TAG, "f_getfree fr=%d", (int)f_getfree("0:", &nclst2, &fs2));
+        FILINFO *fi = malloc(sizeof(FILINFO));
+        if (fi) {
+            FRESULT fr2 = f_stat("0:/SPEED.BIN", fi);
+            ESP_LOGE(TAG, "f_stat SPEED.BIN fr=%d size=%lld", (int)fr2,
+                     (long long)fi->fsize);
+            free(fi);
+        }
+        /* POSIX 側からも数える(FatFs 側だけ見えないのかを見る) */
+        DIR *d = opendir(SD_BASE);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                ESP_LOGE(TAG, "  root: %s", e->d_name);
+            }
+            closedir(d);
+        } else {
+            ESP_LOGE(TAG, "opendir %s 失敗", SD_BASE);
+        }
+        fat_dump_state();
         free(buf);
         return ESP_FAIL;
     }
     int64_t r0 = esp_timer_get_time();
-    size_t got = fread(buf, 1, (size_t)CH, f);
+    f_read(&fl, buf, (UINT)CH, &bw);
     int64_t r1 = esp_timer_get_time();
-    fclose(f);
-    ESP_LOGI(TAG, "SD 先頭 %dKB 読み %.1fMB/s", (int)got / 1024,
-             (double)got / 1e6 / ((double)(r1 - r0) / 1e6));
+    f_close(&fl);
+    ESP_LOGI(TAG, "SD 先頭 %dKB 読み %.1fMB/s", (int)bw / 1024,
+             (double)bw / 1e6 / ((double)(r1 - r0) / 1e6));
     free(buf);
+    return ESP_OK;
+}
+
+/* FatFs を通さず、カードの生セクタへ直接 mb MB 書いて読み戻して比べる。
+ * カードそのものが壊れているのか、FatFs のせいなのかを切り分けるため。
+ * 書き込む場所は既定で 1GB 地点(データ領域の後ろの方)。FAT 表は触らないが、
+ * その場所にあったファイルは壊れる。試した後は 'F' で作り直すこと。 */
+esp_err_t gbac_sd_rawtest(int mb, int start_mb)
+{
+    if (!g_card) {
+        ESP_LOGE(TAG, "SD がマウントされていない");
+        return ESP_FAIL;
+    }
+    if (g_detached) {
+        ESP_LOGE(TAG, "PC に SD を見せている最中。生セクタテストはできない('m' で戻す)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_task) {
+        ESP_LOGE(TAG, "録画中。先に 't' で止める");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (mb < 1) {
+        mb = 1;
+    }
+    if (start_mb < 1) {
+        start_mb = 1;
+    }
+    const int CH = 128 * 1024;
+    const uint32_t SEC_PER_CH = CH / 512;      /* 256 セクタ */
+    uint8_t *w = heap_caps_malloc((size_t)CH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *r = heap_caps_malloc((size_t)CH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!w || !r) {
+        free(w);
+        free(r);
+        ESP_LOGE(TAG, "生セクタテストの %dKB×2 が確保できない", CH / 1024);
+        return ESP_ERR_NO_MEM;
+    }
+    uint64_t base = (uint64_t)start_mb * 2048;  /* 1MB = 512B × 2048 */
+    int n = mb * 8;                             /* 128KB × n */
+    if (base + (uint64_t)n * SEC_PER_CH > g_card->csd.capacity) {
+        free(w);
+        free(r);
+        ESP_LOGE(TAG, "範囲外: %llu+%d セクタ > カード %u セクタ",
+                 (unsigned long long)base, n * (int)SEC_PER_CH, (unsigned)g_card->csd.capacity);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    ESP_LOGI(TAG, "生セクタ書込 %dMB @%dMB 地点(カード %u セクタ)", mb, start_mb,
+             (unsigned)g_card->csd.capacity);
+
+    int64_t t0 = esp_timer_get_time();
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < CH; j++) {
+            w[j] = (uint8_t)((i * 131 + j * 3 + 0x5a) & 0xff);
+        }
+        esp_err_t err = sdmmc_write_sectors(g_card, w, (size_t)(base + (uint64_t)i * SEC_PER_CH),
+                                            SEC_PER_CH);
+        if (err != ESP_OK) {
+            int64_t e = esp_timer_get_time();
+            ESP_LOGE(TAG, "生セクタ書込 失敗 %dMB目(%d回目) %s %.1fMB/s",
+                     (i * CH) >> 20, i, esp_err_to_name(err),
+                     (double)i * CH / 1e6 / ((double)(e - t0) / 1e6));
+            free(w);
+            free(r);
+            return err;
+        }
+    }
+    int64_t tw = esp_timer_get_time();
+    ESP_LOGI(TAG, "生セクタ書込 %dMB %.1fMB/s", mb,
+             (double)n * CH / 1e6 / ((double)(tw - t0) / 1e6));
+
+    int bad = 0, first_i = -1, first_off = -1, first_exp = 0, first_act = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < CH; j++) {
+            w[j] = (uint8_t)((i * 131 + j * 3 + 0x5a) & 0xff);
+        }
+        esp_err_t err = sdmmc_read_sectors(g_card, r, (size_t)(base + (uint64_t)i * SEC_PER_CH),
+                                           SEC_PER_CH);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "生セクタ読込 失敗 %dMB目(%d回目) %s", (i * CH) >> 20, i,
+                     esp_err_to_name(err));
+            free(w);
+            free(r);
+            return err;
+        }
+        if (memcmp(w, r, (size_t)CH) != 0) {
+            int j = 0;
+            while (j < CH && w[j] == r[j]) {
+                j++;
+            }
+            if (first_i < 0) {
+                first_i = i;
+                first_off = j;
+                first_exp = w[j];
+                first_act = r[j];
+            }
+            bad++;
+        }
+    }
+    int64_t tr = esp_timer_get_time();
+    ESP_LOGI(TAG, "生セクタ読込 %dMB %.1fMB/s  不一致 %d/%d 個", mb,
+             (double)n * CH / 1e6 / ((double)(tr - tw) / 1e6), bad, n);
+    if (bad) {
+        ESP_LOGE(TAG, "最初の不一致 %dMB目(%d回目) 内 %d バイト目 期待=%02x 実際=%02x",
+                 (first_i * CH) >> 20, first_i, first_off, first_exp, first_act);
+        free(w);
+        free(r);
+        return ESP_FAIL;
+    }
+    free(w);
+    free(r);
     return ESP_OK;
 }
 
