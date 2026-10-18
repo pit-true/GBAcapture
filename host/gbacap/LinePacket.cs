@@ -3,17 +3,20 @@ using System.Buffers.Binary;
 namespace GbaCap;
 
 /// <summary>
-/// USB ラインパケット v3 (484B):
-/// [0xA5][フレーム番号][ライン番号u16LE][サンプル240×u16LE]
+/// USB ラインパケット v3 (FW v0.34 から 512B。中身 484B + 詰め物 28B):
+/// [0xA5][フレーム番号][ライン番号u16LE][サンプル240×u16LE][0×28]
+/// 512B はバルク EP の最大パケット長ちょうどで、ショートパケットにならない。
+/// 受け手は大きな転送でまとめて受け取れる(ESP32-P4 のホスト負荷を減らすため)。
 /// サンプルは FW が赤下位2bitを bit2/bit6 に合成済みの15bit値。
 /// </summary>
 public sealed record LinePacket(byte FrameNo, ushort LineNo, ushort[] Samples)
 {
     public const byte Magic = 0xA5;
     public const int SamplesPerLine = 240;
-    public const int PacketSize = 4 + SamplesPerLine * 2; // 484
+    public const int PayloadSize = 4 + SamplesPerLine * 2; // 484
+    public const int PacketSize = 512; // 484 + 詰め物 28
 
-    /// <summary>484Bのラインパケットを解析する。マジック不一致は null。サイズ不正は例外。</summary>
+    /// <summary>512Bのラインパケットを解析する。マジック不一致は null。サイズ不正は例外。</summary>
     public static LinePacket? Parse(ReadOnlySpan<byte> data)
     {
         if (data.Length != PacketSize)

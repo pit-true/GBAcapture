@@ -4,13 +4,13 @@ namespace GbaCap.Tests;
 
 // USB ラインパケット v3 解析のテスト。
 //   ヘッダ4B: マジック 0xA5, フレーム番号 uint8, ライン番号 uint16(LE)
-//   ペイロード: 240 サンプル × uint16(LE) = 480B、計 484B
+//   ペイロード: 240 サンプル × uint16(LE) = 480B、計 484B + 詰め物 28B = 512B(FW v0.34)
 public class LinePacketTests
 {
     private static byte[] MakePacket(byte frameNo = 0, ushort lineNo = 0, ushort[]? samples = null)
     {
         samples ??= new ushort[240];
-        var data = new byte[4 + samples.Length * 2];
+        var data = new byte[LinePacket.PacketSize];
         data[0] = 0xA5;
         data[1] = frameNo;
         data[2] = (byte)(lineNo & 0xFF);
@@ -24,9 +24,10 @@ public class LinePacketTests
     }
 
     [Fact]
-    public void パケットサイズは484バイト()
+    public void パケットサイズは512バイトで中身は484バイト()
     {
-        Assert.Equal(484, LinePacket.PacketSize);
+        Assert.Equal(512, LinePacket.PacketSize);
+        Assert.Equal(484, LinePacket.PayloadSize);
     }
 
     [Fact]

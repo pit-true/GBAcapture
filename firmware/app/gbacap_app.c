@@ -13,7 +13,17 @@
 #include "hsusb_v30x.h"
 #include "hsusb_v30x.c"
 
-#define FW_VERSION 33     // v0.33: SPLでライン0を特定しアンカー補正 (ダミーライン対策)
+#define FW_VERSION 34     // v0.34: パケットを 512B に詰め物 (ホストの転送回数を減らす)
+// v0.33: SPLでライン0を特定しアンカー補正 (ダミーライン対策)
+
+// 全パケット(映像・音声・'L' 応答)は 512 バイト = 中身 484B + 詰め物 28B(0)。
+// 484B のままだと毎パケットがショートパケットになり、ホスト側は 1 パケットごとに
+// 転送完了の割り込みを受ける(1 万回/秒)。ESP32-P4 ではそれが core0 の 6〜7 割を
+// 食っていた(2026-10-18 実測)。512B = バルク EP の最大パケット長ちょうどなので
+// ショートパケットにならず、ホストは 4KB・8KB の転送でまとめて受け取れる。
+// 受け手(PC ビューア・CLI・ESP32-P4)はマジックで切り出すので中身の並びは v3 のまま。
+#define PKT_BYTES 512
+#define PKT_PAYLOAD 484
 #define IAP_MAGIC  0x424C // "BL" — firmware/iap/iap.c と一致させること
 
 // --- M1: GBA信号計測 ---
@@ -530,7 +540,7 @@ static void AudioAdcInit( void )
 //   音声 = EP3 専用 (パケット順序が保証される。複数EPに撒くと順序が壊れ音割れする)
 // 1EPあたり実効~3.3MB/s(NAK後のホスト再ポーリングがマイクロフレーム単位のため)
 static const uint8_t k_stream_eps[3] = { 4, 1, 3 };
-static uint8_t g_eptx[3][484];
+static uint8_t g_eptx[3][PKT_BYTES]; // 詰め物 28B は static の 0 のまま
 static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 {
 	for( int k = 0; k < 2; k++ ) // 映像は EP4/EP1 のみ
@@ -553,13 +563,13 @@ static int TrySendLine( uint8_t frame, uint16_t line_no, uint32_t cbase )
 		}
 		// UEPn_TX_DMA は UEP1 から連続配置
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
-		USBHS_SendEndpoint( ep, 484, 0 );
+		USBHS_SendEndpoint( ep, PKT_BYTES, 0 );
 		return 0;
 	}
 	return -1;
 }
 
-// 音声パケット (484B): [0xA6][seq][ペア数=48][0] + 32.8kHz L,R交互 u16(ADC生) + 0詰め
+// 音声パケット (512B、中身 484B): [0xA6][seq][ペア数=48][0] + 32.8kHz L,R交互 u16(ADC生) + 0詰め
 // 327.68kHzで取った10サンプル(=キャリア1周期)を平均して32.8kHz化
 static int TrySendAudio( void )
 {
@@ -589,13 +599,13 @@ static int TrySendAudio( void )
 		}
 		g_aud_sent += 960; // 消費: 480ペア = 960サンプル
 		( (volatile uint32_t *)&USBHSD->UEP1_TX_DMA )[ep - 1] = (uintptr_t)pkt;
-		USBHS_SendEndpoint( ep, 484, 0 );
+		USBHS_SendEndpoint( ep, PKT_BYTES, 0 );
 		return 0;
 	}
 	return -1;
 }
 
-// ラインパケット v3 (484B): [0xA5][frame][line u16][240×u16]
+// ラインパケット v3 (512B、中身 484B): [0xA5][frame][line u16][240×u16]
 // u16 の空きビットに赤下位2bitを合成する: bit2=LDR1(赤bit0), bit6=LDR2(赤bit1)
 // (GPIOB実配線で bit2/6/7 は未使用。これで1ライン=バルク1パケットに収まり帯域半減)
 static void BuildLinePacket( uint8_t * pkt, uint8_t frame, uint16_t line_no, int slot )
@@ -611,7 +621,7 @@ static void BuildLinePacket( uint8_t * pkt, uint8_t frame, uint16_t line_no, int
 }
 
 // 'L': ラインキャプチャ。"GBAC"+'L'+pad1+u16開始ライン+u16ライン数(≤32)
-// 成功: ラインパケットv3 (484B) × ライン数 / 失敗: 8B応答 {..'l', status, filled, line}
+// 成功: ラインパケットv3 (512B) × ライン数 / 失敗: 8B応答 {..'l', status, filled, line}
 static void HandleCaptureCmd( const uint8_t * cmd )
 {
 	uint16_t start, count;
@@ -646,14 +656,14 @@ static void HandleCaptureCmd( const uint8_t * cmd )
 		return;
 	}
 
-	static uint8_t pkt[484];
+	static uint8_t pkt[PKT_BYTES]; // 詰め物は 0 のまま
 	uint8_t frame = (uint8_t)g_sps_count;
 	for( int i = 0; i < count; i++ )
 	{
 		BuildLinePacket( pkt, frame, start + i, i );
 		// 注意: g_txpkt に直接組み立ててはならない（前パケット送信中に上書きされ
 		// 全パケットが1本ズレるバグの原因だった）。ステージング経由で送る
-		if( SendEp4( pkt, 484 ) ) return;
+		if( SendEp4( pkt, PKT_BYTES ) ) return;
 	}
 }
 
