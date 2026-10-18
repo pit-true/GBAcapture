@@ -110,77 +110,97 @@ static void bench_fill(uint16_t *dst, int n)
     }
 }
 
-/* ---- scale=4 のときだけ PSRAM への書き出しを GDMA に逃がす(2026-10-18) ----
+/* ---- PSRAM への書き出しを GDMA に逃がす(2026-10-18) ----
  * r91 実測: esp_async_memcpy(AXI-GDMA)で internal→PSRAM を 921,600B 送る時間は
  *   5,760B 刻み ×160 = 19.91ms(46MB/s)  ← 1 個あたりのオーバーヘッドが大きい
  *  23,040B 刻み ×40  =  5.71ms(161MB/s) ← ここから頭打ち
  * で、CPU memcpy(10.48ms)より 23,040B 刻みが速い。よって元行 4 本ぶん(23,040B)を
  * internal RAM の段に組み、それを DMA で PSRAM へ送る。
- * 段は n 個を循環。前回その段を使った DMA(= n-1 個前の発行)が
- * 終わるのを待ってから組み直す。発行の直前に「残り n-2 個以下」まで待てば、
- * 次の組み立て先(n-1 個前に使った段)の DMA は必ず終わっている。
+ * 段は n 個を循環。次に組む段は n 回前の発行で使った段なので、発行の直前に
+ * 「飛んでいる数が n-2 以下」になるまで待てば、その段の DMA は終わっている。
  * ドライバは source のキャッシュ writeback(C2M)と、dst のキャッシュライン
  * 境界外部分の退避を自分でやる(async_memcpy_gdma.c 374〜411 行)。
  *
- * 既定の scale=2 でも段を使う(2026-10-18)。CPU が PSRAM へ直接書くと 1 枚
- * 2.6ms(ベンチ実測)で、録画中は core1 の 16% にあたる。core1 は aac と拡大で
- * 埋まりかけているので、この書き出しを GDMA に逃がして CPU を空ける。
- * 2 倍は元行 8 本ぶん(11,520B)を 1 回の flush にする(5,760B 刻みだと DMA の
- * 固定費で半分の速さ。r91)。段 4 個 = 46KB の internal。 */
+ * 2 倍(既定): 1 組 4 段(11,520B = 元行 8 本)。CPU が PSRAM へ直接書くと 1 枚
+ * 2.6ms(ベンチ実測)で、録画中は core1 の 16% にあたるので DMA に逃がす。
+ *
+ * 4 倍: 上半分(元行 0〜79)を core0 の scale タスク、下半分(80〜159)を core1 の
+ * scale_b タスクが同時に組む。1 本だと拡大 16.6ms/枚で core0 を使い切り 57.5fps
+ * だった(2026-10-18 t12)。段と DMA チャネルと待ちは組ごとに持つ。
+ * 1 組 2 段(23,040B)。組み立て(約 245us/4 行)が DMA(143us)より長いので、
+ * 2 段あれば組み立てと DMA が重なる。2 組で 92KB の internal。 */
 #define STG_BYTES_X4 (GBAC_OUYY_STRIDE(GBAC_WIDTH, 4) * 4 * 4) /* 23040 */
 #define STG_BYTES_X2 (GBAC_OUYY_STRIDE(GBAC_WIDTH, 2) * 2 * 8) /* 11520 */
-#define STG_N 4
-static uint8_t *g_stg[STG_N];
-static int g_stg_n;
+#define STG_N_X2   4
+#define STG_N_X4   2
+#define STG_N_MAX  4
+#define SCALE_SETS 2
+#define SCALE_HALF (GBAC_HEIGHT / 2)   /* 80。4 の倍数なので 4 元行組で割れる */
+
+typedef struct {
+    uint8_t *stg[STG_N_MAX];
+    int n;
+    async_memcpy_handle_t mcp;
+    SemaphoreHandle_t sem;
+    volatile int issue;
+    volatile int done;
+    gbac_scale_ctx_t ctx;
+    int64_t prof[4];
+} scale_set_t;
+static scale_set_t g_ss[SCALE_SETS];
 static size_t g_stg_bytes;
-static async_memcpy_handle_t g_mcp;
-static SemaphoreHandle_t g_dma_sem;
-static volatile int g_dma_issue;
-static volatile int g_dma_done;
+static int g_split;                 /* 4 倍で 2 組そろったら 1 */
 /* 完了コールバックが載るコア。ISR でログは出せないので変数だけ置いて
  * 後でタスク側から印字する。 */
 static volatile int g_dma_isr_core = -99;
+/* 上下分割の受け渡し。scale が枠を置いて g_job_sem を与え、scale_b は下半分を
+ * 組んで g_join_sem を返す。scale は join を取るまで次の枠を作らない。 */
+static SemaphoreHandle_t g_job_sem;
+static SemaphoreHandle_t g_join_sem;
+static const uint16_t *g_job_px;
+static uint8_t *g_job_dst;
+static TaskHandle_t g_scale_task_b;
 
 static bool dma_done_cb(async_memcpy_handle_t h, async_memcpy_event_t *e, void *arg)
 {
     (void)h;
     (void)e;
-    (void)arg;
+    scale_set_t *s = (scale_set_t *)arg;
     g_dma_isr_core = (int)xPortGetCoreID();
-    g_dma_done++;
+    s->done++;
     BaseType_t hp = pdFALSE;
-    xSemaphoreGiveFromISR(g_dma_sem, &hp);
+    xSemaphoreGiveFromISR(s->sem, &hp);
     return hp == pdTRUE;
 }
 
-/* gbac_scale が 4 元行ぶんを組み終えるたびに呼ばれる */
-static void dma_flush(uint8_t *dst, const uint8_t *stage, size_t n)
+/* gbac_scale が元行の組を段に組み終えるたびに呼ばれる */
+static void dma_flush_set(scale_set_t *s, uint8_t *dst, const uint8_t *stage, size_t n)
 {
-    while (g_dma_issue - g_dma_done >= g_stg_n - 2) {
-        if (xSemaphoreTake(g_dma_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+    while (s->issue - s->done >= s->n - 1) {
+        if (xSemaphoreTake(s->sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
             ESP_LOGW(TAG, "DMA 完了待ちが 200ms 超過");
             break;
         }
     }
-    if (g_mcp == NULL || esp_async_memcpy(g_mcp, dst, (void *)stage, n, dma_done_cb, NULL) != ESP_OK) {
+    if (s->mcp == NULL || esp_async_memcpy(s->mcp, dst, (void *)stage, n, dma_done_cb, s) != ESP_OK) {
         memcpy(dst, stage, n); /* 発行に失敗したらその場で CPU が書く */
         g_errs++;
     } else {
-        g_dma_issue++;
+        s->issue++;
     }
 }
 
-/* 1 枚ぶん全部が PSRAM に乗るまで待つ(enc が読み始める前に必要) */
-static void dma_finish(void)
+/* この組の分が全部 PSRAM に乗るまで待つ(enc が読み始める前に必要) */
+static void dma_finish_set(scale_set_t *s)
 {
     static bool isr_core_logged;
     if (!isr_core_logged && g_dma_isr_core >= 0) {
         isr_core_logged = true;
         ESP_LOGI(TAG, "DMA 完了 ISR は core%d で動いている", g_dma_isr_core);
     }
-    while (g_dma_done < g_dma_issue) {
-        if (xSemaphoreTake(g_dma_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+    while (s->done < s->issue) {
+        if (xSemaphoreTake(s->sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
             ESP_LOGE(TAG, "DMA 完了待ちが 200ms 超過。枚を捨てる");
             break;
@@ -188,10 +208,28 @@ static void dma_finish(void)
     }
 }
 
+static void dma_flush_a(uint8_t *d, const uint8_t *stg, size_t n) { dma_flush_set(&g_ss[0], d, stg, n); }
+static void dma_flush_b(uint8_t *d, const uint8_t *stg, size_t n) { dma_flush_set(&g_ss[1], d, stg, n); }
+static void dma_finish_a(void) { dma_finish_set(&g_ss[0]); }
+static void dma_finish_b(void) { dma_finish_set(&g_ss[1]); }
+
+/* 内訳カウンタは組ごとに別。既定の作業台(2 倍・ベンチ)と足し合わせる */
+static int64_t prof_sum(int i)
+{
+    int64_t v = gbac_scale_prof[i];
+    for (int k = 0; k < SCALE_SETS; k++) {
+        v += g_ss[k].prof[i];
+    }
+    return v;
+}
+
 static void prof_zero_all(void)
 {
     for (int i = 0; i < 4; i++) {
         gbac_scale_prof[i] = 0;
+        for (int k = 0; k < SCALE_SETS; k++) {
+            g_ss[k].prof[i] = 0;
+        }
     }
 }
 
@@ -208,39 +246,60 @@ static void dma_stage_setup(int scale)
         ESP_LOGI(TAG, "scale=%d は PSRAM へ CPU 直書き。段も GDMA も作らない", scale);
         return;
     }
-    for (int i = 0; i < STG_N; i++) {
-        g_stg[i] = heap_caps_aligned_alloc(64, g_stg_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        if (g_stg[i] == NULL) {
-            break;
-        }
-        g_stg_n = i + 1;
-    }
-    if (g_stg_n < 2) {
-        for (int i = 0; i < STG_N; i++) {
-            if (g_stg[i] != NULL) {
-                heap_caps_free(g_stg[i]);
-                g_stg[i] = NULL;
+    const int nsets = (scale == 4) ? SCALE_SETS : 1;
+    const int nstg = (scale == 4) ? STG_N_X4 : STG_N_X2;
+    for (int k = 0; k < nsets; k++) {
+        scale_set_t *s = &g_ss[k];
+        for (int i = 0; i < nstg; i++) {
+            s->stg[i] = heap_caps_aligned_alloc(64, g_stg_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            if (s->stg[i] == NULL) {
+                break;
             }
+            s->n = i + 1;
         }
-        g_stg_n = 0;
-        ESP_LOGW(TAG, "段が 2 個取れない。CPU が直接書く");
-        return;
+        if (s->n < 2) {
+            for (int i = 0; i < STG_N_MAX; i++) {
+                if (s->stg[i] != NULL) {
+                    heap_caps_free(s->stg[i]);
+                    s->stg[i] = NULL;
+                }
+            }
+            s->n = 0;
+            ESP_LOGW(TAG, "組 %d の段が 2 個取れない", k);
+            continue;
+        }
+        s->sem = xSemaphoreCreateCounting(16, 0);
+        async_memcpy_config_t ac = ASYNC_MEMCPY_DEFAULT_CONFIG();
+        ac.backlog = 8;
+        ac.dma_burst_size = 128;
+        esp_err_t e = esp_async_memcpy_install_gdma_axi(&ac, &s->mcp);
+        if (e != ESP_OK) {
+            e = esp_async_memcpy_install_gdma_ahb(&ac, &s->mcp);
+        }
+        if (e != ESP_OK) {
+            s->mcp = NULL;   /* DMA が飛べなければ CPU がその場で書く */
+        }
+        s->issue = s->done = 0;
+        s->ctx.prof = s->prof;   /* ctx_set より先に置く(ctx_set は NULL のときだけ埋める) */
+        gbac_scale_ctx_set(&s->ctx, s->stg, s->n, g_stg_bytes,
+                           (k == 0) ? dma_flush_a : dma_flush_b,
+                           (k == 0) ? dma_finish_a : dma_finish_b);
+        gbac_scale_ctx_raw(&s->ctx, 1);   /* 枠は nano のサンプルそのまま */
     }
-    g_dma_sem = xSemaphoreCreateCounting(16, 0);
-    async_memcpy_config_t ac = ASYNC_MEMCPY_DEFAULT_CONFIG();
-    ac.backlog = 8;
-    ac.dma_burst_size = 128;
-    esp_err_t e = esp_async_memcpy_install_gdma_axi(&ac, &g_mcp);
-    if (e != ESP_OK) {
-        e = esp_async_memcpy_install_gdma_ahb(&ac, &g_mcp);
+    g_split = (scale == 4 && g_ss[0].n >= 2 && g_ss[1].n >= 2);
+    if (g_split) {
+        g_job_sem = xSemaphoreCreateBinary();
+        g_join_sem = xSemaphoreCreateBinary();
     }
-    if (e != ESP_OK) {
-        g_mcp = NULL;   /* DMA が飛べなければ CPU がその場で書く */
+    if (g_ss[0].n >= 2) {
+        /* 分割しないときは既定の作業台に組 0 の段を渡す(gbac_scale_ouyy_raw が使う) */
+        gbac_scale_set_stage(g_ss[0].stg, g_ss[0].n, g_stg_bytes, dma_flush_a, dma_finish_a);
+    } else {
+        ESP_LOGW(TAG, "段がないので CPU が直接書く");
     }
-    g_dma_issue = g_dma_done = 0;
-    gbac_scale_set_stage(g_stg, g_stg_n, g_stg_bytes, dma_flush, dma_finish);
-    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(段 %dB x%d、同時 %d、internal free %uKB)",
-             (int)g_stg_bytes, g_stg_n, g_stg_n - 1,
+    ESP_LOGI(TAG, "PSRAM 書き出しは GDMA(分割 %s、段 %dB x%d x%d 組、組あたり同時 %d、internal free %uKB)",
+             g_split ? "上下 2 コア" : "なし", (int)g_stg_bytes, g_ss[0].n, nsets,
+             g_ss[0].n - 1,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }
 
@@ -259,7 +318,7 @@ static void dma_selfcheck(uint8_t *slot, const uint16_t *px)
     }
     gbac_scale_set_stage(NULL, 0, 0, NULL, NULL);   /* CPU が直接書く経路 */
     gbac_scale_ouyy_raw(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, ref);
-    gbac_scale_set_stage(g_stg, g_stg_n, g_stg_bytes, dma_flush, dma_finish);
+    gbac_scale_set_stage(g_ss[0].stg, g_ss[0].n, g_stg_bytes, dma_flush_a, dma_finish_a);
     /* slot は CPU が一度も読んでいないのでキャッシュに無いはずだが、
      * 念のため M2C で無効化してから読む(アドレス・サイズは 64B の倍数) */
     esp_cache_msync(slot, g_yuv_len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
@@ -276,9 +335,34 @@ static void dma_selfcheck(uint8_t *slot, const uint16_t *px)
     prof_zero_all();   /* 確認ぶんを内訳から除外する */
 }
 
+/* 4 倍の下半分(元行 80〜159)を core1 で組むタスク。枠の受け取りと enc への
+ * 受け渡し(= 解放)は scale がやる。 */
+static void scale_task_b(void *arg)
+{
+    (void)arg;
+    uint32_t made = 0;
+    while (g_run) {
+        if (xSemaphoreTake(g_job_sem, pdMS_TO_TICKS(300)) != pdTRUE) {
+            continue;
+        }
+        if (!g_run) {
+            break;
+        }
+        gbac_scale_ouyy_rows(&g_ss[1].ctx, g_job_px, GBAC_WIDTH, GBAC_HEIGHT,
+                             g_scale, g_job_dst, SCALE_HALF, GBAC_HEIGHT);
+        xSemaphoreGive(g_join_sem);
+        made++;
+    }
+    ESP_LOGI(TAG, "スケール B 終了 枚=%u stack 残り=%uB",
+             (unsigned)made, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    g_scale_task_b = NULL;
+    vTaskDeleteWithCaps(NULL);
+}
+
 /* ---- 前段: nano のサンプル -> OUYY 拡大 ----
  * 枠(frame_pipe)は nano のサンプルそのまま。復号と色変換は直引き表 1 回で
- * 済ませる(gbac_scale_ouyy_raw、2026-10-18)。 */
+ * 済ませる(gbac_scale_ouyy_raw、2026-10-18)。4 倍で 2 組そろっていれば
+ * 上半分をここで、下半分を scale_b で同時に組む。 */
 static void scale_task(void *arg)
 {
     (void)arg;
@@ -318,12 +402,24 @@ static void scale_task(void *arg)
         }
 
         int64_t t0 = esp_timer_get_time();
-        gbac_scale_ouyy_raw(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, g_yuv[slot]);
+        if (g_split) {
+            g_job_px = px;
+            g_job_dst = g_yuv[slot];
+            xSemaphoreGive(g_job_sem);
+            gbac_scale_ouyy_rows(&g_ss[0].ctx, px, GBAC_WIDTH, GBAC_HEIGHT, g_scale,
+                                 g_yuv[slot], 0, SCALE_HALF);
+            if (xSemaphoreTake(g_join_sem, pdMS_TO_TICKS(400)) != pdTRUE) {
+                g_errs++;
+                ESP_LOGW(TAG, "scale_b が 400ms 以内に終わらない");
+            }
+        } else {
+            gbac_scale_ouyy_raw(px, GBAC_WIDTH, GBAC_HEIGHT, g_scale, g_yuv[slot]);
+        }
         int64_t t1 = esp_timer_get_time();
         if (!g_bench) {
             frame_pipe_release();
         }
-        if (g_bench && g_mcp != NULL && made == 0) {
+        if (g_bench && g_ss[0].mcp != NULL && made == 0) {
             dma_selfcheck(g_yuv[slot], px);
         }
         if ((uint32_t)(t1 - t0) > g_scale_us_max) {
@@ -450,8 +546,8 @@ static void enc_task(void *arg)
     if (g_bench) {
         const int n = done > 0 ? (int)done : 1;
         ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f",
-                 (double)gbac_scale_prof[0] / n, (double)gbac_scale_prof[1] / n,
-                 (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n);
+                 (double)prof_sum(0) / n, (double)prof_sum(1) / n,
+                 (double)prof_sum(2) / n, (double)prof_sum(3) / n);
     }
     g_task = NULL;
     /* enc のスタックは PSRAM なので WithCaps 用の削除を使う */
@@ -706,7 +802,16 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     prof_zero_all();
     /* 段と GDMA(起動時に済んでいる。失敗していても CPU が書く) */
     dma_stage_setup(cfg->scale);
-    g_dma_issue = g_dma_done = 0;
+    for (int k = 0; k < SCALE_SETS; k++) {
+        g_ss[k].issue = g_ss[k].done = 0;
+    }
+    /* 前の録画で取り残した job の旗を下ろしておく */
+    if (g_job_sem != NULL) {
+        while (xSemaphoreTake(g_job_sem, 0) == pdTRUE) { }
+    }
+    if (g_join_sem != NULL) {
+        while (xSemaphoreTake(g_join_sem, 0) == pdTRUE) { }
+    }
     /* エンコーダは開きっぱなしなので、この録画の 1 枚目を IDR にする。
      * IDR の NAL には SPS+PPS が付くので、muxer はそこから mp4 を始められる。 */
     gbac_enc_force_idr();
@@ -724,8 +829,19 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * スタックは PSRAM(計算だけのタスクなので SD/NVS は呼ばない)。
      * gbac_scale_ouyy だけで約 4.2KB のスタックを使う。実機(2026-10-14)で
      * 4096 バイトだと "Stack protection fault" で落ちたので 12KB にした。 */
-    xTaskCreatePinnedToCoreWithCaps(scale_task, "scale", 12288, NULL, 3, &g_scale_task, 1,
-                                    MALLOC_CAP_SPIRAM);
+    /* nano v0.34(512B パケット)で USB ホストの負荷が core0 の 8% まで下がった
+     * (2026-10-18 t10)。4 倍は拡大が 2 倍の約 2 倍(8〜10ms/枚)で core1 に収まらない
+     * ので core0 に置く。2 倍は実績のある core1 のまま。 */
+    const int scale_core = (g_scale == 4) ? 0 : 1;
+    xTaskCreatePinnedToCoreWithCaps(scale_task, "scale", 12288, NULL, 3, &g_scale_task,
+                                    scale_core, MALLOC_CAP_SPIRAM);
+    if (g_split) {
+        /* 下半分は core1。rx(4)の下、aac(1)の上 */
+        xTaskCreatePinnedToCoreWithCaps(scale_task_b, "scale_b", 12288, NULL, 3, &g_scale_task_b,
+                                        1, MALLOC_CAP_SPIRAM);
+    } else {
+        g_scale_task_b = NULL;
+    }
     /* 後段(エンコード)。esp_h264_enc_process は HW 待ちでブロックするので
      * CPU は常に取り合わない。core1 では rx(4)の下、mux(2)の上の prio3。
      * 2026-10-18 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった
@@ -735,8 +851,8 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * 自己終了は vTaskDeleteWithCaps(NULL) が必須。 */
     xTaskCreatePinnedToCoreWithCaps(enc_task, "enc", 8192, NULL, 3, &g_task, 1,
                                     MALLOC_CAP_SPIRAM);
-    ESP_LOGI(TAG, "タスク表 core/prio: usb_lib 0/22 usbh 0/21 rx 1/4 scale 1/%d enc 1/%d mux 1/2 aac 1/1 (このログを出したタスクは core%d)",
-             g_scale_task ? (int)uxTaskPriorityGet(g_scale_task) : -1,
+    ESP_LOGI(TAG, "タスク表 core/prio: usb_lib 0/22 usbh 0/21 rx 1/4 scale %d/%d enc 1/%d mux 1/2 aac 1/1 (このログを出したタスクは core%d)",
+             scale_core, g_scale_task ? (int)uxTaskPriorityGet(g_scale_task) : -1,
              (int)uxTaskPriorityGet(g_task), (int)xPortGetCoreID());
     ESP_LOGI(TAG, "internal free=%uKB 最大ブロック=%uKB DMA 可=%uKB PSRAM free=%uKB",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -751,13 +867,16 @@ void gbac_enc_stop(void)
     g_run = false;
     /* 前段は frame_pipe_take のタイムアウト(100ms)で一度ループを見て抜ける。
      * 後段は g_yuv_q を空にしてから抜ける。 */
-    for (int i = 0; i < 300 && (g_task != NULL || g_scale_task != NULL); i++) {
+    for (int i = 0; i < 300 && (g_task != NULL || g_scale_task != NULL ||
+                                g_scale_task_b != NULL); i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     /* エンコーダは開きっぱなしにする。close/del すると internal の塊が
      * 断片化して、後で reference frame が取れなくなる。
      * 次回の gbac_enc_start で force_idr するので、mp4 の先頭は IDR のまま。 */
-    g_dma_issue = g_dma_done = 0;
+    for (int k = 0; k < SCALE_SETS; k++) {
+        g_ss[k].issue = g_ss[k].done = 0;
+    }
 }
 
 /* 次のエンコードフレームを IDR にする。mp4 のスライス切り替え時に呼ぶ。
@@ -792,8 +911,8 @@ void gbac_enc_prof_report(void)
 {
     double n = g_frames > 0 ? (double)g_frames : 1.0;
     ESP_LOGI(TAG, "スケール内訳 us/枚 rgb=%.0f y=%.0f uv=%.0f copy=%.0f | 枚=%u scale<=%uus enc<=%uus",
-             (double)gbac_scale_prof[0] / n, (double)gbac_scale_prof[1] / n,
-             (double)gbac_scale_prof[2] / n, (double)gbac_scale_prof[3] / n,
+             (double)prof_sum(0) / n, (double)prof_sum(1) / n,
+             (double)prof_sum(2) / n, (double)prof_sum(3) / n,
              (unsigned)g_frames, (unsigned)g_scale_us_max, (unsigned)g_enc_us_max);
 }
 
