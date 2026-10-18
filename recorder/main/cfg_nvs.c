@@ -16,14 +16,15 @@ static const char *TAG = "cfg";
 #define KEY_SPLIT     "split_min"
 #define KEY_VOLUME    "volume"
 #define KEY_VER       "ver"
-/* 2026-10-18 の仕様変更(録画は 480x320。960x640 への 2 倍は PC の ffmpeg)で 2 へ。
- * NVS に古い値(scale=4, 16000kbps)が入っていても 1 回だけ新しい既定値に寄せる。 */
-#define CFG_VER       2
+/* 既定は 4 倍(960x640、16Mbps)。2026-10-18 夜に nano v0.34 + 上下 2 コア分割で
+ * 4 倍が 59.7fps で録れるようになった(t13)。ver 2 までは 2 倍が既定だったので、
+ * NVS の ver が古ければ 1 回だけ 4 倍へ寄せる。2 倍に戻すにはコンソールの '2'。 */
+#define CFG_VER       3
 
 void gbac_cfg_default(gbac_cfg_t *c)
 {
-    c->scale = 2;
-    c->bitrate_kbps = 8000;
+    c->scale = 4;
+    c->bitrate_kbps = 16000;
     c->split_min = 15;
     c->volume_pct = 100;
 }
@@ -31,10 +32,10 @@ void gbac_cfg_default(gbac_cfg_t *c)
 void gbac_cfg_clamp(gbac_cfg_t *c)
 {
     if (c->scale < 1 || c->scale > 4) {
-        c->scale = 2;
+        c->scale = 4;
     }
     if (c->bitrate_kbps < 1000 || c->bitrate_kbps > 40000) {
-        c->bitrate_kbps = 8000;
+        c->bitrate_kbps = 16000;
     }
     if (c->split_min < 1 || c->split_min > 60) {
         c->split_min = 15;
@@ -85,14 +86,10 @@ void gbac_cfg_load(gbac_cfg_t *c)
 
     gbac_cfg_clamp(c);
     if (ver < CFG_VER) {
-        /* 4 が保存済みでもここでは 2 にする(2026-10-18 の仕様変更)。
-         * 960x640 を直接録画すると 1 枚 921,600 バイトで P4 では重すぎた。
-         * 480x320(230,400 バイト)にすれば 1/4 で、彩度 1 個 = GBA 1 画素。
-         * 960x640 への 2 倍は PC の ffmpeg(recorder/tools)でやる。 */
-        ESP_LOGW(TAG, "設定を移行(ver %d → %d)。scale=%d bitrate=%dkbps",
+        ESP_LOGW(TAG, "設定を移行(ver %d → %d)。scale=%d bitrate=%dkbps → 4x 16000kbps",
                  (int)ver, CFG_VER, (int)c->scale, (int)c->bitrate_kbps);
-        c->scale = 2;
-        c->bitrate_kbps = 8000;
+        c->scale = 4;
+        c->bitrate_kbps = 16000;
         gbac_cfg_save(c);
     }
     ESP_LOGI(TAG, "設定 scale=%d bitrate=%dkbps split=%dmin vol=%d%%",
