@@ -17,10 +17,15 @@ static const char *TAG = "usbnano";
 #define VID_GBAC     0x1209
 #define PID_GBAC     0xC001
 #define EP_CMD_OUT   0x05
-#define XFER_BYTES   512          /* bulk IN の MPS。484B は短_packets で完了する */
-#define RX_PER_EP    32           /* EP 1 本あたりに積み続ける転送数。
-                                   * 8 の実測で毎秒 2.0MB(60fps に必要は 6.9MB)だったので
-                                   * インフライトを増してバスを空けないようにする */
+/* nano FW v0.34 から全パケットが 512B(= バルク EP の最大パケット長)になり、
+ * ショートパケットで転送が切れなくなった。1 転送 4KB(8 パケット)でまとめて受ける。
+ * v0.33 までは 484B のショートパケットごとに転送が完了し、1 万回/秒の完了処理で
+ * usbh タスクと割り込みが core0 の 6〜7 割を食っていた(2026-10-18)。
+ * 転送のバッファは usb_host_transfer_alloc が internal の DMA 可能メモリから取る:
+ * 4KB × 4 本 × 3 EP = 48KB(v0.33 の 512B × 32 × 3 = 48KB と同じ)。
+ * 4 本で 16KB = 3.4ms ぶんが常に飛んでいるので、完了→再投入の遅れでは溢れない。 */
+#define XFER_BYTES   4096
+#define RX_PER_EP    4
 #define MAX_RX_EP    3
 
 static gbac_pkt_cb g_cb;
@@ -60,20 +65,20 @@ static SemaphoreHandle_t g_reply_sem;
 /* nano はパケットを USB の 512B 境界に揃えず、連続したバイト列として流す。
  * なので 1 転送 = 1 パケットでは扱えない(PC 版 ViewerForm.cs の RxLoop と
  * 同じ再組み立てをする)。EP ごとに独立したバッファへ追記し、
- *   [0xA5][frame][line<160][0] → 484B のライン
- *   [0xA6][seq][n 1..120][0]   → 484B の音声
- * に一致する位置から 484B ずつ切り出して上に渡す。違えば 1 バイトずらして
+ *   [0xA5][frame][line<160][0] → 512B のライン(中身 484B)
+ *   [0xA6][seq][n 1..120][0]   → 512B の音声(中身 484B)
+ * に一致する位置から 512B ずつ切り出して上に渡す。違えば 1 バイトずらして
  * 再同期し、端数は先頭へ詰める。転送の完了順は EP 内では保たれる。 */
-#define REASM_BYTES (GBAC_PACKET_SIZE * 12)
+#define REASM_BYTES (XFER_BYTES + GBAC_PACKET_SIZE * 2)
 static uint8_t g_reasm[MAX_RX_EP][REASM_BYTES];
 static int g_reasm_len[MAX_RX_EP];
 static uint32_t g_reasm_lost;   /* バッファ溢れで捨てたバイト数 */
 
-/* 切り出した 484B パケットを渡すリング(SPSC)。
+/* 切り出した 512B パケットを渡すリング(SPSC)。
  * rx_cb(=usbh タスク、core0)はここへコピーするだけにして、ピクセル復号や
  * フレーム書き込みといった重い仕事は core1 の rx タスクでやる。
  * そうしないと usbh が IDLE0 を飢えさせて task_wdt が発火した(実測)。
- * 内部 RAM で 128 枠 = 62KB。14,500 パケット/秒なら約 9 ミリ秒ぶん。 */
+ * 内部 RAM で 128 枠 = 64KB。10,300 パケット/秒なら約 12 ミリ秒ぶん。 */
 #define RXRING_SLOTS 128
 #define RXRING_MASK  (RXRING_SLOTS - 1)
 #define RXRING_WAKE  48    /* これだけ溜まったら rx を tick を待たずに起こす(約 4.6ms ぶん) */

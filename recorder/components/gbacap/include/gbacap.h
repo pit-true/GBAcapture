@@ -11,10 +11,15 @@
 extern "C" {
 #endif
 
-/* ---- パケット共通 (FW v0.33) ---- */
+/* ---- パケット共通 (FW v0.34) ----
+ * 全パケットは 512 バイト = 中身 484B + 詰め物 28B(0)。v0.33 までは 484B だった。
+ * 512B はバルク EP の最大パケット長ちょうどなのでショートパケットにならず、
+ * ホストは 4KB・8KB の転送でまとめて受け取れる(ESP32-P4 の USB ホスト負荷が
+ * 転送回数に比例して core0 の 6〜7 割を食っていた。2026-10-18)。 */
 #define GBAC_LINE_MAGIC 0xA5u
 #define GBAC_AUDIO_MAGIC 0xA6u
-#define GBAC_PACKET_SIZE 484
+#define GBAC_PACKET_SIZE 512
+#define GBAC_PACKET_PAYLOAD 484
 
 /* ---- 映像 ---- */
 #define GBAC_SAMPLES_PER_LINE 240

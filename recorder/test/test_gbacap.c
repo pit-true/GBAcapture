@@ -53,7 +53,8 @@ static void test_line_parse(void) {
   pkt[0] = GBAC_AUDIO_MAGIC;
   OK_EQ(gbac_line_parse(pkt, sizeof(pkt), &ln), 0);
   pkt[0] = GBAC_LINE_MAGIC;
-  OK_EQ(gbac_line_parse(pkt, GBAC_PACKET_SIZE - 2, &ln), 0);
+  OK_EQ(gbac_line_parse(pkt, GBAC_PACKET_PAYLOAD - 2, &ln), 0); /* 中身 484B に満たない */
+  OK_EQ(gbac_line_parse(pkt, GBAC_PACKET_PAYLOAD, &ln), 1);     /* 詰め物なしの v0.33 形式も読める */
   OK_EQ(gbac_line_parse(pkt, 4, &ln), 0);
 }
 
