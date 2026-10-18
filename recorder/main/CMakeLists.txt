@@ -10,6 +10,7 @@ idf_component_register(
         "frame_pipe.c"
         "video_enc.c"
         "sd_recorder.c"
+        "ppa_probe.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         gbacap
@@ -21,6 +22,7 @@ idf_component_register(
         esp_driver_sdmmc
         nvs_flash
         esp_driver_gpio
+        esp_driver_ppa
         esp_driver_uart
         esp_timer
         esp_hw_support

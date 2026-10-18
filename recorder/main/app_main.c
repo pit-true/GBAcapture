@@ -19,6 +19,7 @@
 #include "soc/lp_system_reg.h"
 #include "frame_pipe.h"
 #include "gbacap.h"
+#include "ppa_probe.h"
 #include "sdkconfig.h"
 #include "sd_recorder.h"
 #include "usb_host_nano.h"
@@ -387,6 +388,12 @@ static void uart_cmd_handle(char c)
         gbac_sd_buf_battery();
     } else if (c == 'v') {
         gbac_sd_wrprobe();
+    } else if (c == 'k') {
+        if (g_recording || g_pipe_test) {
+            ESP_LOGW(TAG, "録画中なので PPA プローブは使えない");
+        } else {
+            gbac_ppa_probe();
+        }
     } else if (c == 'F') {
         gbac_sd_format();
     } else if (c == 'd') {
