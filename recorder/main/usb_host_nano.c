@@ -76,30 +76,47 @@ static uint32_t g_reasm_lost;   /* バッファ溢れで捨てたバイト数 */
  * 内部 RAM で 128 枠 = 62KB。14,500 パケット/秒なら約 9 ミリ秒ぶん。 */
 #define RXRING_SLOTS 128
 #define RXRING_MASK  (RXRING_SLOTS - 1)
+#define RXRING_WAKE  48    /* これだけ溜まったら rx を tick を待たずに起こす(約 4.6ms ぶん) */
 static uint8_t g_ring[RXRING_SLOTS][GBAC_PACKET_SIZE] __attribute__((aligned(32)));
 static volatile uint32_t g_wr;
 static volatile uint32_t g_rd;
 static uint32_t g_ring_drop;   /* リングが満杯で捨てたパケット */
 /* リング投入の成否を EP 別・種別(映像/音声)別に数える。
  * r9 で ring の溢れが 6 万パケットを超え、音声の 6 秒分がここで消えている疑い
- * (監督 2026-10-16 02:57 指示)。音声は 683 パケット/秒だけなので、
+ * (2026-10-16)。音声は 683 パケット/秒だけなので、
  * 溢れに巻き込まれる割合を測る。 */
 static uint32_t g_put_ok[MAX_RX_EP];
 static uint32_t g_put_drop[MAX_RX_EP];
 static uint32_t g_put_audio_ok;
 static uint32_t g_put_audio_drop;
 static SemaphoreHandle_t g_ring_sem;
+/* rx タスクが「寝ようとしている」印(2026-10-18)。
+ * 書き手は印が立っているときだけ give する。毎パケット give すると
+ * 1 万回/秒のコア間割り込みになり、usbh(core0)と rx(core1)の両方で
+ * 時間を食っていた。
+ * 「リングが空のときだけ give」では、rx が空を確かめてから寝るまでの間に
+ * 書き手が古い読み位置を見て give を省き、rx が永久に寝た(2026-10-18 t3)。
+ * 印の立て下ろしと読み位置・書き位置の読み書きは SEQ_CST で並べ、
+ * 両方が相手の更新を見落とすことがないようにする。 */
+static volatile int g_rx_sleep;
 
 static int ring_put(const uint8_t *p)
 {
     uint32_t wr = g_wr;   /* 書き手は usbh タスクだけ */
-    if (wr - __atomic_load_n(&g_rd, __ATOMIC_ACQUIRE) >= RXRING_SLOTS) {
+    uint32_t rd = __atomic_load_n(&g_rd, __ATOMIC_ACQUIRE);
+    if (wr - rd >= RXRING_SLOTS) {
         g_ring_drop++;
         return 0;
     }
     memcpy(g_ring[wr & RXRING_MASK], p, GBAC_PACKET_SIZE);
-    __atomic_store_n(&g_wr, wr + 1, __ATOMIC_RELEASE);
-    xSemaphoreGive(g_ring_sem);
+    __atomic_store_n(&g_wr, wr + 1, __ATOMIC_SEQ_CST);
+    /* rx タスク(core1)は 1ms ごとに自分で目を覚ましてまとめて処理する。
+     * ここから起こすのは、rx が寝ていてリングが RXRING_WAKE 個まで溜まったとき
+     * だけ(tick が遅れたときの保険)。毎パケット起こすと 1 万回/秒の
+     * コア間割り込みで rx が core1 の 2 割を使った(2026-10-18 t4)。 */
+    if ((wr + 1 - rd) >= RXRING_WAKE && __atomic_load_n(&g_rx_sleep, __ATOMIC_SEQ_CST)) {
+        xSemaphoreGive(g_ring_sem);
+    }
     return 1;
 }
 
@@ -368,7 +385,14 @@ static void rx_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        xSemaphoreTake(g_ring_sem, portMAX_DELAY);
+        /* 印を立ててからリングを見る。空なら 1 tick(1ms)寝て、溜まったぶんを
+         * まとめて処理する(1ms で約 10 パケット。リングは 9ms ぶんある)。
+         * 書き手は印を見て、リングが RXRING_WAKE 個に達したら早めに起こす。 */
+        __atomic_store_n(&g_rx_sleep, 1, __ATOMIC_SEQ_CST);
+        if (g_rd == __atomic_load_n(&g_wr, __ATOMIC_SEQ_CST)) {
+            xSemaphoreTake(g_ring_sem, 1);
+        }
+        __atomic_store_n(&g_rx_sleep, 0, __ATOMIC_SEQ_CST);
         while (g_rd != __atomic_load_n(&g_wr, __ATOMIC_ACQUIRE)) {
             const uint8_t *p = g_ring[g_rd & RXRING_MASK];
             if (g_cb) {
