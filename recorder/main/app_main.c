@@ -30,6 +30,9 @@ static const char *TAG = "main";
 
 static gbac_cfg_t g_cfg;
 static bool g_recording;
+/* 試験用: 'T' で録画を始めるとこの時刻に自動で止まる(0=使わない)。
+ * 20 秒録画のログは途中でシリアルを開けず 1 回で取れるようにする。 */
+static int64_t g_auto_stop_at;
 
 static uint32_t g_pkt_unk;   /* マジバがどちらでもないパケット */
 static int g_pkt_dbg;        /* 中身を一度だけログに出す回数 */
@@ -259,6 +262,12 @@ static void start_recording(void)
     g_recording = true;
     ESP_LOGI(TAG, "録画開始 scale=%dx %dkbps split=%dmin vol=%d%%",
              (int)g_cfg.scale, (int)g_cfg.bitrate_kbps, (int)g_cfg.split_min, (int)g_cfg.volume_pct);
+    /* 受信が始まった直後の internal RAM。AAC・muxer・enc の確保が終わった後なので、
+     * DMA のステージ(23,040B x2)が足りているかここで見ると切り分けやすい。 */
+    ESP_LOGI(TAG, "録画開始直後 internal free=%uKB 最大=%uKB DMA 可=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) / 1024));
 }
 
 static void stop_recording(void)
@@ -359,6 +368,16 @@ static void uart_cmd_handle(char c)
             stop_recording();
         } else {
             start_recording();
+        }
+    } else if (c == 'T') {
+        if (g_pipe_test || g_recording) {
+            ESP_LOGW(TAG, "すでに動いている");
+        } else {
+            start_recording();
+            if (g_recording) {
+                g_auto_stop_at = esp_timer_get_time() + 20 * 1000 * 1000;
+                ESP_LOGI(TAG, "20 秒たったら自動停止する(試験)");
+            }
         }
     } else if (c == 'e') {
         if (g_pipe_test) {
@@ -466,6 +485,12 @@ void app_main(void)
     }
 #endif
 
+    /* H.264 HW エンコーダと GDMA の internal RAM はここでたしかめておく。
+     * 録画のたびに開くと heap が断片化して reference frame(約 69KB の連続)が
+     * 取れなくなる(2026-10-19 r99/r100 で -3)。 */
+    if (gbac_enc_early_init(&g_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "エンコーダが起動時に開けない。録画のときにリトライする");
+    }
     frame_pipe_init();
     audio_pipe_init(g_cfg.volume_pct);
     gbac_button_init();
@@ -495,6 +520,13 @@ void app_main(void)
                 stop_recording();
             } else {
                 start_recording();
+            }
+        }
+        if (g_auto_stop_at != 0 && esp_timer_get_time() >= g_auto_stop_at) {
+            g_auto_stop_at = 0;
+            ESP_LOGI(TAG, "試験: 指定秒に達したので自動停止する");
+            if (g_recording) {
+                stop_recording();
             }
         }
         if (g_recording && !gbac_usb_ready()) {

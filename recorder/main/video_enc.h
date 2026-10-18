@@ -19,6 +19,10 @@ typedef struct {
 /* bench_frames > 0 のときは USB を使わず、合成パターンを bench_frames 枚
  * エンコードして止める(HW エンコーダの実測用。docs/recorder-plan-esp32p4.md の手順 2)。 */
 esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames);
+/* 起動直後の一番最初に 1 回だけ呼ぶ。H.264 HW エンコーダ(internal RAM に
+ * 約 69KB の連続ブロックが要る)と GDMA のステージを、heap が荒れる前に
+ * 確保しておく。録画のたびに開くと断片化して失敗する(2026-10-19 r99/r100)。 */
+esp_err_t gbac_enc_early_init(const gbac_cfg_t *cfg);
 void gbac_enc_stop(void);
 int gbac_enc_running(void);
 /* まだ muxer に入れていない NAL の数。ベンチの終了判定に使う */

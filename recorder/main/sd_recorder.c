@@ -18,6 +18,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
@@ -26,6 +27,7 @@
 #include "vfs_fat_internal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "gbacap.h"
 #include "esp_aac_enc.h"
 #include "impl/mp4_muxer.h"
@@ -765,6 +767,27 @@ fail:
     return ESP_FAIL;
 }
 
+static void encode_audio(int bytes);
+static int pump_audio(bool flush);
+
+/* AAC 符号化は mux(SD 書き込み)から切り離す。
+ * 2026-10-19 r98 で mux が SD 書き込みで止まっている間 AAC を作れず、
+ * 音声リングが溢れて(ringovf=10662)mp4 の音が 353 本しか入らなかった。
+ * aac タスクは PCM を読み続けて符号化し、mux は出来上がった AAC を
+ * mp4 に足すだけにする。 */
+#define A_QSLOTS 4
+typedef struct {
+    int idx;
+    int len;
+    uint32_t pts;
+} aac_item_t;
+static uint8_t *g_abuf[A_QSLOTS];
+static QueueHandle_t g_aq_free;
+static QueueHandle_t g_aq_full;
+static TaskHandle_t g_aac_task;
+static volatile bool g_aac_run;
+static uint32_t g_a_qdrop;
+
 static void encode_audio(int bytes)
 {
     esp_audio_enc_in_frame_t in = { .buffer = (uint8_t *)g_pcm, .len = (uint32_t)bytes };
@@ -781,32 +804,23 @@ static void encode_audio(int bytes)
     if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes == 0) {
         g_a_zero++;
     }
-    if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && g_muxer) {
+    if (e == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0) {
         /* リング溢れで捨てた分も時間として数える。捨てた分を無視すると
          * 音声の pts が実際の時刻より前にずれ、映像と音がずれる。 */
         uint32_t drop = audio_pipe_dropped_pairs();
         uint32_t ms = (uint32_t)((uint64_t)1000 * (g_audio_samples + drop) / AAC_RATE);
-        esp_muxer_audio_packet_t ap = {
-            .data = g_aacbuf,
-            .len = (int)out.encoded_bytes,
-            .pts = ms,
-        };
-        int64_t tb = esp_timer_get_time();
-        esp_muxer_err_t ae = esp_muxer_add_audio_packet(g_muxer, g_aidx, &ap);
-        uint32_t db = (uint32_t)(esp_timer_get_time() - tb);
-        g_add_a_n++;
-        g_add_a_sum += db;
-        if (db > g_add_a_max) {
-            g_add_a_max = db;
-        }
-        if (ae == ESP_MUXER_ERR_OK) {
-            if (g_apkts == 0) {
-                g_apts_first = ms;
+        aac_item_t it = { .idx = -1, .len = (int)out.encoded_bytes, .pts = ms };
+        if (g_aq_free != NULL &&
+            xQueueReceive(g_aq_free, &it.idx, pdMS_TO_TICKS(20)) == pdTRUE) {
+            memcpy(g_abuf[it.idx], g_aacbuf, (size_t)out.encoded_bytes);
+            if (xQueueSend(g_aq_full, &it, 0) != pdTRUE) {
+                xQueueSend(g_aq_free, &it.idx, 0);
+                g_aerr++;
+                g_a_qdrop++;
             }
-            g_apts_last = ms;
-            g_apkts++;
         } else {
             g_aerr++;
+            g_a_qdrop++;
         }
     } else if (e != ESP_AUDIO_ERR_OK) {
         g_aerr++;
@@ -818,8 +832,9 @@ static void encode_audio(int bytes)
     }
 }
 
-static void pump_audio(bool flush)
+static int pump_audio(bool flush)
 {
+    int made = 0;
     /* mux_task のループは SD 書き込みで 1 回 200ms 止まることもある。
      * 1 回につき AAC を 1 本しか作らないと 46.9 本/秒に足りず、
      * mp4 の音声が数本しか入らない。読み出せるだけ読み出して符号化する。
@@ -841,12 +856,64 @@ static void pump_audio(bool flush)
             break;
         }
         encode_audio(g_in_bytes); /* 余りは encode_audio が先頭へ寄せる */
+        made++;
     }
     if (flush && g_pcm_fill > 0) {
         int have = g_pcm_fill;
         memset((uint8_t *)g_pcm + have, 0, (size_t)(g_in_bytes - have));
         encode_audio(g_in_bytes);
+        made++;
     }
+    return made;
+}
+
+/* mux が AAC を mp4 に足す。符号化は aac タスクがやっている。 */
+static void drain_audio_q(void)
+{
+    aac_item_t it;
+    while (g_muxer && xQueueReceive(g_aq_full, &it, 0) == pdTRUE) {
+        esp_muxer_audio_packet_t ap = {
+            .data = g_abuf[it.idx],
+            .len = it.len,
+            .pts = it.pts,
+        };
+        int64_t tb = esp_timer_get_time();
+        esp_muxer_err_t ae = esp_muxer_add_audio_packet(g_muxer, g_aidx, &ap);
+        uint32_t db = (uint32_t)(esp_timer_get_time() - tb);
+        g_add_a_n++;
+        g_add_a_sum += db;
+        if (db > g_add_a_max) {
+            g_add_a_max = db;
+        }
+        if (ae == ESP_MUXER_ERR_OK) {
+            if (g_apkts == 0) {
+                g_apts_first = it.pts;
+            }
+            g_apts_last = it.pts;
+            g_apkts++;
+        } else {
+            g_aerr++;
+        }
+        xQueueSend(g_aq_free, &it.idx, 0);
+    }
+}
+
+/* PCM を読んで AAC にするタスク。mux は SD 書き込みで 200ms 止まることがあるので、
+ * それに引っ張られないよう別コア(core0)で回す。2026-10-19 r98 の音声欠け対策。 */
+static void aac_task(void *arg)
+{
+    (void)arg;
+    while (g_aac_run) {
+        int n = pump_audio(false);
+        if (n == 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+    pump_audio(true); /* 残った PCM を 1 本にまとめてから抜ける */
+    ESP_LOGI(TAG, "aac タスク終了 stack 残り=%uB",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    g_aac_task = NULL;
+    vTaskDelete(NULL);
 }
 
 /* 下に定義。フォーマット後にもジオメトリを出すので前に必要 */
@@ -1636,8 +1703,8 @@ static void mux_task(void *arg)
             gbac_enc_free(&n);
         }
         if (g_muxer) {
-            mux_mark("pump_audio");
-            pump_audio(false);
+            mux_mark("drain_audio");
+            drain_audio_q();
         }
         /* 5 秒に 1 回、空き容量を見る。250MB は 16Mbps で約 100 秒分。
          * ここで教えたあと app_main が録画を止めて mp4 を正しく閉じる。 */
@@ -1667,7 +1734,13 @@ static void mux_task(void *arg)
     }
     if (g_muxer) {
         int64_t tf = esp_timer_get_time();
-        pump_audio(true);
+        /* aac タスクに残りの PCM を 1 本にまとめさせてから mp4 に足す。
+         * 先に muxer を閉じると足す先がなくなる。 */
+        g_aac_run = false;
+        for (int i = 0; i < 200 && g_aac_task != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        drain_audio_q();
         g_flush_us = (uint32_t)(esp_timer_get_time() - tf);
         int64_t tg = esp_timer_get_time();
         esp_muxer_err_t me = esp_muxer_close(g_muxer);
@@ -1762,10 +1835,16 @@ static esp_err_t aac_open(void)
         .cfg = &ac,
         .cfg_sz = sizeof(ac),
     };
+    uint32_t bi0 = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
     if (esp_audio_enc_open(&cfg, &g_aac) != ESP_AUDIO_ERR_OK) {
         ESP_LOGE(TAG, "AAC エンコーダを開けない");
         return ESP_FAIL;
     }
+    /* コーデック本体の確保量。internal から減っていれば作業バッファが internal、
+     * 減っていなければ PSRAM に落ちている(AAC が遅い原因の候補)。 */
+    ESP_LOGI(TAG, "AAC open で internal %uKB -> %uKB(差分 %uKB)",
+             bi0, (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(bi0 - heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     if (esp_audio_enc_get_frame_size(g_aac, &g_in_bytes, &g_out_bytes) != ESP_AUDIO_ERR_OK) {
         esp_audio_enc_close(g_aac);
         g_aac = NULL;
@@ -1774,22 +1853,51 @@ static esp_err_t aac_open(void)
     /* PCM の部屋は AAC 1 フレーム分の 2 倍。ちょうどの大きさだと
      * (1023 ペアで止まる不具合)読み出しが永久に止まる。 */
     g_pcm_cap = g_in_bytes * 2;
+    /* internal は 960x640 の H264 が 1 本 69KB の連続ブロックを要求するので空けておく。
+     * ここは malloc のまま(2KB 超は PSRAM へ流れる)にして、エンコーダの確保を優先する。 */
     g_pcm = malloc((size_t)g_pcm_cap + 8);
     g_aacbuf = malloc((size_t)g_out_bytes + 64);
     if (!g_pcm || !g_aacbuf) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "AAC in=%d out=%d バイト", g_in_bytes, g_out_bytes);
+    /* aac -> mux の受け渡し。4 枠あれば mux が SD で 200ms 止まっても持てる。 */
+    g_aq_free = xQueueCreate(A_QSLOTS, sizeof(int));
+    g_aq_full = xQueueCreate(A_QSLOTS, sizeof(aac_item_t));
+    if (g_aq_free == NULL || g_aq_full == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < A_QSLOTS; i++) {
+        g_abuf[i] = malloc((size_t)g_out_bytes + 64);
+        if (g_abuf[i] == NULL || xQueueSend(g_aq_free, &i, 0) != pdTRUE) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_LOGI(TAG, "AAC in=%d out=%d バイト、部屋は %s",
+             g_in_bytes, g_out_bytes,
+             esp_ptr_internal(g_pcm) ? "internal" : "PSRAM");
     return ESP_OK;
 }
 
 static void rec_free(void)
 {
+    g_aac_run = false;
     free(g_pcm);
     free(g_aacbuf);
     free(g_avcc);
     g_pcm = NULL;
     g_aacbuf = NULL;
+    for (int i = 0; i < A_QSLOTS; i++) {
+        free(g_abuf[i]);
+        g_abuf[i] = NULL;
+    }
+    if (g_aq_free) {
+        vQueueDelete(g_aq_free);
+        g_aq_free = NULL;
+    }
+    if (g_aq_full) {
+        vQueueDelete(g_aq_full);
+        g_aq_full = NULL;
+    }
     g_avcc = NULL;
     g_avcc_len = 0;
     if (g_aac) {
@@ -1850,10 +1958,20 @@ static esp_err_t rec_start_common(const gbac_cfg_t *cfg, int bench_frames)
         return e;
     }
     g_run = true;
-    /* AAC 符号化 + muxer + FATFS でスタックを使う。enc と同じく 12KB にしておく。
-     * SD 書き込みで core0(USB 受信)を止めないよう、mux は core1 の低優先度。
-     * enc(5) > rx(6) > mux(3) の順で、SD が遅くても受信は落ちない。 */
-    xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 3, &g_task, 1);
+    /* AAC 符号化のタスク。core0 の低優先度で、PCM を読み続けて AAC にする。
+     * mux(core1)の SD 書き込みに引っ張られないため別コアに置く。
+     * 2026-10-19 r98 は mux が止まっている間 AAC が作れず音が欠けた。 */
+    g_aac_run = true;
+    g_aac_task = (TaskHandle_t)1; /* 生成前に NULL と区別できるようにする */
+    if (xTaskCreatePinnedToCore(aac_task, "aac", 8192, NULL, 2, &g_aac_task, 0) != pdPASS) {
+        g_aac_run = false;
+        g_aac_task = NULL;
+        rec_free();
+        return ESP_ERR_NO_MEM;
+    }
+    /* SD 書き込みだけ。AAC は上のタスクが作るので優先度は rx より下でよい。
+     * enc(core0 prio4)より下にして、符号化待ちで enc を止めないようにする。 */
+    xTaskCreatePinnedToCore(mux_task, "mux", 12288, NULL, 2, &g_task, 1);
     return ESP_OK;
 }
 

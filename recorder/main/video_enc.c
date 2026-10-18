@@ -52,6 +52,18 @@ static bool g_bench;
 static volatile int g_bench_left;
 static uint32_t g_frames;
 static uint32_t g_errs;
+/* H264 は internal RAM に約 69KB の連続ブロック(reference frame)を要求する。
+ * 動かしたあとでは internal の最大ブロックが 71KB まで減り、録画のたびに
+ * 開けなくなった(2026-10-19 r99/r100 で "No memory for reference frame" -3)。
+ * そこで起動直後の heap が荒れていないところで 1 回だけ開いて、
+ * 録画ごとは close/del しない(リセットして使い回す)ようにした。
+ * 実際に確保できた internal の一覧は gbac_enc_early_init で 1 回印字する。 */
+static int g_open_scale;
+static int g_open_bitrate;
+/* enc タスクが今どこで止まっているか(録画中に enc が回っていないときの切り分け)。
+ * 0=待機以外 1=g_yuv_q 待ち 2=NAL スロット待ち 3=HW エンコード内 4=out_q 待ち */
+static volatile int g_enc_state;
+static int g_fail_logged;
 static uint32_t g_scale_us_max;
 static uint32_t g_enc_us_max;
 static int g_scale = 4;
@@ -96,11 +108,15 @@ static async_memcpy_handle_t g_mcp;
 static SemaphoreHandle_t g_stg_sem;
 static volatile int g_dma_issue;
 static volatile int g_dma_done;
+/* 完了コールバックが載るコア。ISR でログは出せないので変数だけ置いて
+ * 後でタスク側から印字する(GDMA の ISR が core1 なら mux/enc を踏む)。 */
+static volatile int g_dma_isr_core = -99;
 
 static bool dma_done_cb(async_memcpy_handle_t h, async_memcpy_event_t *e, void *arg)
 {
     (void)h;
     (void)e;
+    g_dma_isr_core = (int)xPortGetCoreID();
     g_dma_done++;
     BaseType_t hp = pdFALSE;
     xSemaphoreGiveFromISR((SemaphoreHandle_t)arg, &hp);
@@ -128,6 +144,11 @@ static void dma_flush(uint8_t *dst, const uint8_t *stage, size_t n)
 /* 1 枚ぶん全部が PSRAM に乗るまで待つ(enc が読み始める前に必要) */
 static void dma_finish(void)
 {
+    static bool isr_core_logged;
+    if (!isr_core_logged && g_dma_isr_core >= 0) {
+        isr_core_logged = true;
+        ESP_LOGI(TAG, "DMA 完了 ISR は core%d で動いている", g_dma_isr_core);
+    }
     while (g_dma_done < g_dma_issue) {
         if (xSemaphoreTake(g_stg_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
@@ -261,6 +282,13 @@ static void scale_task(void *arg)
         yuv_item_t it = { .slot = slot, .pts_us = pts_us };
         if (!xQueueSend(g_yuv_q, &it, 0)) {
             g_errs++;
+            static int qf_logged;
+            if (qf_logged < 5) {
+                qf_logged++;
+                ESP_LOGW(TAG, "g_yuv_q が満杯 %d/5(enc が取りに来ていない) enc_state=%d yuv_q=%u",
+                         qf_logged, (int)g_enc_state,
+                         (unsigned)uxQueueMessagesWaiting(g_yuv_q));
+            }
             xQueueSend(g_yuv_free_q, &slot, 0);
             continue;
         }
@@ -283,6 +311,7 @@ static void enc_task(void *arg)
      * そうしないと録画停止の直前 2 枚が mp4 から消える。 */
     while (g_run || uxQueueMessagesWaiting(g_yuv_q) > 0) {
         yuv_item_t it;
+        g_enc_state = 1;
         if (xQueueReceive(g_yuv_q, &it, pdMS_TO_TICKS(100)) != pdTRUE) {
             continue;
         }
@@ -290,6 +319,7 @@ static void enc_task(void *arg)
         const uint64_t pts_us = it.pts_us;
 
         int nslot = -1;
+        g_enc_state = 2;
         if (xQueueReceive(g_free_q, &nslot, pdMS_TO_TICKS(200)) != pdTRUE) {
             g_errs++;
             xQueueSend(g_yuv_free_q, &slot, 0);
@@ -307,10 +337,16 @@ static void enc_task(void *arg)
         out.raw_data.len = g_encout_len;
 
         int64_t t1 = esp_timer_get_time();
+        g_enc_state = 3;
         esp_h264_err_t e = esp_h264_enc_process(g_enc, &in, &out);
         int64_t t2 = esp_timer_get_time();
+        g_enc_state = 0;
         if ((uint32_t)(t2 - t1) > g_enc_us_max) {
             g_enc_us_max = (uint32_t)(t2 - t1);
+        }
+        if (t2 - t1 > 300000) {
+            ESP_LOGW(TAG, "encode が %lldms かかった(ret=%d)",
+                     (long long)((t2 - t1) / 1000), (int)e);
         }
         /* 入力の YUV はここで読み終わり。HW が cache の書き戻しまで済ませている
          * (esp_h264_enc_single_hw.c:231 で esp_h264_cache_check_and_writeback)。 */
@@ -319,7 +355,14 @@ static void enc_task(void *arg)
         if (e != ESP_H264_ERR_OK) {
             g_errs++;
             xQueueSend(g_free_q, &nslot, 0);
-            ESP_LOGW(TAG, "encode 失敗(%d)", (int)e);
+            if (g_fail_logged < 5) {
+                g_fail_logged++;
+                ESP_LOGW(TAG, "encode 失敗 %d/5 ret=%d slot=%d in=%u out=%u internal free=%uKB 最大=%uKB",
+                         g_fail_logged, (int)e, slot,
+                         (unsigned)in.raw_data.len, (unsigned)out.length,
+                         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                         (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+            }
             continue;
         }
         if ((int)out.length > NAL_SLOT_BYTES) {
@@ -337,18 +380,20 @@ static void enc_task(void *arg)
             .key = (out.frame_type == ESP_H264_FRAME_TYPE_IDR ||
                     out.frame_type == ESP_H264_FRAME_TYPE_I),
         };
+        g_enc_state = 4;
         if (!xQueueSend(g_out_q, &n, 0)) {
             g_errs++;
             xQueueSend(g_free_q, &nslot, 0);
             continue;
         }
+        g_enc_state = 0;
         g_frames++;
         done++;
     }
 
-    ESP_LOGI(TAG, "エンコード終了 frames=%u errs=%u scale_max=%uus enc_max=%uus stack 残り=%uB",
+    ESP_LOGI(TAG, "エンコード終了 frames=%u errs=%u scale_max=%uus enc_max=%uus enc_state=%d stack 残り=%uB",
              (unsigned)g_frames, (unsigned)g_errs,
-             (unsigned)g_scale_us_max, (unsigned)g_enc_us_max,
+             (unsigned)g_scale_us_max, (unsigned)g_enc_us_max, (int)g_enc_state,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
     if (g_bench) {
         const int n = done > 0 ? (int)done : 1;
@@ -360,17 +405,9 @@ static void enc_task(void *arg)
     vTaskDelete(NULL);
 }
 
-esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
+/* PSRAM 側の部屋とキューを作る。録画のたびに作り直さない(断片化避け)。 */
+static esp_err_t pool_alloc(void)
 {
-    if (g_run) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    g_scale = cfg->scale;
-    g_W = GBAC_WIDTH * g_scale;
-    g_H = GBAC_HEIGHT * g_scale;
-    g_yuv_len = GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, g_scale);
-    g_encout_len = g_yuv_len;
-
     if (g_yuv[0] == NULL) {
         /* esp_h264 はエンコード後に出力バッファを
          * esp_cache_msync(..., DIR_M2C) で無効化する。この方向は
@@ -409,6 +446,119 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
     if (g_yuv_free_q == NULL) {
         g_yuv_free_q = xQueueCreate(YUV_SLOTS, sizeof(int));
         g_yuv_q = xQueueCreate(YUV_SLOTS, sizeof(yuv_item_t));
+        if (g_free_q == NULL || g_out_q == NULL || g_yuv_free_q == NULL || g_yuv_q == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+/* H.264 HW エンコーダを開く。internal RAM に約 69KB の連続ブロックが要る。 */
+static esp_err_t enc_open(const gbac_cfg_t *cfg)
+{
+    esp_h264_enc_cfg_t c = { 0 };
+    c.pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY;
+    c.gop = 60;
+    c.fps = 60;
+    c.res.width = (uint16_t)g_W;
+    c.res.height = (uint16_t)g_H;
+    c.rc.bitrate = (uint32_t)cfg->bitrate_kbps * 1000u;
+    c.rc.qp_min = 10;
+    c.rc.qp_max = ESP_H264_QP_MAX;
+
+    esp_h264_err_t e = esp_h264_enc_hw_new(&c, &g_enc);
+    if (e != ESP_H264_ERR_OK) {
+        ESP_LOGE(TAG, "enc_hw_new 失敗(%d) %dx%d internal free=%uKB 最大=%uKB",
+                 (int)e, g_W, g_H,
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+        return ESP_FAIL;
+    }
+    e = esp_h264_enc_open(g_enc);
+    if (e != ESP_H264_ERR_OK) {
+        ESP_LOGE(TAG, "enc_open 失敗(%d)", (int)e);
+        esp_h264_enc_del(g_enc);
+        g_enc = NULL;
+        return ESP_FAIL;
+    }
+    /* IDR を任意の位置で打つためのパラメータハンドル。
+     * mp4 のスライス先頭を IDR にしたいので muxer に教える必要がある。 */
+    e = esp_h264_enc_hw_get_param_hd(g_enc, &g_param);
+    if (e != ESP_H264_ERR_OK) {
+        ESP_LOGW(TAG, "get_param_hd 失敗(%d)。IDR 強制は使えない", (int)e);
+        g_param = NULL;
+    }
+    g_open_scale = cfg->scale;
+    g_open_bitrate = cfg->bitrate_kbps;
+    ESP_LOGI(TAG, "エンコーダを開いた %dx%d %dkbps internal free=%uKB 最大=%uKB",
+             g_W, g_H, (int)cfg->bitrate_kbps,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    return ESP_OK;
+}
+
+static void enc_close(void)
+{
+    if (g_enc != NULL) {
+        esp_h264_enc_close(g_enc);
+        esp_h264_enc_del(g_enc);
+        g_enc = NULL;
+        g_param = NULL;
+    }
+}
+
+/* 起動直後の一番最初に 1 回だけ呼ぶ。internal RAM の大口
+ * (H264 の約 69KB と GDMA のステージ 23,040B x2)を heap が荒れる前に
+ * たしかめておく。録画のたびに開くと断片化して取れない(2026-10-19 r99/r100)。 */
+esp_err_t gbac_enc_early_init(const gbac_cfg_t *cfg)
+{
+    g_scale = cfg->scale;
+    g_W = GBAC_WIDTH * g_scale;
+    g_H = GBAC_HEIGHT * g_scale;
+    g_yuv_len = GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, g_scale);
+    g_encout_len = g_yuv_len;
+    esp_err_t r = pool_alloc();
+    if (r != ESP_OK) {
+        return r;
+    }
+    /* 一番大きな連続ブロックを要求する方を先に確保させる */
+    r = enc_open(cfg);
+    if (r != ESP_OK) {
+        return r;
+    }
+    dma_stage_setup();
+    ESP_LOGI(TAG, "internal free=%uKB 最大=%uKB DMA 可=%uKB PSRAM free=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    /* internal RAM を何がどれだけ食っているかの表(1 回だけ) */
+    heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+    return ESP_OK;
+}
+
+esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
+{
+    if (g_run) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_scale = cfg->scale;
+    g_W = GBAC_WIDTH * g_scale;
+    g_H = GBAC_HEIGHT * g_scale;
+    g_yuv_len = GBAC_OUYY_SIZE(GBAC_WIDTH, GBAC_HEIGHT, g_scale);
+    g_encout_len = g_yuv_len;
+    /* 起動時に開いてあるので、普通はここを通らない。
+     * 開けなかったか、scale かビットレートが変わったときだけ作り直す。 */
+    if (g_enc == NULL || g_open_scale != g_scale || g_open_bitrate != cfg->bitrate_kbps) {
+        if (g_enc != NULL) {
+            enc_close();
+        }
+        if (pool_alloc() != ESP_OK) {
+            return ESP_ERR_NO_MEM;
+        }
+        if (enc_open(cfg) != ESP_OK) {
+            return ESP_FAIL;
+        }
     }
     xQueueReset(g_free_q);
     xQueueReset(g_out_q);
@@ -438,48 +588,23 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
         g_bench_left = -1;
     }
 
-    esp_h264_enc_cfg_t c = { 0 };
-    c.pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY;
-    c.gop = 60;
-    c.fps = 60;
-    c.res.width = (uint16_t)g_W;
-    c.res.height = (uint16_t)g_H;
-    c.rc.bitrate = (uint32_t)cfg->bitrate_kbps * 1000u;
-    c.rc.qp_min = 10;
-    c.rc.qp_max = ESP_H264_QP_MAX;
-
-    esp_h264_err_t e = esp_h264_enc_hw_new(&c, &g_enc);
-    if (e != ESP_H264_ERR_OK) {
-        ESP_LOGE(TAG, "enc_hw_new 失敗(%d) %dx%d", (int)e, g_W, g_H);
-        return ESP_FAIL;
-    }
-    e = esp_h264_enc_open(g_enc);
-    if (e != ESP_H264_ERR_OK) {
-        ESP_LOGE(TAG, "enc_open 失敗(%d)", (int)e);
-        esp_h264_enc_del(g_enc);
-        g_enc = NULL;
-        return ESP_FAIL;
-    }
-    /* IDR を任意の位置で打つためのパラメータハンドル。
-     * mp4 のスライス先頭を IDR にしたいので muxer に教える必要がある。 */
-    e = esp_h264_enc_hw_get_param_hd(g_enc, &g_param);
-    if (e != ESP_H264_ERR_OK) {
-        ESP_LOGW(TAG, "get_param_hd 失敗(%d)。IDR 強制は使えない", (int)e);
-        g_param = NULL;
-    }
-
     g_frames = 0;
     g_errs = 0;
     g_scale_us_max = 0;
     g_enc_us_max = 0;
+    g_fail_logged = 0;
     for (int i = 0; i < 4; i++) {
         gbac_scale_prof[i] = 0;
     }
-    /* 前段の PSRAM 書き出しを DMA に切り替える(失敗しても従来経路で動く) */
+    /* 前段の PSRAM 書き出しを DMA に切り替える(起動時に済んでいる。
+     * 失敗していても従来経路(CPU が直接書く)で動く) */
     dma_stage_setup();
     if (g_mcp != NULL) {
         g_dma_issue = g_dma_done = 0;
     }
+    /* エンコーダは開きっぱなしなので、この録画の 1 枚目を IDR にする。
+     * IDR の NAL には SPS+PPS が付くので、muxer はそこから mp4 を始められる。 */
+    gbac_enc_force_idr();
     g_run = true;
     ESP_LOGI(TAG, "エンコード開始 %dx%d scale=%d %dkbps bench=%d",
              g_W, g_H, g_scale, (int)cfg->bitrate_kbps, bench_frames);
@@ -494,10 +619,24 @@ esp_err_t gbac_enc_start(const gbac_cfg_t *cfg, int bench_frames)
      * 拡大が USB 受信に割り込まれて 85ms/枚になったのは、割り込みで止まる
      * 見かけ上の値なので、後段と重ねることで実効スループットを上げる。 */
     xTaskCreatePinnedToCore(scale_task, "scale", 12288, NULL, 5, &g_scale_task, 0);
-    /* 後段(エンコード)。esp_h264_enc_process は HW 待ちでブロックするので
-     * CPU はあまり使わない。core1 の rx(prio4)/mux(prio3)より下において、
-     * 受信と SD 書き込みを邪魔しないようにする。 */
-    xTaskCreatePinnedToCore(enc_task, "enc", 8192, NULL, 2, &g_task, 1);
+    /* 後段(エンコード)。1 枚 10ms の締め切りがあるので mux より上にする。
+     * core1 だと rx(prio4)と同じ優先度で同じコアになるため core0 へ移した。
+     * core0 では scale(prio5)の下、aac(prio2)と mux(prio2)の上。
+     * esp_h264_enc_process は HW 待ちでブロックするので CPU は常に取り合わない。
+     * 2026-10-19 r98 は core1 prio2 で mux(prio3)に餓死され 3 枚しか進まなかった。 */
+    xTaskCreatePinnedToCore(enc_task, "enc", 8192, NULL, 4, &g_task, 0);
+    /* 録画中に enc が回っていないときの切り分け用。コアと優先度の実値と、
+     * この時点の internal RAM を 1 回だけ出す(2026-10-19 r98 で
+     * aac が 6 倍遅くなり ringovf=10662 になった原因を見る)。 */
+    ESP_LOGI(TAG, "タスク表 core/prio: usb_lib 0/22 usbh 0/21 rx 1/4 mux 1/2 aac 0/2 "
+                  "scale %d/%d enc %d/%d (このログを出したタスクは core%d)",
+             0, (int)uxTaskPriorityGet(g_scale_task),
+             0, (int)uxTaskPriorityGet(g_task), (int)xPortGetCoreID());
+    ESP_LOGI(TAG, "internal free=%uKB 最大ブロック=%uKB DMA 可=%uKB PSRAM free=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     return ESP_OK;
 }
 
@@ -509,11 +648,11 @@ void gbac_enc_stop(void)
     for (int i = 0; i < 200 && (g_task != NULL || g_scale_task != NULL); i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (g_enc) {
-        esp_h264_enc_close(g_enc);
-        esp_h264_enc_del(g_enc);
-        g_enc = NULL;
-        g_param = NULL;
+    /* エンコーダは開きっぱなしにする。close/del すると internal の塊が
+     * 断片化して、後で reference frame が取れなくなる。
+     * 次回の gbac_enc_start で force_idr するので、mp4 の先頭は IDR のまま。 */
+    if (g_mcp != NULL) {
+        g_dma_issue = g_dma_done = 0;
     }
 }
 
