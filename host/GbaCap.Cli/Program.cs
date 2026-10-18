@@ -297,10 +297,36 @@ switch (args[0])
         })).ToList();
         ths.ForEach(t => t.Start());
         Thread.Sleep(4000); // 数百フレーム分の統計を溜める
-        var q = Transact(dev, MakeCmd('Q'), 16, timeoutMs: 3000);
+        // 'Q' の応答(16B)は EP4 のストリーム(512B パケット)に混ざって届く。
+        // 読み取りスレッドを止めてから EP4 を自分で読み、"GBACq" を探す
         stop = true;
-        Write(dev, MakeCmd('X'));
         ths.ForEach(t => t.Join(500));
+        Write(dev, MakeCmd('Q'));
+        byte[]? q = null;
+        {
+            var rd4 = dev.OpenEndpointReader(ReadEndpointID.Ep04);
+            var acc = new List<byte>();
+            var deadline = Environment.TickCount64 + 3000;
+            while (Environment.TickCount64 < deadline && q is null)
+            {
+                var b = new byte[65536];
+                if (rd4.Read(b, 300, out var n) != Error.Success || n == 0) continue;
+                acc.AddRange(b.Take(n));
+                for (var i = 0; i + 16 <= acc.Count; i++)
+                    if (acc[i] == 'G' && acc[i + 1] == 'B' && acc[i + 2] == 'A' && acc[i + 3] == 'C' && acc[i + 4] == 'q')
+                    {
+                        q = acc.Skip(i).Take(16).ToArray();
+                        break;
+                    }
+                if (acc.Count > 1 << 20) acc.RemoveRange(0, acc.Count - 4096);
+            }
+        }
+        Write(dev, MakeCmd('X'));
+        if (q is null)
+        {
+            Console.Error.WriteLine("'Q' の応答が見つからない");
+            return 1;
+        }
         var last = BitConverter.ToInt32(q, 8);
         var min = BitConverter.ToInt32(q, 12);
         var max = (int)BitConverter.ToInt16(q, 5);
